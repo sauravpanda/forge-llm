@@ -1,0 +1,15 @@
+[package]
+name = "forge-codegen-wasm"
+description = "WASM + WebGPU code generation for Forge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forge-frontend = { workspace = true }
+forge-optimizer = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
