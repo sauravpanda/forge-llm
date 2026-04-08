@@ -1,12 +1,12 @@
 [workspace]
 members = [
-    "crates/forge-frontend",
-    "crates/forge-optimizer",
-    "crates/forge-codegen-cpu",
-    "crates/forge-codegen-wasm",
-    "crates/forge-codegen-gpu",
-    "crates/forge-runtime",
-    "crates/forge-cli",
+    "crates/forgellm-frontend",
+    "crates/forgellm-optimizer",
+    "crates/forgellm-codegen-cpu",
+    "crates/forgellm-codegen-wasm",
+    "crates/forgellm-codegen-gpu",
+    "crates/forgellm-runtime",
+    "crates/forgellm-cli",
 ]
 resolver = "2"
 
@@ -15,15 +15,16 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/sauravpanda/forge-llm"
+homepage = "https://forgellm.dev"
 
 [workspace.dependencies]
 # Internal crates
-forge-frontend = { path = "crates/forge-frontend" }
-forge-optimizer = { path = "crates/forge-optimizer" }
-forge-codegen-cpu = { path = "crates/forge-codegen-cpu" }
-forge-codegen-wasm = { path = "crates/forge-codegen-wasm" }
-forge-codegen-gpu = { path = "crates/forge-codegen-gpu" }
-forge-runtime = { path = "crates/forge-runtime" }
+forgellm-frontend = { path = "crates/forgellm-frontend" }
+forgellm-optimizer = { path = "crates/forgellm-optimizer" }
+forgellm-codegen-cpu = { path = "crates/forgellm-codegen-cpu" }
+forgellm-codegen-wasm = { path = "crates/forgellm-codegen-wasm" }
+forgellm-codegen-gpu = { path = "crates/forgellm-codegen-gpu" }
+forgellm-runtime = { path = "crates/forgellm-runtime" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

@@ -3,7 +3,7 @@
 //! Generates Rust source with SIMD intrinsics (AVX2, AVX-512, NEON)
 //! specialized to exact tensor dimensions.
 
-use forge_frontend::Graph;
+use forgellm_frontend::Graph;
 
 /// Generate CPU-optimized Rust source code from a computation graph.
 pub fn generate(_graph: &Graph) -> String {
