@@ -1,0 +1,44 @@
+[workspace]
+members = [
+    "crates/forge-frontend",
+    "crates/forge-optimizer",
+    "crates/forge-codegen-cpu",
+    "crates/forge-codegen-wasm",
+    "crates/forge-codegen-gpu",
+    "crates/forge-runtime",
+    "crates/forge-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/sauravpanda/forge-llm"
+
+[workspace.dependencies]
+# Internal crates
+forge-frontend = { path = "crates/forge-frontend" }
+forge-optimizer = { path = "crates/forge-optimizer" }
+forge-codegen-cpu = { path = "crates/forge-codegen-cpu" }
+forge-codegen-wasm = { path = "crates/forge-codegen-wasm" }
+forge-codegen-gpu = { path = "crates/forge-codegen-gpu" }
+forge-runtime = { path = "crates/forge-runtime" }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Testing
+pretty_assertions = "1"

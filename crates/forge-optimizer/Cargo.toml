@@ -1,0 +1,14 @@
+[package]
+name = "forge-optimizer"
+description = "Graph-level optimizations for Forge (fusion, layout, quantization, memory planning)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forge-frontend = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
