@@ -1,12 +1,13 @@
-//! Reference interpreter — executes IR graphs directly on CPU.
+//! Interpreter — executes IR graphs directly on CPU.
 //!
-//! This is a straightforward, unoptimized interpreter that runs each
-//! IR operation in sequence using f32 arithmetic. Used to validate
-//! correctness before the compiled codegen path.
+//! Uses optimized kernels from the `kernels` module for compute-heavy
+//! operations (matmul, rms_norm). Validates correctness and serves as
+//! the primary inference path until the AOT codegen is ready.
 
 use forgellm_frontend::ir::*;
 use forgellm_frontend::weight_loader::ModelWeights;
 
+use crate::kernels;
 use crate::kv_cache::KVCache;
 
 /// Run a single forward pass for one token through the model.
@@ -136,63 +137,30 @@ pub fn forward(
     logits
 }
 
-// --- Kernel implementations ---
+// --- Kernel wrappers (delegate to optimized kernels module) ---
 
 fn rms_norm(output: &mut [f32], input: &[f32], weight: &[f32], eps: f32) {
-    let n = input.len();
-    let mut sum_sq: f32 = 0.0;
-    for &x in input {
-        sum_sq += x * x;
-    }
-    let inv_rms = 1.0 / (sum_sq / n as f32 + eps).sqrt();
-    for i in 0..n {
-        output[i] = input[i] * inv_rms * weight[i];
-    }
+    kernels::rms_norm(output, input, weight, eps);
 }
 
-/// Matrix multiply: output[m,n] = input[m,k] * weight^T[k,n]
-/// Weight layout: [n, k] (row-major).
 fn matmul(output: &mut [f32], input: &[f32], weight: &[f32], m: usize, k: usize, n: usize) {
-    for i in 0..m {
-        for j in 0..n {
-            let mut sum: f32 = 0.0;
-            for l in 0..k {
-                sum += input[i * k + l] * weight[j * k + l];
-            }
-            output[i * n + j] = sum;
-        }
-    }
+    kernels::matmul(output, input, weight, m, k, n);
 }
 
 fn silu(output: &mut [f32], input: &[f32]) {
-    for i in 0..input.len() {
-        let x = input[i];
-        output[i] = x / (1.0 + (-x).exp());
-    }
+    kernels::silu(output, input);
 }
 
 fn elementwise_mul(output: &mut [f32], a: &[f32], b: &[f32]) {
-    for i in 0..a.len() {
-        output[i] = a[i] * b[i];
-    }
+    kernels::elementwise_mul(output, a, b);
 }
 
 fn elementwise_add(output: &mut [f32], a: &[f32], b: &[f32]) {
-    for i in 0..a.len() {
-        output[i] = a[i] + b[i];
-    }
+    kernels::elementwise_add(output, a, b);
 }
 
 fn softmax(values: &mut [f32]) {
-    let max_val = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut sum: f32 = 0.0;
-    for v in values.iter_mut() {
-        *v = (*v - max_val).exp();
-        sum += *v;
-    }
-    for v in values.iter_mut() {
-        *v /= sum;
-    }
+    kernels::softmax(values);
 }
 
 fn rope(data: &mut [f32], pos: usize, head_dim: usize, num_heads: usize, theta: f32) {
