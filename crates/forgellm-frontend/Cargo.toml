@@ -4,6 +4,8 @@ description = "Model parsing (GGUF, SafeTensors) and IR construction for ForgeLL
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 serde = { workspace = true }

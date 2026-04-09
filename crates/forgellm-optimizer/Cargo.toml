@@ -4,6 +4,8 @@ description = "Graph-level optimizations for ForgeLLM (fusion, layout, quantizat
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 forgellm-frontend = { workspace = true }

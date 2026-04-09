@@ -4,6 +4,8 @@ description = "Minimal runtime for ForgeLLM (KV cache, sampling, tokenizer, API 
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 forgellm-frontend = { workspace = true }

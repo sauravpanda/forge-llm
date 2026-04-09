@@ -4,6 +4,8 @@ description = "GPU code generation via wgpu/WGSL for ForgeLLM"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 forgellm-frontend = { workspace = true }

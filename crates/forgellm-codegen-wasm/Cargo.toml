@@ -4,6 +4,8 @@ description = "WASM + WebGPU code generation for ForgeLLM"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 forgellm-frontend = { workspace = true }
