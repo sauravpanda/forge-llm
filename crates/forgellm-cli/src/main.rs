@@ -1,5 +1,6 @@
 use std::fs;
-use std::io::{self, Cursor, Write};
+use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
+use std::net::TcpListener;
 use std::path::Path;
 use std::time::Instant;
 
@@ -82,10 +83,15 @@ enum Commands {
         iterations: usize,
     },
 
-    /// Start an OpenAI-compatible API server (not yet implemented)
+    /// Start an OpenAI-compatible API server
     Serve {
-        /// Path to compiled model
+        /// Path to GGUF model file
+        #[arg(long)]
         model: String,
+
+        /// Path to tokenizer.json
+        #[arg(long)]
+        tokenizer: String,
 
         /// Port to listen on
         #[arg(long, default_value = "8080")]
@@ -133,9 +139,11 @@ fn main() -> Result<()> {
             println!("forge bench is not yet implemented (model={model}, iterations={iterations})");
         }
 
-        Commands::Serve { model, port } => {
-            println!("forge serve is not yet implemented (model={model}, port={port})");
-        }
+        Commands::Serve {
+            model,
+            tokenizer,
+            port,
+        } => cmd_serve(&model, &tokenizer, port)?,
     }
 
     Ok(())
@@ -440,4 +448,196 @@ fn cmd_run(
     );
 
     Ok(())
+}
+
+fn cmd_serve(model_path: &str, tokenizer_path: &str, port: u16) -> Result<()> {
+    // Load model and tokenizer
+    eprintln!("Loading tokenizer from {tokenizer_path}...");
+    let tokenizer =
+        Tokenizer::from_file(tokenizer_path).with_context(|| "failed to load tokenizer")?;
+
+    eprintln!("Loading model from {model_path}...");
+    let config = load_model_config(model_path)?;
+    let graph =
+        graph_builder::build_graph(&config).with_context(|| "failed to build computation graph")?;
+
+    let data = fs::read(model_path).with_context(|| format!("failed to read {model_path}"))?;
+    let gguf_file = gguf::parse(Cursor::new(&data)).with_context(|| "failed to parse GGUF file")?;
+    let weights = weight_loader::load_all(&mut Cursor::new(&data), &gguf_file)
+        .with_context(|| "failed to load weights")?;
+
+    eprintln!(
+        "Model loaded: {} | {} layers | {:.0} MB",
+        config.architecture,
+        config.num_layers,
+        weights.memory_bytes() as f64 / 1e6,
+    );
+
+    // Start HTTP server
+    let addr = format!("0.0.0.0:{port}");
+    let listener = TcpListener::bind(&addr).with_context(|| format!("failed to bind {addr}"))?;
+    eprintln!("Serving on http://localhost:{port}");
+    eprintln!("Endpoints:");
+    eprintln!("  POST /v1/completions");
+    eprintln!("  GET  /v1/models");
+    eprintln!("  GET  /health");
+
+    for stream in listener.incoming() {
+        let mut stream = stream?;
+        let mut reader = BufReader::new(&stream);
+
+        // Read request line
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line)?;
+        let parts: Vec<&str> = request_line.trim().split(' ').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let method = parts[0];
+        let path = parts[1];
+
+        // Read headers
+        let mut content_length: usize = 0;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line)?;
+            if line.trim().is_empty() {
+                break;
+            }
+            if let Some(val) = line.strip_prefix("Content-Length: ") {
+                content_length = val.trim().parse().unwrap_or(0);
+            }
+            if let Some(val) = line.strip_prefix("content-length: ") {
+                content_length = val.trim().parse().unwrap_or(0);
+            }
+        }
+
+        // Read body
+        let mut body = vec![0u8; content_length];
+        if content_length > 0 {
+            reader.read_exact(&mut body)?;
+        }
+
+        // Route
+        let (status, response_body) = match (method, path) {
+            ("GET", "/health") => ("200 OK", r#"{"status":"ok"}"#.to_string()),
+
+            ("GET", "/v1/models") => {
+                let model_name = config.architecture.to_string();
+                (
+                    "200 OK",
+                    format!(
+                        r#"{{"object":"list","data":[{{"id":"{model_name}","object":"model","owned_by":"forgellm"}}]}}"#
+                    ),
+                )
+            }
+
+            ("POST", "/v1/completions") => {
+                match handle_completion(&body, &config, &graph, &weights, &tokenizer) {
+                    Ok(resp) => ("200 OK", resp),
+                    Err(e) => (
+                        "400 Bad Request",
+                        format!(r#"{{"error":{{"message":"{}"}}}}"#, e),
+                    ),
+                }
+            }
+
+            _ => (
+                "404 Not Found",
+                r#"{"error":{"message":"not found"}}"#.to_string(),
+            ),
+        };
+
+        // Write response
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\n\r\n{response_body}",
+            response_body.len()
+        );
+        stream.write_all(response.as_bytes())?;
+    }
+
+    Ok(())
+}
+
+fn handle_completion(
+    body: &[u8],
+    config: &ModelConfig,
+    graph: &forgellm_frontend::ir::Graph,
+    weights: &weight_loader::ModelWeights,
+    tokenizer: &Tokenizer,
+) -> Result<String> {
+    let req: serde_json::Value = serde_json::from_slice(body)?;
+
+    let prompt = req["prompt"].as_str().unwrap_or("Hello");
+    let max_tokens = req["max_tokens"].as_u64().unwrap_or(64) as usize;
+    let temperature = req["temperature"].as_f64().unwrap_or(0.0) as f32;
+
+    let sampling_config = if temperature == 0.0 {
+        sampling::SamplingConfig::greedy()
+    } else {
+        sampling::SamplingConfig {
+            temperature,
+            top_k: req["top_k"].as_u64().unwrap_or(0) as usize,
+            top_p: req["top_p"].as_f64().unwrap_or(1.0) as f32,
+            repetition_penalty: 1.0,
+        }
+    };
+
+    let prompt_tokens = tokenizer.encode(prompt)?;
+    let mut cache = KVCache::with_capacity(
+        config.num_layers,
+        config.num_kv_heads,
+        config.head_dim,
+        config
+            .max_seq_len
+            .min(prompt_tokens.len() + max_tokens + 16),
+    );
+
+    // Prefill
+    let mut next_token = 0u32;
+    for (pos, &token) in prompt_tokens.iter().enumerate() {
+        let logits = interpreter::forward(token, pos, graph, weights, &mut cache);
+        cache.advance();
+        next_token = sampling::sample(&logits, &sampling_config, pos as u64);
+    }
+
+    // Generate
+    let mut generated_text = String::new();
+    let eos_id = tokenizer.eos_token_id();
+    let mut generated_count = 0;
+
+    for i in 0..max_tokens {
+        if let Ok(text) = tokenizer.decode_one(next_token) {
+            generated_text.push_str(&text);
+        }
+        generated_count += 1;
+
+        if eos_id.is_some_and(|eos| next_token == eos) {
+            break;
+        }
+
+        let pos = prompt_tokens.len() + i;
+        let logits = interpreter::forward(next_token, pos, graph, weights, &mut cache);
+        cache.advance();
+        next_token = sampling::sample(&logits, &sampling_config, (pos + 1) as u64);
+    }
+
+    // Build OpenAI-compatible response
+    let response = serde_json::json!({
+        "id": "cmpl-forge",
+        "object": "text_completion",
+        "model": config.architecture.to_string(),
+        "choices": [{
+            "text": generated_text,
+            "index": 0,
+            "finish_reason": if eos_id.is_some_and(|eos| next_token == eos) { "stop" } else { "length" },
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens.len(),
+            "completion_tokens": generated_count,
+            "total_tokens": prompt_tokens.len() + generated_count,
+        }
+    });
+
+    Ok(response.to_string())
 }
