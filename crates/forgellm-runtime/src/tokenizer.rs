@@ -96,6 +96,28 @@ impl Tokenizer {
             .or_else(|| self.token_to_id("<|endoftext|>"))
             .or_else(|| self.token_to_id("<|im_end|>"))
     }
+
+    /// Get all stop token IDs (EOS + chat-specific stop tokens).
+    /// Used to detect when generation should stop.
+    pub fn stop_token_ids(&self) -> Vec<u32> {
+        let candidates = [
+            "</s>",
+            "<|end_of_text|>",
+            "<|endoftext|>",
+            "<|im_end|>",
+            "<|eot_id|>",
+            "<|end|>",
+        ];
+        candidates
+            .iter()
+            .filter_map(|&token| self.token_to_id(token))
+            .collect()
+    }
+
+    /// Check if a token ID is a stop token.
+    pub fn is_stop_token(&self, token_id: u32) -> bool {
+        self.stop_token_ids().contains(&token_id)
+    }
 }
 
 #[cfg(test)]
