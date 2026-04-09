@@ -46,6 +46,13 @@ enum Commands {
         model: String,
     },
 
+    /// List GGUF models in a directory
+    Models {
+        /// Directory to search (default: current dir, or FORGE_MODEL_DIR)
+        #[arg(default_value = ".")]
+        dir: String,
+    },
+
     /// Run inference on a GGUF model
     Run {
         /// Path to GGUF model file or HuggingFace model ID
@@ -164,6 +171,8 @@ fn main() -> Result<()> {
             target,
             output,
         } => cmd_compile(&model, &target, &output)?,
+
+        Commands::Models { dir } => cmd_models(&dir)?,
 
         Commands::Info { model } => cmd_info(&model)?,
 
@@ -1280,6 +1289,54 @@ fn cmd_chat(
         }
         eprintln!("\n");
         history.push(ChatMessage::assistant(response_text.trim()));
+    }
+
+    Ok(())
+}
+
+fn cmd_models(dir: &str) -> Result<()> {
+    let search_dir = if dir == "." {
+        // Check FORGE_MODEL_DIR env var
+        std::env::var("FORGE_MODEL_DIR").unwrap_or_else(|_| ".".to_string())
+    } else {
+        dir.to_string()
+    };
+
+    let path = Path::new(&search_dir);
+    if !path.is_dir() {
+        bail!("{search_dir} is not a directory");
+    }
+
+    println!("Searching for GGUF models in {search_dir}...\n");
+
+    let mut found = 0;
+    for entry in std::fs::read_dir(path)?.flatten() {
+        let p = entry.path();
+        if p.extension().is_some_and(|ext| ext == "gguf") {
+            let name = p.file_name().unwrap_or_default().to_string_lossy();
+            let size_mb = p.metadata().map(|m| m.len() as f64 / 1e6).unwrap_or(0.0);
+
+            // Try to get model info
+            match load_model_config(&p.to_string_lossy()) {
+                Ok(config) => {
+                    println!(
+                        "  {} ({:.0} MB) — {} | {} layers | hidden={}",
+                        name, size_mb, config.architecture, config.num_layers, config.hidden_size,
+                    );
+                }
+                Err(_) => {
+                    println!("  {} ({:.0} MB)", name, size_mb);
+                }
+            }
+            found += 1;
+        }
+    }
+
+    if found == 0 {
+        println!("No GGUF models found.");
+        println!("Tip: set FORGE_MODEL_DIR to your model directory");
+    } else {
+        println!("\n{found} model(s) found.");
     }
 
     Ok(())
