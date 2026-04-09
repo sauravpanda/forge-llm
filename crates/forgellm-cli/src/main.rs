@@ -620,6 +620,31 @@ fn cmd_serve(model_path: &str, tokenizer_path: &str, port: u16) -> Result<()> {
             }
 
             ("POST", "/v1/completions") => {
+                // Check for streaming
+                let is_stream = serde_json::from_slice::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| v["stream"].as_bool())
+                    .unwrap_or(false);
+
+                if is_stream {
+                    // Stream response directly
+                    let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\n\r\n";
+                    stream.write_all(header.as_bytes())?;
+                    if let Err(e) = handle_completion_stream(
+                        &body,
+                        &config,
+                        &graph,
+                        &weights,
+                        &tokenizer,
+                        &mut stream,
+                    ) {
+                        let err_data = format!("data: {{\"error\":\"{e}\"}}\n\n");
+                        let _ = stream.write_all(err_data.as_bytes());
+                    }
+                    let _ = stream.write_all(b"data: [DONE]\n\n");
+                    continue;
+                }
+
                 match handle_completion(&body, &config, &graph, &weights, &tokenizer) {
                     Ok(resp) => ("200 OK", resp),
                     Err(e) => (
@@ -960,6 +985,76 @@ fn handle_chat_completion(
     Ok(response.to_string())
 }
 
+fn handle_completion_stream(
+    body: &[u8],
+    config: &ModelConfig,
+    graph: &forgellm_frontend::ir::Graph,
+    weights: &weight_loader::ModelWeights,
+    tokenizer: &Tokenizer,
+    stream: &mut impl Write,
+) -> Result<()> {
+    let req: serde_json::Value = serde_json::from_slice(body)?;
+    let prompt = req["prompt"].as_str().unwrap_or("Hello");
+    let max_tokens = req["max_tokens"].as_u64().unwrap_or(64) as usize;
+    let temperature = req["temperature"].as_f64().unwrap_or(0.0) as f32;
+
+    let sampling_config = if temperature == 0.0 {
+        sampling::SamplingConfig::greedy()
+    } else {
+        sampling::SamplingConfig {
+            temperature,
+            top_k: req["top_k"].as_u64().unwrap_or(0) as usize,
+            top_p: req["top_p"].as_f64().unwrap_or(1.0) as f32,
+            repetition_penalty: 1.1,
+        }
+    };
+
+    let prompt_tokens = tokenizer.encode(prompt)?;
+    let mut cache = KVCache::with_capacity(
+        config.num_layers,
+        config.num_kv_heads,
+        config.head_dim,
+        config
+            .max_seq_len
+            .min(prompt_tokens.len() + max_tokens + 16),
+    );
+
+    let mut next_token = 0u32;
+    for (pos, &token) in prompt_tokens.iter().enumerate() {
+        let logits = interpreter::forward(token, pos, graph, weights, &mut cache);
+        cache.advance();
+        next_token = sampling::sample(&logits, &sampling_config, pos as u64);
+    }
+
+    let eos_id = tokenizer.eos_token_id();
+    let mut all_tokens: Vec<u32> = prompt_tokens;
+
+    for i in 0..max_tokens {
+        let text = tokenizer.decode_one(next_token).unwrap_or_default();
+        all_tokens.push(next_token);
+
+        let chunk = serde_json::json!({
+            "id": "cmpl-forge",
+            "object": "text_completion",
+            "choices": [{"text": text, "index": 0, "finish_reason": serde_json::Value::Null}]
+        });
+        write!(stream, "data: {}\n\n", chunk)?;
+        stream.flush()?;
+
+        if eos_id.is_some_and(|eos| next_token == eos) {
+            break;
+        }
+
+        let pos = all_tokens.len() - 1;
+        let mut logits = interpreter::forward(next_token, pos, graph, weights, &mut cache);
+        cache.advance();
+        sampling::apply_repetition_penalty(&mut logits, &all_tokens, 1.1);
+        next_token = sampling::sample(&logits, &sampling_config, (i + 1) as u64);
+    }
+
+    Ok(())
+}
+
 fn cmd_chat(
     model_path: &str,
     tokenizer_path: &str,
@@ -971,18 +1066,16 @@ fn cmd_chat(
 
     eprintln!("Loading tokenizer...");
     let tokenizer = Tokenizer::from_file(tokenizer_path)?;
-
     eprintln!("Loading model...");
     let config = load_model_config(model_path)?;
     let graph = graph_builder::build_graph(&config)?;
-
     eprintln!("Loading weights...");
     let (_gguf, weights) = weight_loader::load_from_file(model_path)?;
     eprintln!(
         "Ready! {} | {} layers | {:.0} MB\n",
         config.architecture,
         config.num_layers,
-        weights.memory_bytes() as f64 / 1e6,
+        weights.memory_bytes() as f64 / 1e6
     );
 
     let template = ChatTemplate::from_architecture(&config.architecture.to_string());
@@ -1003,12 +1096,11 @@ fn cmd_chat(
     let mut history: Vec<ChatMessage> = vec![ChatMessage::system(system_prompt)];
 
     loop {
-        // Read user input
         eprint!("You: ");
         io::stderr().flush()?;
         let mut user_input = String::new();
         if io::stdin().read_line(&mut user_input)? == 0 {
-            break; // EOF
+            break;
         }
         let user_input = user_input.trim();
         if user_input.is_empty() {
@@ -1018,18 +1110,15 @@ fn cmd_chat(
             break;
         }
         if user_input == "/clear" {
-            history.truncate(1); // Keep system prompt
+            history.truncate(1);
             eprintln!("History cleared.\n");
             continue;
         }
 
         history.push(ChatMessage::user(user_input));
-
-        // Format full conversation
         let prompt = template.format(&history);
         let prompt_tokens = tokenizer.encode(&prompt)?;
 
-        // Fresh KV cache per turn (full recompute — context caching is a future optimization)
         let mut cache = KVCache::with_capacity(
             config.num_layers,
             config.num_kv_heads,
@@ -1039,7 +1128,6 @@ fn cmd_chat(
                 .min(prompt_tokens.len() + max_tokens + 16),
         );
 
-        // Prefill
         let mut next_token = 0u32;
         for (pos, &token) in prompt_tokens.iter().enumerate() {
             let logits = interpreter::forward(token, pos, &graph, &weights, &mut cache);
@@ -1047,7 +1135,6 @@ fn cmd_chat(
             next_token = sampling::sample(&logits, &sampling_config, pos as u64);
         }
 
-        // Generate
         eprint!("\nAssistant: ");
         let eos_id = tokenizer.eos_token_id();
         let mut response_text = String::new();
@@ -1059,11 +1146,9 @@ fn cmd_chat(
             io::stderr().flush()?;
             response_text.push_str(&text);
             all_tokens.push(next_token);
-
             if eos_id.is_some_and(|eos| next_token == eos) {
                 break;
             }
-
             let pos = all_tokens.len() - 1;
             let mut logits = interpreter::forward(next_token, pos, &graph, &weights, &mut cache);
             cache.advance();
@@ -1071,8 +1156,6 @@ fn cmd_chat(
             next_token = sampling::sample(&logits, &sampling_config, (i + 1) as u64);
         }
         eprintln!("\n");
-
-        // Add assistant response to history
         history.push(ChatMessage::assistant(response_text.trim()));
     }
 
