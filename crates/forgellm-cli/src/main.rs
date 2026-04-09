@@ -8,7 +8,9 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 use forgellm_frontend::{config::HFConfig, gguf, graph_builder, ir::ModelConfig, weight_loader};
-use forgellm_runtime::{interpreter, kv_cache::KVCache, sampling, tokenizer::Tokenizer};
+use forgellm_runtime::{
+    chat::ChatTemplate, interpreter, kv_cache::KVCache, sampling, tokenizer::Tokenizer,
+};
 
 #[derive(Parser)]
 #[command(name = "forge")]
@@ -495,6 +497,7 @@ fn cmd_serve(model_path: &str, tokenizer_path: &str, port: u16) -> Result<()> {
     eprintln!("Serving on http://localhost:{port}");
     eprintln!("Endpoints:");
     eprintln!("  POST /v1/completions");
+    eprintln!("  POST /v1/chat/completions");
     eprintln!("  GET  /v1/models");
     eprintln!("  GET  /health");
 
@@ -550,6 +553,16 @@ fn cmd_serve(model_path: &str, tokenizer_path: &str, port: u16) -> Result<()> {
 
             ("POST", "/v1/completions") => {
                 match handle_completion(&body, &config, &graph, &weights, &tokenizer) {
+                    Ok(resp) => ("200 OK", resp),
+                    Err(e) => (
+                        "400 Bad Request",
+                        format!(r#"{{"error":{{"message":"{}"}}}}"#, e),
+                    ),
+                }
+            }
+
+            ("POST", "/v1/chat/completions") => {
+                match handle_chat_completion(&body, &config, &graph, &weights, &tokenizer) {
                     Ok(resp) => ("200 OK", resp),
                     Err(e) => (
                         "400 Bad Request",
@@ -646,6 +659,110 @@ fn handle_completion(
         "choices": [{
             "text": generated_text,
             "index": 0,
+            "finish_reason": if eos_id.is_some_and(|eos| next_token == eos) { "stop" } else { "length" },
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens.len(),
+            "completion_tokens": generated_count,
+            "total_tokens": prompt_tokens.len() + generated_count,
+        }
+    });
+
+    Ok(response.to_string())
+}
+
+fn handle_chat_completion(
+    body: &[u8],
+    config: &ModelConfig,
+    graph: &forgellm_frontend::ir::Graph,
+    weights: &weight_loader::ModelWeights,
+    tokenizer: &Tokenizer,
+) -> Result<String> {
+    let req: serde_json::Value = serde_json::from_slice(body)?;
+
+    // Parse messages
+    let messages = req["messages"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("missing 'messages' array"))?;
+
+    let chat_messages: Vec<forgellm_runtime::chat::ChatMessage> = messages
+        .iter()
+        .map(|m| forgellm_runtime::chat::ChatMessage {
+            role: m["role"].as_str().unwrap_or("user").to_string(),
+            content: m["content"].as_str().unwrap_or("").to_string(),
+        })
+        .collect();
+
+    // Format with appropriate template
+    let template = ChatTemplate::from_architecture(&config.architecture.to_string());
+    let prompt = template.format(&chat_messages);
+
+    let max_tokens = req["max_tokens"].as_u64().unwrap_or(128) as usize;
+    let temperature = req["temperature"].as_f64().unwrap_or(0.0) as f32;
+
+    let sampling_config = if temperature == 0.0 {
+        sampling::SamplingConfig::greedy()
+    } else {
+        sampling::SamplingConfig {
+            temperature,
+            top_k: req["top_k"].as_u64().unwrap_or(0) as usize,
+            top_p: req["top_p"].as_f64().unwrap_or(1.0) as f32,
+            repetition_penalty: 1.1,
+        }
+    };
+
+    let prompt_tokens = tokenizer.encode(&prompt)?;
+    let mut cache = KVCache::with_capacity(
+        config.num_layers,
+        config.num_kv_heads,
+        config.head_dim,
+        config
+            .max_seq_len
+            .min(prompt_tokens.len() + max_tokens + 16),
+    );
+
+    // Prefill
+    let mut next_token = 0u32;
+    for (pos, &token) in prompt_tokens.iter().enumerate() {
+        let logits = interpreter::forward(token, pos, graph, weights, &mut cache);
+        cache.advance();
+        next_token = sampling::sample(&logits, &sampling_config, pos as u64);
+    }
+
+    // Generate
+    let mut generated_text = String::new();
+    let eos_id = tokenizer.eos_token_id();
+    let mut generated_count = 0;
+    let mut all_tokens: Vec<u32> = prompt_tokens.clone();
+
+    for i in 0..max_tokens {
+        if let Ok(text) = tokenizer.decode_one(next_token) {
+            generated_text.push_str(&text);
+        }
+        generated_count += 1;
+        all_tokens.push(next_token);
+
+        if eos_id.is_some_and(|eos| next_token == eos) {
+            break;
+        }
+
+        let pos = prompt_tokens.len() + i;
+        let mut logits = interpreter::forward(next_token, pos, graph, weights, &mut cache);
+        cache.advance();
+        sampling::apply_repetition_penalty(&mut logits, &all_tokens, 1.1);
+        next_token = sampling::sample(&logits, &sampling_config, (pos + 1) as u64);
+    }
+
+    let response = serde_json::json!({
+        "id": "chatcmpl-forge",
+        "object": "chat.completion",
+        "model": config.architecture.to_string(),
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": generated_text,
+            },
             "finish_reason": if eos_id.is_some_and(|eos| next_token == eos) { "stop" } else { "length" },
         }],
         "usage": {
