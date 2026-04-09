@@ -164,6 +164,51 @@ pub fn softmax(values: &mut [f32]) {
     }
 }
 
+/// Optimized grouped-query attention using NEON dot products.
+///
+/// Computes: for each head, score = softmax(Q·K^T / sqrt(d)), output = score·V
+#[allow(clippy::too_many_arguments)]
+pub fn attention(
+    output: &mut [f32],
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    seq_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+) {
+    let kv_group_size = num_heads / num_kv_heads;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let kv_stride = num_kv_heads * head_dim;
+
+    for h in 0..num_heads {
+        let kv_h = h / kv_group_size;
+        let q_offset = h * head_dim;
+        let q_head = &q[q_offset..q_offset + head_dim];
+
+        // Compute attention scores using NEON dot product
+        let mut scores = vec![0.0f32; seq_len];
+        for (t, score) in scores.iter_mut().enumerate() {
+            let k_offset = t * kv_stride + kv_h * head_dim;
+            *score =
+                dot_f32_neon(q_head, &k_cache[k_offset..k_offset + head_dim], head_dim) * scale;
+        }
+
+        softmax(&mut scores);
+
+        // Weighted sum of values
+        for d in 0..head_dim {
+            let mut sum: f32 = 0.0;
+            for (t, &score) in scores.iter().enumerate() {
+                let v_offset = t * kv_stride + kv_h * head_dim;
+                sum += score * v_cache[v_offset + d];
+            }
+            output[q_offset + d] = sum;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
