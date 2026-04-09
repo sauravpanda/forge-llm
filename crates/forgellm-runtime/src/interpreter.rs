@@ -176,10 +176,6 @@ fn elementwise_add_inplace(a: &mut [f32], b: &[f32]) {
     }
 }
 
-fn softmax(values: &mut [f32]) {
-    kernels::softmax(values);
-}
-
 fn rope(data: &mut [f32], pos: usize, head_dim: usize, num_heads: usize, theta: f32) {
     for h in 0..num_heads {
         let head_offset = h * head_dim;
@@ -210,37 +206,16 @@ fn attention(
     v_cache: &[f32],
     params: &AttentionParams,
 ) {
-    let kv_group_size = params.num_heads / params.num_kv_heads;
-    let scale = 1.0 / (params.head_dim as f32).sqrt();
-
-    for h in 0..params.num_heads {
-        let kv_h = h / kv_group_size;
-        let q_offset = h * params.head_dim;
-
-        // Compute attention scores
-        let mut scores = vec![0.0f32; params.seq_len];
-        for (t, score) in scores.iter_mut().enumerate() {
-            let k_offset = t * params.num_kv_heads * params.head_dim + kv_h * params.head_dim;
-            let mut dot: f32 = 0.0;
-            for d in 0..params.head_dim {
-                dot += q[q_offset + d] * k_cache[k_offset + d];
-            }
-            *score = dot * scale;
-        }
-
-        // Softmax
-        softmax(&mut scores);
-
-        // Weighted sum of values
-        for d in 0..params.head_dim {
-            let mut sum: f32 = 0.0;
-            for (t, &score) in scores.iter().enumerate() {
-                let v_offset = t * params.num_kv_heads * params.head_dim + kv_h * params.head_dim;
-                sum += score * v_cache[v_offset + d];
-            }
-            output[q_offset + d] = sum;
-        }
-    }
+    kernels::attention(
+        output,
+        q,
+        k_cache,
+        v_cache,
+        params.seq_len,
+        params.num_heads,
+        params.num_kv_heads,
+        params.head_dim,
+    );
 }
 
 #[cfg(test)]
@@ -289,7 +264,7 @@ mod tests {
     #[test]
     fn softmax_basic() {
         let mut values = vec![1.0, 2.0, 3.0];
-        softmax(&mut values);
+        kernels::softmax(&mut values);
         let sum: f32 = values.iter().sum();
         assert!((sum - 1.0).abs() < 1e-6);
         assert!(values[2] > values[1]);
