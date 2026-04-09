@@ -71,6 +71,10 @@ enum Commands {
         /// Top-p nucleus sampling (1.0 = disabled)
         #[arg(long, default_value = "1.0")]
         top_p: f32,
+
+        /// Repetition penalty (1.0 = disabled, >1.0 = penalize repeats)
+        #[arg(long, default_value = "1.1")]
+        repeat_penalty: f32,
     },
 
     /// Benchmark a compiled model (not yet implemented)
@@ -123,6 +127,7 @@ fn main() -> Result<()> {
             temperature,
             top_k,
             top_p,
+            repeat_penalty,
         } => cmd_run(
             &model,
             &tokenizer,
@@ -131,6 +136,7 @@ fn main() -> Result<()> {
             temperature,
             top_k,
             top_p,
+            repeat_penalty,
         )?,
 
         Commands::Bench {
@@ -324,6 +330,7 @@ fn cmd_run(
     temperature: f32,
     top_k: usize,
     top_p: f32,
+    repeat_penalty: f32,
 ) -> Result<()> {
     // Load tokenizer
     eprintln!("Loading tokenizer from {tokenizer_path}...");
@@ -367,13 +374,16 @@ fn cmd_run(
 
     // Sampling config
     let sampling_config = if temperature == 0.0 {
-        sampling::SamplingConfig::greedy()
+        sampling::SamplingConfig {
+            repetition_penalty: repeat_penalty,
+            ..sampling::SamplingConfig::greedy()
+        }
     } else {
         sampling::SamplingConfig {
             temperature,
             top_k,
             top_p,
-            repetition_penalty: 1.0,
+            repetition_penalty: repeat_penalty,
         }
     };
 
@@ -398,7 +408,8 @@ fn cmd_run(
     let prefill_time = prefill_start.elapsed();
 
     // Generate tokens
-    let mut generated_tokens = vec![next_token];
+    let mut generated_tokens: Vec<u32> = prompt_tokens.clone();
+    generated_tokens.push(next_token);
     let eos_id = tokenizer.eos_token_id();
     let gen_start = Instant::now();
 
@@ -416,8 +427,13 @@ fn cmd_run(
 
         // Forward pass
         let pos = prompt_tokens.len() + i;
-        let logits = interpreter::forward(next_token, pos, &graph, &weights, &mut cache);
+        let mut logits = interpreter::forward(next_token, pos, &graph, &weights, &mut cache);
         cache.advance();
+
+        // Apply repetition penalty
+        if repeat_penalty != 1.0 {
+            sampling::apply_repetition_penalty(&mut logits, &generated_tokens, repeat_penalty);
+        }
 
         // Sample next token
         next_token = sampling::sample(&logits, &sampling_config, (pos + 1) as u64);
