@@ -702,14 +702,34 @@ fn cmd_serve(model_path: &str, tokenizer_path: &str, port: u16) -> Result<()> {
 
         // Route
         let (status, response_body) = match (method, path) {
-            ("GET", "/health") => ("200 OK", r#"{"status":"ok"}"#.to_string()),
+            ("OPTIONS", _) => {
+                // CORS preflight
+                let cors = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nContent-Length: 0\r\n\r\n";
+                stream.write_all(cors.as_bytes())?;
+                continue;
+            }
+
+            ("GET", "/health") => {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                (
+                    "200 OK",
+                    format!(
+                        r#"{{"status":"ok","model":"{}","timestamp":{ts}}}"#,
+                        config.architecture
+                    ),
+                )
+            }
 
             ("GET", "/v1/models") => {
                 let model_name = config.architecture.to_string();
                 (
                     "200 OK",
                     format!(
-                        r#"{{"object":"list","data":[{{"id":"{model_name}","object":"model","owned_by":"forgellm"}}]}}"#
+                        r#"{{"object":"list","data":[{{"id":"{model_name}","object":"model","owned_by":"forgellm","layers":{},"hidden_size":{}}}]}}"#,
+                        config.num_layers, config.hidden_size,
                     ),
                 )
             }
