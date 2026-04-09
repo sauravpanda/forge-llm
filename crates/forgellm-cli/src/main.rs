@@ -665,12 +665,20 @@ fn cmd_serve(model_path: &str, tokenizer_path: &str, port: u16) -> Result<()> {
     eprintln!("  GET  /health");
 
     for stream in listener.incoming() {
-        let mut stream = stream?;
+        let mut stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Connection error: {e}");
+                continue;
+            }
+        };
         let mut reader = BufReader::new(&stream);
 
         // Read request line
         let mut request_line = String::new();
-        reader.read_line(&mut request_line)?;
+        if reader.read_line(&mut request_line).is_err() {
+            continue;
+        }
         let parts: Vec<&str> = request_line.trim().split(' ').collect();
         if parts.len() < 2 {
             continue;
