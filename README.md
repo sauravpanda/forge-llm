@@ -56,27 +56,41 @@ cargo run --release -- run \
 
 | Architecture | Models | Status |
 |-------------|--------|--------|
-| LlamaForCausalLM | SmolLM2 (135M, 360M, 1.7B), Llama 3.2 (1B, 3B), TinyLlama | Working |
-| Qwen2ForCausalLM | Qwen2.5 (0.5B-7B) | Working |
-| MistralForCausalLM | Mistral 7B | Working |
+| LlamaForCausalLM | SmolLM2 (135M, 360M, 1.7B), Llama 3.2 (1B, 3B), TinyLlama | Verified |
+| Qwen2ForCausalLM | Qwen2.5 (0.5B-7B) | Verified |
+| MistralForCausalLM | Mistral 7B | Supported |
+| Phi3ForCausalLM | Phi-3 Mini | Supported |
+| GemmaForCausalLM | Gemma 2B, 7B | Supported |
+| StableLMForCausalLM | StableLM 1.6B, 3B | Supported |
 
-Supports GGUF quantization formats: F32, F16, BF16, Q8_0, Q4_0, Q4_1.
+Supports 12 GGUF quantization formats: F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q2_K through Q8_K.
 
 ## Performance
 
-Reference interpreter (naive f32, no SIMD):
+Optimized kernels (unrolled matmul) on Apple Silicon:
 
-| Model | Params | Prefill | Generation |
-|-------|--------|---------|------------|
-| SmolLM2-135M Q8_0 | 135M | ~20 tok/s | ~21.6 tok/s |
-
-These are baseline numbers. SIMD kernels and operator fusion will bring 10-30x improvements.
+| Model | Params | Generation |
+|-------|--------|------------|
+| SmolLM2-135M Q8_0 | 135M | **46.3 tok/s** |
+| SmolLM2-360M Q8_0 | 360M | **17.5 tok/s** |
+| Qwen2.5-0.5B Q8_0 | 494M | **12.0 tok/s** |
 
 ## CLI Commands
 
 ```bash
 # Run inference on a GGUF model
 forge run --model model.gguf --tokenizer tokenizer.json --prompt "Hello"
+
+# With chat template and system prompt
+forge run --model model.gguf --tokenizer tokenizer.json \
+  --chat --system "You are a helpful assistant" \
+  --prompt "What is Rust?"
+
+# Start OpenAI-compatible API server
+forge serve --model model.gguf --tokenizer tokenizer.json --port 8080
+
+# Benchmark performance
+forge bench --model model.gguf --tokenizer tokenizer.json --num-tokens 128 --runs 3
 
 # Inspect model architecture
 forge info model.gguf
