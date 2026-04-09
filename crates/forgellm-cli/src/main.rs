@@ -1,11 +1,13 @@
 use std::fs;
-use std::io::Cursor;
+use std::io::{self, Cursor, Write};
 use std::path::Path;
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use forgellm_frontend::{config::HFConfig, gguf, graph_builder, ir::ModelConfig};
+use forgellm_frontend::{config::HFConfig, gguf, graph_builder, ir::ModelConfig, weight_loader};
+use forgellm_runtime::{interpreter, kv_cache::KVCache, sampling, tokenizer::Tokenizer};
 
 #[derive(Parser)]
 #[command(name = "forge")]
@@ -39,18 +41,35 @@ enum Commands {
         model: String,
     },
 
-    /// Run a compiled model (not yet implemented)
+    /// Run inference on a GGUF model
     Run {
-        /// Path to compiled model
+        /// Path to GGUF model file
+        #[arg(long)]
         model: String,
+
+        /// Path to tokenizer.json
+        #[arg(long)]
+        tokenizer: String,
 
         /// Input prompt
         #[arg(long)]
         prompt: String,
 
         /// Maximum tokens to generate
-        #[arg(long, default_value = "256")]
+        #[arg(long, default_value = "128")]
         max_tokens: usize,
+
+        /// Temperature (0 = greedy)
+        #[arg(long, default_value = "0.0")]
+        temperature: f32,
+
+        /// Top-k sampling (0 = disabled)
+        #[arg(long, default_value = "0")]
+        top_k: usize,
+
+        /// Top-p nucleus sampling (1.0 = disabled)
+        #[arg(long, default_value = "1.0")]
+        top_p: f32,
     },
 
     /// Benchmark a compiled model (not yet implemented)
@@ -92,13 +111,21 @@ fn main() -> Result<()> {
 
         Commands::Run {
             model,
+            tokenizer,
             prompt,
             max_tokens,
-        } => {
-            println!(
-                "forge run is not yet implemented (model={model}, prompt={prompt}, max_tokens={max_tokens})"
-            );
-        }
+            temperature,
+            top_k,
+            top_p,
+        } => cmd_run(
+            &model,
+            &tokenizer,
+            &prompt,
+            max_tokens,
+            temperature,
+            top_k,
+            top_p,
+        )?,
 
         Commands::Bench {
             model, iterations, ..
@@ -277,6 +304,141 @@ fn cmd_info(model_path: &str) -> Result<()> {
     println!("RMS norm eps: {:e}", config.rms_norm_eps);
     println!("RoPE theta:   {:e}", config.rope_theta);
     println!("Dtype:        {}", config.dtype);
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_run(
+    model_path: &str,
+    tokenizer_path: &str,
+    prompt: &str,
+    max_tokens: usize,
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+) -> Result<()> {
+    // Load tokenizer
+    eprintln!("Loading tokenizer from {tokenizer_path}...");
+    let tokenizer =
+        Tokenizer::from_file(tokenizer_path).with_context(|| "failed to load tokenizer")?;
+    eprintln!("Vocab size: {}", tokenizer.vocab_size());
+
+    // Load model config from GGUF
+    eprintln!("Loading model from {model_path}...");
+    let config = load_model_config(model_path)?;
+    eprintln!(
+        "Model: {} | {} layers | hidden={} | vocab={}",
+        config.architecture, config.num_layers, config.hidden_size, config.vocab_size,
+    );
+
+    // Build computation graph
+    let graph =
+        graph_builder::build_graph(&config).with_context(|| "failed to build computation graph")?;
+
+    // Load weights
+    eprintln!("Loading weights...");
+    let start = Instant::now();
+    let data = fs::read(model_path).with_context(|| format!("failed to read {model_path}"))?;
+    let gguf_file = gguf::parse(Cursor::new(&data)).with_context(|| "failed to parse GGUF file")?;
+    let weights = weight_loader::load_all(&mut Cursor::new(&data), &gguf_file)
+        .with_context(|| "failed to load weights")?;
+    eprintln!(
+        "Loaded {} tensors ({:.1} MB) in {:.1}s",
+        weights.len(),
+        weights.memory_bytes() as f64 / 1e6,
+        start.elapsed().as_secs_f64(),
+    );
+
+    // Initialize KV cache
+    let mut cache = KVCache::with_capacity(
+        config.num_layers,
+        config.num_kv_heads,
+        config.head_dim,
+        config.max_seq_len,
+    );
+
+    // Sampling config
+    let sampling_config = if temperature == 0.0 {
+        sampling::SamplingConfig::greedy()
+    } else {
+        sampling::SamplingConfig {
+            temperature,
+            top_k,
+            top_p,
+            repetition_penalty: 1.0,
+        }
+    };
+
+    // Encode prompt
+    let prompt_tokens = tokenizer
+        .encode(prompt)
+        .with_context(|| "failed to encode prompt")?;
+    eprintln!("Prompt: {} tokens", prompt_tokens.len());
+
+    // Process prompt tokens (prefill)
+    eprintln!("Generating...\n");
+    print!("{prompt}");
+    io::stdout().flush()?;
+
+    let prefill_start = Instant::now();
+    let mut next_token = 0u32;
+    for (pos, &token) in prompt_tokens.iter().enumerate() {
+        let logits = interpreter::forward(token, pos, &graph, &weights, &mut cache);
+        cache.advance();
+        next_token = sampling::sample(&logits, &sampling_config, pos as u64);
+    }
+    let prefill_time = prefill_start.elapsed();
+
+    // Generate tokens
+    let mut generated_tokens = vec![next_token];
+    let eos_id = tokenizer.eos_token_id();
+    let gen_start = Instant::now();
+
+    for i in 0..max_tokens {
+        // Decode and print the token
+        if let Ok(text) = tokenizer.decode_one(next_token) {
+            print!("{text}");
+            io::stdout().flush()?;
+        }
+
+        // Check for EOS
+        if eos_id.is_some_and(|eos| next_token == eos) {
+            break;
+        }
+
+        // Forward pass
+        let pos = prompt_tokens.len() + i;
+        let logits = interpreter::forward(next_token, pos, &graph, &weights, &mut cache);
+        cache.advance();
+
+        // Sample next token
+        next_token = sampling::sample(&logits, &sampling_config, (pos + 1) as u64);
+        generated_tokens.push(next_token);
+    }
+
+    let gen_time = gen_start.elapsed();
+    println!();
+
+    // Stats
+    let total_gen = generated_tokens.len();
+    let tok_per_sec = if gen_time.as_secs_f64() > 0.0 {
+        total_gen as f64 / gen_time.as_secs_f64()
+    } else {
+        0.0
+    };
+
+    eprintln!("\n--- Stats ---");
+    eprintln!(
+        "Prefill: {} tokens in {:.2}s ({:.1} tok/s)",
+        prompt_tokens.len(),
+        prefill_time.as_secs_f64(),
+        prompt_tokens.len() as f64 / prefill_time.as_secs_f64(),
+    );
+    eprintln!(
+        "Generate: {total_gen} tokens in {:.2}s ({tok_per_sec:.1} tok/s)",
+        gen_time.as_secs_f64(),
+    );
 
     Ok(())
 }
