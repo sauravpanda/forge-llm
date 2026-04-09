@@ -1,24 +1,12 @@
-//! Forge Optimizer — Graph-level optimizations.
+//! ForgeLLM Optimizer — graph-level optimization passes.
 //!
-//! Includes operator fusion, memory layout optimization,
-//! compile-time quantization, and static memory planning.
+//! Transforms IR computation graphs to improve performance:
+//! - Operator fusion (merge multiple ops into single kernels)
+//! - Dead node elimination
+//!
+//! Each pass is independent and composable.
 
-use forgellm_frontend::Graph;
+mod fusion;
+mod passes;
 
-/// Apply all optimization passes to a computation graph.
-pub fn optimize(graph: &Graph) -> Graph {
-    // Optimization passes will be added in PR 6.
-    graph.clone()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn optimize_identity() {
-        let graph = Graph::new("test");
-        let optimized = optimize(&graph);
-        assert_eq!(optimized.name, "test");
-    }
-}
+pub use passes::optimize;
