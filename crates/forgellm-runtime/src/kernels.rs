@@ -130,6 +130,15 @@ pub fn silu(output: &mut [f32], input: &[f32]) {
     }
 }
 
+/// GeLU activation (approximate): 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+pub fn gelu(output: &mut [f32], input: &[f32]) {
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6; // sqrt(2/pi)
+    for (o, &x) in output.iter_mut().zip(input.iter()) {
+        let inner = SQRT_2_OVER_PI * (x + 0.044715 * x * x * x);
+        *o = 0.5 * x * (1.0 + inner.tanh());
+    }
+}
+
 /// Optimized elementwise multiply
 pub fn elementwise_mul(output: &mut [f32], a: &[f32], b: &[f32]) {
     for i in 0..a.len() {

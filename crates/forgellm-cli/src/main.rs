@@ -77,6 +77,14 @@ enum Commands {
         /// Repetition penalty (1.0 = disabled, >1.0 = penalize repeats)
         #[arg(long, default_value = "1.1")]
         repeat_penalty: f32,
+
+        /// System prompt (enables chat template formatting)
+        #[arg(long)]
+        system: Option<String>,
+
+        /// Use chat template formatting
+        #[arg(long)]
+        chat: bool,
     },
 
     /// Benchmark model inference performance
@@ -143,16 +151,34 @@ fn main() -> Result<()> {
             top_k,
             top_p,
             repeat_penalty,
-        } => cmd_run(
-            &model,
-            &tokenizer,
-            &prompt,
-            max_tokens,
-            temperature,
-            top_k,
-            top_p,
-            repeat_penalty,
-        )?,
+            system,
+            chat,
+        } => {
+            // Apply chat template if --chat or --system is provided
+            let effective_prompt = if chat || system.is_some() {
+                let config = load_model_config(&model)?;
+                let template = forgellm_runtime::chat::ChatTemplate::from_architecture(
+                    &config.architecture.to_string(),
+                );
+                if let Some(ref sys) = system {
+                    template.format_with_system(sys, &prompt)
+                } else {
+                    template.format_prompt(&prompt)
+                }
+            } else {
+                prompt.clone()
+            };
+            cmd_run(
+                &model,
+                &tokenizer,
+                &effective_prompt,
+                max_tokens,
+                temperature,
+                top_k,
+                top_p,
+                repeat_penalty,
+            )?
+        }
 
         Commands::Bench {
             model,
