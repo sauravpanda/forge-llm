@@ -17,6 +17,9 @@ Thumbs.db
 .env
 .env.*
 
+# Docs build output
+docs/book/
+
 # Project planning (local only)
 plan.md
 TODO.md

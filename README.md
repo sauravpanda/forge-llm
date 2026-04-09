@@ -1,66 +1,106 @@
-# Forge
+# ForgeLLM
 
 **Compile your LLMs, don't interpret them.**
 
-Forge is a Rust-native ahead-of-time (AOT) ML compiler for small language models (1-7B parameters). It takes a model definition and compiles it into an optimized, self-contained binary — no runtime interpreter, no Python dependencies, no dynamic dispatch.
+ForgeLLM is a Rust-native ahead-of-time (AOT) ML compiler for small language models (1M-7B parameters). It takes a model definition and compiles it into an optimized, self-contained binary — no runtime interpreter, no Python dependencies, no dynamic dispatch.
 
-## Why Forge?
+[Documentation](https://sauravpanda.github.io/forge-llm/) | [Crates.io](https://crates.io/crates/forgellm-frontend) | [forgellm.dev](https://forgellm.dev)
+
+## It Works
+
+```
+$ forge run --model SmolLM2-135M-Instruct-Q8_0.gguf \
+            --tokenizer tokenizer.json \
+            --prompt "The meaning of life is"
+
+The meaning of life is a complex and multifaceted concept that has been
+debated by philosophers, scientists, and theologians for centuries. At its
+core, the question of what it means to be human...
+
+Prefill: 5 tokens in 0.25s (19.7 tok/s)
+Generate: 33 tokens in 1.53s (21.6 tok/s)
+```
+
+## Why ForgeLLM?
 
 Every existing LLM inference engine loads model weights at runtime and executes a generic inference loop. This is like shipping a Python interpreter when you could ship a compiled binary.
 
-Forge compiles models into hardware-specific code with:
+ForgeLLM compiles models into hardware-specific code with:
 - **Fused operations** baked into the binary
 - **Shape-specialized kernels** tuned to exact weight dimensions
 - **Compile-time quantization** — no quantization overhead at inference
 - **Static memory planning** — zero allocations during inference
 - **Single binary output** — deploy with `scp`
 
-## Status
-
-🚧 **Early development** — not yet ready for production use.
-
-## Supported Targets
-
-| Backend | Status |
-|---------|--------|
-| CPU (x86-64 AVX2/512) | Planned |
-| CPU (ARM NEON / Apple Silicon) | Planned |
-| WASM + SIMD128 | Planned |
-| GPU via wgpu (Vulkan/Metal/DX12/WebGPU) | Planned |
-| CUDA (optional) | Planned |
-
-## Supported Models
-
-| Architecture | Models | Priority |
-|-------------|--------|----------|
-| LlamaForCausalLM | Llama 3.2 (1B, 3B) | P0 |
-| Qwen2ForCausalLM | Qwen2.5 (0.5B-7B) | P0 |
-| MistralForCausalLM | Mistral 7B | P1 |
-| Phi3ForCausalLM | Phi-3 Mini | P1 |
-
-## Usage (Planned)
+## Quick Start
 
 ```bash
-# Compile a model
-forge compile --model meta-llama/Llama-3.2-1B-Instruct \
-              --target cpu --quantize q4 --output llama-1b
-
-# Run inference
-forge run llama-1b --prompt "Hello, world"
-
-# Benchmark
-forge bench llama-1b --iterations 100
-
-# Start API server
-forge serve llama-1b --port 8080
-```
-
-## Building from Source
-
-```bash
+# Build from source
 git clone https://github.com/sauravpanda/forge-llm.git
 cd forge-llm
 cargo build --release
+
+# Download a model
+pip install huggingface-hub
+python3 -c "from huggingface_hub import hf_hub_download; print(hf_hub_download('bartowski/SmolLM2-135M-Instruct-GGUF', 'SmolLM2-135M-Instruct-Q8_0.gguf'))"
+python3 -c "from huggingface_hub import hf_hub_download; print(hf_hub_download('HuggingFaceTB/SmolLM2-135M-Instruct', 'tokenizer.json'))"
+
+# Run inference
+cargo run --release -- run \
+  --model path/to/SmolLM2-135M-Instruct-Q8_0.gguf \
+  --tokenizer path/to/tokenizer.json \
+  --prompt "Hello, world"
+```
+
+## Supported Models
+
+| Architecture | Models | Status |
+|-------------|--------|--------|
+| LlamaForCausalLM | SmolLM2 (135M, 360M, 1.7B), Llama 3.2 (1B, 3B), TinyLlama | Working |
+| Qwen2ForCausalLM | Qwen2.5 (0.5B-7B) | Working |
+| MistralForCausalLM | Mistral 7B | Working |
+
+Supports GGUF quantization formats: F32, F16, BF16, Q8_0, Q4_0, Q4_1.
+
+## Performance
+
+Reference interpreter (naive f32, no SIMD):
+
+| Model | Params | Prefill | Generation |
+|-------|--------|---------|------------|
+| SmolLM2-135M Q8_0 | 135M | ~20 tok/s | ~21.6 tok/s |
+
+These are baseline numbers. SIMD kernels and operator fusion will bring 10-30x improvements.
+
+## CLI Commands
+
+```bash
+# Run inference on a GGUF model
+forge run --model model.gguf --tokenizer tokenizer.json --prompt "Hello"
+
+# Inspect model architecture
+forge info model.gguf
+
+# Compile to optimized Rust source (experimental)
+forge compile --model model.gguf --target cpu --output model.rs
+```
+
+## Architecture
+
+```
+GGUF/SafeTensors → Frontend (parse) → IR Graph → Optimizer → Codegen/Interpreter → Text
+```
+
+7 crates: `forgellm-frontend`, `forgellm-optimizer`, `forgellm-codegen-cpu`, `forgellm-codegen-wasm`, `forgellm-codegen-gpu`, `forgellm-runtime`, `forgellm-cli`
+
+See the [full documentation](https://sauravpanda.github.io/forge-llm/) for architecture details.
+
+## Contributing
+
+```bash
+cargo test --workspace            # Run tests (89 tests)
+cargo clippy --workspace -- -D warnings  # Lint
+cargo fmt --all -- --check        # Format check
 ```
 
 ## License
