@@ -5,8 +5,9 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom};
+use std::path::Path;
 
-use crate::gguf::{GGMLType, GGUFFile, GGUFTensorInfo};
+use crate::gguf::{self, GGMLType, GGUFFile, GGUFTensorInfo};
 
 /// Loaded model weights — all tensors dequantized to f32.
 #[derive(Debug, Clone)]
@@ -77,6 +78,41 @@ pub fn load_all<R: Read + Seek>(
     }
 
     Ok(ModelWeights { tensors })
+}
+
+/// Load all tensors from a GGUF file using memory mapping.
+///
+/// This is faster than `load_all` because it avoids reading the entire
+/// file into a Vec first — the OS maps it directly into virtual memory.
+pub fn load_from_file(path: impl AsRef<Path>) -> Result<(GGUFFile, ModelWeights), WeightLoadError> {
+    let file = std::fs::File::open(path.as_ref())?;
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    let mut cursor = io::Cursor::new(&mmap[..]);
+
+    let gguf = gguf::parse(&mut cursor).map_err(|e| WeightLoadError::Io(io::Error::other(e)))?;
+
+    let mut tensors = HashMap::with_capacity(gguf.tensors.len());
+    for tensor_info in &gguf.tensors {
+        let data_offset = gguf.tensor_data_offset + tensor_info.offset;
+        let data_size = tensor_info.data_size() as usize;
+        let numel = tensor_info.numel() as usize;
+
+        let start = data_offset as usize;
+        let end = start + data_size;
+        if end > mmap.len() {
+            return Err(WeightLoadError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("tensor {} extends past end of file", tensor_info.name),
+            )));
+        }
+
+        let raw = &mmap[start..end];
+        let data = dequantize(raw, tensor_info.ggml_type, numel)?;
+        let hf_name = gguf_name_to_hf(&tensor_info.name);
+        tensors.insert(hf_name, data);
+    }
+
+    Ok((gguf, ModelWeights { tensors }))
 }
 
 /// Remap GGUF tensor names to HuggingFace convention.

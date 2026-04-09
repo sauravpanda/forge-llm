@@ -44,5 +44,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Tokenizer
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 
+# Memory mapping
+memmap2 = "0.9"
+
 # Testing
 pretty_assertions = "1"
