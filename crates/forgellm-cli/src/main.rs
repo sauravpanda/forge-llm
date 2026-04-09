@@ -350,13 +350,11 @@ fn cmd_run(
     let graph =
         graph_builder::build_graph(&config).with_context(|| "failed to build computation graph")?;
 
-    // Load weights
+    // Load weights (mmap)
     eprintln!("Loading weights...");
     let start = Instant::now();
-    let data = fs::read(model_path).with_context(|| format!("failed to read {model_path}"))?;
-    let gguf_file = gguf::parse(Cursor::new(&data)).with_context(|| "failed to parse GGUF file")?;
-    let weights = weight_loader::load_all(&mut Cursor::new(&data), &gguf_file)
-        .with_context(|| "failed to load weights")?;
+    let (_gguf_file, weights) =
+        weight_loader::load_from_file(model_path).with_context(|| "failed to load weights")?;
     eprintln!(
         "Loaded {} tensors ({:.1} MB) in {:.1}s",
         weights.len(),
@@ -477,10 +475,8 @@ fn cmd_serve(model_path: &str, tokenizer_path: &str, port: u16) -> Result<()> {
     let graph =
         graph_builder::build_graph(&config).with_context(|| "failed to build computation graph")?;
 
-    let data = fs::read(model_path).with_context(|| format!("failed to read {model_path}"))?;
-    let gguf_file = gguf::parse(Cursor::new(&data)).with_context(|| "failed to parse GGUF file")?;
-    let weights = weight_loader::load_all(&mut Cursor::new(&data), &gguf_file)
-        .with_context(|| "failed to load weights")?;
+    let (_gguf_file, weights) =
+        weight_loader::load_from_file(model_path).with_context(|| "failed to load weights")?;
 
     eprintln!(
         "Model loaded: {} | {} layers | {:.0} MB",
