@@ -9,6 +9,7 @@ pub mod gguf;
 pub mod graph_builder;
 pub mod ir;
 pub mod safetensors;
+pub mod weight_loader;
 
 /// Re-export core IR types at the crate root.
 pub use ir::*;
