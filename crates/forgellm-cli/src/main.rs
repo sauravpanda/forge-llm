@@ -110,6 +110,29 @@ enum Commands {
         prompt: String,
     },
 
+    /// Interactive chat mode
+    Chat {
+        /// Path to GGUF model file
+        #[arg(long)]
+        model: String,
+
+        /// Path to tokenizer.json
+        #[arg(long)]
+        tokenizer: String,
+
+        /// System prompt
+        #[arg(long, default_value = "You are a helpful assistant.")]
+        system: String,
+
+        /// Maximum tokens per response
+        #[arg(long, default_value = "256")]
+        max_tokens: usize,
+
+        /// Temperature (0 = greedy)
+        #[arg(long, default_value = "0.7")]
+        temperature: f32,
+    },
+
     /// Start an OpenAI-compatible API server
     Serve {
         /// Path to GGUF model file
@@ -187,6 +210,14 @@ fn main() -> Result<()> {
             runs,
             prompt,
         } => cmd_bench(&model, &tokenizer, &prompt, num_tokens, runs)?,
+
+        Commands::Chat {
+            model,
+            tokenizer,
+            system,
+            max_tokens,
+            temperature,
+        } => cmd_chat(&model, &tokenizer, &system, max_tokens, temperature)?,
 
         Commands::Serve {
             model,
@@ -988,7 +1019,6 @@ fn handle_completion_stream(
             .min(prompt_tokens.len() + max_tokens + 16),
     );
 
-    // Prefill
     let mut next_token = 0u32;
     for (pos, &token) in prompt_tokens.iter().enumerate() {
         let logits = interpreter::forward(token, pos, graph, weights, &mut cache);
@@ -996,7 +1026,6 @@ fn handle_completion_stream(
         next_token = sampling::sample(&logits, &sampling_config, pos as u64);
     }
 
-    // Generate and stream
     let eos_id = tokenizer.eos_token_id();
     let mut all_tokens: Vec<u32> = prompt_tokens;
 
@@ -1021,6 +1050,113 @@ fn handle_completion_stream(
         cache.advance();
         sampling::apply_repetition_penalty(&mut logits, &all_tokens, 1.1);
         next_token = sampling::sample(&logits, &sampling_config, (i + 1) as u64);
+    }
+
+    Ok(())
+}
+
+fn cmd_chat(
+    model_path: &str,
+    tokenizer_path: &str,
+    system_prompt: &str,
+    max_tokens: usize,
+    temperature: f32,
+) -> Result<()> {
+    use forgellm_runtime::chat::{ChatMessage, ChatTemplate};
+
+    eprintln!("Loading tokenizer...");
+    let tokenizer = Tokenizer::from_file(tokenizer_path)?;
+    eprintln!("Loading model...");
+    let config = load_model_config(model_path)?;
+    let graph = graph_builder::build_graph(&config)?;
+    eprintln!("Loading weights...");
+    let (_gguf, weights) = weight_loader::load_from_file(model_path)?;
+    eprintln!(
+        "Ready! {} | {} layers | {:.0} MB\n",
+        config.architecture,
+        config.num_layers,
+        weights.memory_bytes() as f64 / 1e6
+    );
+
+    let template = ChatTemplate::from_architecture(&config.architecture.to_string());
+    let sampling_config = if temperature == 0.0 {
+        sampling::SamplingConfig {
+            repetition_penalty: 1.1,
+            ..sampling::SamplingConfig::greedy()
+        }
+    } else {
+        sampling::SamplingConfig {
+            temperature,
+            top_k: 0,
+            top_p: 0.9,
+            repetition_penalty: 1.1,
+        }
+    };
+
+    let mut history: Vec<ChatMessage> = vec![ChatMessage::system(system_prompt)];
+
+    loop {
+        eprint!("You: ");
+        io::stderr().flush()?;
+        let mut user_input = String::new();
+        if io::stdin().read_line(&mut user_input)? == 0 {
+            break;
+        }
+        let user_input = user_input.trim();
+        if user_input.is_empty() {
+            continue;
+        }
+        if user_input == "/quit" || user_input == "/exit" {
+            break;
+        }
+        if user_input == "/clear" {
+            history.truncate(1);
+            eprintln!("History cleared.\n");
+            continue;
+        }
+
+        history.push(ChatMessage::user(user_input));
+        let prompt = template.format(&history);
+        let prompt_tokens = tokenizer.encode(&prompt)?;
+
+        let mut cache = KVCache::with_capacity(
+            config.num_layers,
+            config.num_kv_heads,
+            config.head_dim,
+            config
+                .max_seq_len
+                .min(prompt_tokens.len() + max_tokens + 16),
+        );
+
+        let mut next_token = 0u32;
+        for (pos, &token) in prompt_tokens.iter().enumerate() {
+            let logits = interpreter::forward(token, pos, &graph, &weights, &mut cache);
+            cache.advance();
+            next_token = sampling::sample(&logits, &sampling_config, pos as u64);
+        }
+
+        eprint!("\nAssistant: ");
+        let eos_id = tokenizer.eos_token_id();
+        let mut response_text = String::new();
+        let mut all_tokens: Vec<u32> = prompt_tokens;
+
+        for i in 0..max_tokens {
+            let text = tokenizer.decode_one(next_token).unwrap_or_default();
+            eprint!("{text}");
+            io::stderr().flush()?;
+            response_text.push_str(&text);
+            all_tokens.push(next_token);
+            if eos_id.is_some_and(|eos| next_token == eos) {
+                break;
+            }
+            let pos = all_tokens.len() - 1;
+            let mut logits = interpreter::forward(next_token, pos, &graph, &weights, &mut cache);
+            cache.advance();
+            sampling::apply_repetition_penalty(&mut logits, &all_tokens, 1.1);
+            next_token = sampling::sample(&logits, &sampling_config, (i + 1) as u64);
+        }
+        eprintln!("\n");
+        history.push(ChatMessage::assistant(response_text.trim()));
     }
 
     Ok(())
