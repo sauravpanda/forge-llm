@@ -106,16 +106,42 @@ pub fn matmul(output: &mut [f32], input: &[f32], weight: &[f32], m: usize, k: us
     }
 }
 
-/// Optimized RMSNorm: output = (input / rms(input)) * weight
+/// NEON-accelerated RMSNorm: output = (input / rms(input)) * weight
 pub fn rms_norm(output: &mut [f32], input: &[f32], weight: &[f32], eps: f32) {
     let n = input.len();
 
-    // Compute sum of squares
+    // NEON dot product for sum of squares
     let sum_sq = dot_f32_neon(input, input, n);
     let inv_rms = 1.0 / (sum_sq / n as f32 + eps).sqrt();
 
-    // Apply normalization + weight
-    for i in 0..n {
+    // NEON-accelerated normalization + weight multiply
+    rms_norm_apply(output, input, weight, inv_rms);
+}
+
+#[cfg(target_arch = "aarch64")]
+fn rms_norm_apply(output: &mut [f32], input: &[f32], weight: &[f32], inv_rms: f32) {
+    use std::arch::aarch64::*;
+    let n = input.len();
+    let chunks = n / 4;
+
+    unsafe {
+        let scale = vdupq_n_f32(inv_rms);
+        for i in 0..chunks {
+            let base = i * 4;
+            let x = vld1q_f32(input.as_ptr().add(base));
+            let w = vld1q_f32(weight.as_ptr().add(base));
+            let r = vmulq_f32(vmulq_f32(x, scale), w);
+            vst1q_f32(output.as_mut_ptr().add(base), r);
+        }
+    }
+    for i in (chunks * 4)..n {
+        output[i] = input[i] * inv_rms * weight[i];
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn rms_norm_apply(output: &mut [f32], input: &[f32], weight: &[f32], inv_rms: f32) {
+    for i in 0..input.len() {
         output[i] = input[i] * inv_rms * weight[i];
     }
 }
@@ -136,17 +162,77 @@ pub fn gelu(output: &mut [f32], input: &[f32]) {
     }
 }
 
-/// Optimized elementwise multiply
+/// NEON-accelerated elementwise multiply
 pub fn elementwise_mul(output: &mut [f32], a: &[f32], b: &[f32]) {
-    for i in 0..a.len() {
-        output[i] = a[i] * b[i];
+    elementwise_binary_op(output, a, b, BinaryOp::Mul);
+}
+
+/// NEON-accelerated elementwise add
+pub fn elementwise_add(output: &mut [f32], a: &[f32], b: &[f32]) {
+    elementwise_binary_op(output, a, b, BinaryOp::Add);
+}
+
+enum BinaryOp {
+    Mul,
+    Add,
+}
+
+#[cfg(target_arch = "aarch64")]
+fn elementwise_binary_op(output: &mut [f32], a: &[f32], b: &[f32], op: BinaryOp) {
+    use std::arch::aarch64::*;
+    let n = a.len();
+    let chunks = n / 16;
+
+    unsafe {
+        for i in 0..chunks {
+            let base = i * 16;
+            let a0 = vld1q_f32(a.as_ptr().add(base));
+            let b0 = vld1q_f32(b.as_ptr().add(base));
+            let a1 = vld1q_f32(a.as_ptr().add(base + 4));
+            let b1 = vld1q_f32(b.as_ptr().add(base + 4));
+            let a2 = vld1q_f32(a.as_ptr().add(base + 8));
+            let b2 = vld1q_f32(b.as_ptr().add(base + 8));
+            let a3 = vld1q_f32(a.as_ptr().add(base + 12));
+            let b3 = vld1q_f32(b.as_ptr().add(base + 12));
+
+            let (r0, r1, r2, r3) = match op {
+                BinaryOp::Mul => (
+                    vmulq_f32(a0, b0),
+                    vmulq_f32(a1, b1),
+                    vmulq_f32(a2, b2),
+                    vmulq_f32(a3, b3),
+                ),
+                BinaryOp::Add => (
+                    vaddq_f32(a0, b0),
+                    vaddq_f32(a1, b1),
+                    vaddq_f32(a2, b2),
+                    vaddq_f32(a3, b3),
+                ),
+            };
+
+            vst1q_f32(output.as_mut_ptr().add(base), r0);
+            vst1q_f32(output.as_mut_ptr().add(base + 4), r1);
+            vst1q_f32(output.as_mut_ptr().add(base + 8), r2);
+            vst1q_f32(output.as_mut_ptr().add(base + 12), r3);
+        }
+    }
+
+    // Scalar remainder
+    for i in (chunks * 16)..n {
+        output[i] = match op {
+            BinaryOp::Mul => a[i] * b[i],
+            BinaryOp::Add => a[i] + b[i],
+        };
     }
 }
 
-/// Optimized elementwise add
-pub fn elementwise_add(output: &mut [f32], a: &[f32], b: &[f32]) {
+#[cfg(not(target_arch = "aarch64"))]
+fn elementwise_binary_op(output: &mut [f32], a: &[f32], b: &[f32], op: BinaryOp) {
     for i in 0..a.len() {
-        output[i] = a[i] + b[i];
+        output[i] = match op {
+            BinaryOp::Mul => a[i] * b[i],
+            BinaryOp::Add => a[i] + b[i],
+        };
     }
 }
 
