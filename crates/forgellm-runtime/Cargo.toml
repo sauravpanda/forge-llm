@@ -1,13 +1,12 @@
 [package]
-name = "forge-codegen-wasm"
-description = "WASM + WebGPU code generation for Forge"
+name = "forgellm-runtime"
+description = "Minimal runtime for ForgeLLM (KV cache, sampling, tokenizer, API server)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-forge-frontend = { workspace = true }
-forge-optimizer = { workspace = true }
+forgellm-frontend = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

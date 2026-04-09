@@ -3,7 +3,7 @@
 //! Includes operator fusion, memory layout optimization,
 //! compile-time quantization, and static memory planning.
 
-use forge_frontend::Graph;
+use forgellm_frontend::Graph;
 
 /// Apply all optimization passes to a computation graph.
 pub fn optimize(graph: &Graph) -> Graph {

@@ -126,56 +126,56 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56254986775e3233ffa9c4d7d3faaf6d36a2c09d30b20687e9f88bc8bafc16c8"
 
 [[package]]
-name = "forge-cli"
+name = "forgellm-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "forge-codegen-cpu",
- "forge-codegen-gpu",
- "forge-codegen-wasm",
- "forge-frontend",
- "forge-optimizer",
- "forge-runtime",
+ "forgellm-codegen-cpu",
+ "forgellm-codegen-gpu",
+ "forgellm-codegen-wasm",
+ "forgellm-frontend",
+ "forgellm-optimizer",
+ "forgellm-runtime",
  "tracing",
  "tracing-subscriber",
 ]
 
 [[package]]
-name = "forge-codegen-cpu"
+name = "forgellm-codegen-cpu"
 version = "0.1.0"
 dependencies = [
- "forge-frontend",
- "forge-optimizer",
+ "forgellm-frontend",
+ "forgellm-optimizer",
  "pretty_assertions",
  "thiserror",
  "tracing",
 ]
 
 [[package]]
-name = "forge-codegen-gpu"
+name = "forgellm-codegen-gpu"
 version = "0.1.0"
 dependencies = [
- "forge-frontend",
- "forge-optimizer",
+ "forgellm-frontend",
+ "forgellm-optimizer",
  "pretty_assertions",
  "thiserror",
  "tracing",
 ]
 
 [[package]]
-name = "forge-codegen-wasm"
+name = "forgellm-codegen-wasm"
 version = "0.1.0"
 dependencies = [
- "forge-frontend",
- "forge-optimizer",
+ "forgellm-frontend",
+ "forgellm-optimizer",
  "pretty_assertions",
  "thiserror",
  "tracing",
 ]
 
 [[package]]
-name = "forge-frontend"
+name = "forgellm-frontend"
 version = "0.1.0"
 dependencies = [
  "pretty_assertions",
@@ -186,20 +186,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "forge-optimizer"
+name = "forgellm-optimizer"
 version = "0.1.0"
 dependencies = [
- "forge-frontend",
+ "forgellm-frontend",
  "pretty_assertions",
  "thiserror",
  "tracing",
 ]
 
 [[package]]
-name = "forge-runtime"
+name = "forgellm-runtime"
 version = "0.1.0"
 dependencies = [
- "forge-frontend",
+ "forgellm-frontend",
  "pretty_assertions",
  "thiserror",
  "tracing",

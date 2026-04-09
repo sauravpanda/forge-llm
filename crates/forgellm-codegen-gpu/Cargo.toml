@@ -1,13 +1,13 @@
 [package]
-name = "forge-codegen-cpu"
-description = "CPU code generation (x86 AVX2/512, ARM NEON) for Forge"
+name = "forgellm-codegen-gpu"
+description = "GPU code generation via wgpu/WGSL for ForgeLLM"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-forge-frontend = { workspace = true }
-forge-optimizer = { workspace = true }
+forgellm-frontend = { workspace = true }
+forgellm-optimizer = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

@@ -1,12 +1,13 @@
 [package]
-name = "forge-optimizer"
-description = "Graph-level optimizations for Forge (fusion, layout, quantization, memory planning)"
+name = "forgellm-codegen-cpu"
+description = "CPU code generation (x86 AVX2/512, ARM NEON) for ForgeLLM"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-forge-frontend = { workspace = true }
+forgellm-frontend = { workspace = true }
+forgellm-optimizer = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

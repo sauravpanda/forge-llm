@@ -7,20 +7,20 @@ Forge is a Rust-native ahead-of-time (AOT) ML compiler for small LLMs (1-7B para
 ## Repository Structure
 
 Rust workspace with crates under `crates/`:
-- `forge-frontend` — Model parsing (GGUF, SafeTensors) and IR construction
-- `forge-optimizer` — Graph optimizations (fusion, layout, quantization, memory planning)
-- `forge-codegen-cpu` — CPU code generation (x86 AVX2/512, ARM NEON, Apple AMX)
-- `forge-codegen-wasm` — WASM + WebGPU code generation
-- `forge-codegen-gpu` — GPU code generation via wgpu/WGSL
-- `forge-runtime` — Minimal runtime (KV cache, sampling, tokenizer, API server)
-- `forge-cli` — CLI (`forge compile`, `forge run`, `forge bench`, `forge serve`)
+- `forgellm-frontend` — Model parsing (GGUF, SafeTensors) and IR construction
+- `forgellm-optimizer` — Graph optimizations (fusion, layout, quantization, memory planning)
+- `forgellm-codegen-cpu` — CPU code generation (x86 AVX2/512, ARM NEON, Apple AMX)
+- `forgellm-codegen-wasm` — WASM + WebGPU code generation
+- `forgellm-codegen-gpu` — GPU code generation via wgpu/WGSL
+- `forgellm-runtime` — Minimal runtime (KV cache, sampling, tokenizer, API server)
+- `forgellm-cli` — CLI (`forge compile`, `forge run`, `forge bench`, `forge serve`)
 
 ## Build & Test
 
 ```bash
 cargo build                    # Build all crates
 cargo test                     # Run all tests
-cargo test -p forge-frontend   # Test a specific crate
+cargo test -p forgellm-frontend   # Test a specific crate
 cargo clippy                   # Lint
 cargo fmt --check              # Format check
 ```

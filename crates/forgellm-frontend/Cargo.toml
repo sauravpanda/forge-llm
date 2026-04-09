@@ -1,6 +1,6 @@
 [package]
-name = "forge-frontend"
-description = "Model parsing (GGUF, SafeTensors) and IR construction for Forge"
+name = "forgellm-frontend"
+description = "Model parsing (GGUF, SafeTensors) and IR construction for ForgeLLM"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

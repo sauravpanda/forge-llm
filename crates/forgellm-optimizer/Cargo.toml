@@ -1,13 +1,12 @@
 [package]
-name = "forge-codegen-gpu"
-description = "GPU code generation via wgpu/WGSL for Forge"
+name = "forgellm-optimizer"
+description = "Graph-level optimizations for ForgeLLM (fusion, layout, quantization, memory planning)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-forge-frontend = { workspace = true }
-forge-optimizer = { workspace = true }
+forgellm-frontend = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

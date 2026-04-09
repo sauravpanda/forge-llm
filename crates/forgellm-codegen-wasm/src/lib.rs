@@ -3,7 +3,7 @@
 //! Generates WASM-compatible Rust with SIMD128 intrinsics
 //! and companion WGSL compute shaders for WebGPU acceleration.
 
-use forge_frontend::Graph;
+use forgellm_frontend::Graph;
 
 /// Generate WASM-optimized code from a computation graph.
 pub fn generate(_graph: &Graph) -> String {

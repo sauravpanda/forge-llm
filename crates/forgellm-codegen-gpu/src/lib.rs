@@ -3,7 +3,7 @@
 //! Generates WGSL compute shaders for cross-platform GPU acceleration
 //! via wgpu (Vulkan, Metal, DX12, WebGPU).
 
-use forge_frontend::Graph;
+use forgellm_frontend::Graph;
 
 /// Generate GPU compute shaders from a computation graph.
 pub fn generate(_graph: &Graph) -> String {
