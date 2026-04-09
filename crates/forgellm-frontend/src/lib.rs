@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod gguf;
+pub mod graph_builder;
 pub mod ir;
 pub mod safetensors;
 
