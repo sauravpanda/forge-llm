@@ -7,7 +7,9 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use forgellm_frontend::{config::HFConfig, gguf, graph_builder, ir::ModelConfig, weight_loader};
+use forgellm_frontend::{
+    config::HFConfig, gguf, graph_builder, hub, ir::ModelConfig, weight_loader,
+};
 use forgellm_runtime::{
     chat::ChatTemplate, interpreter, kv_cache::KVCache, sampling, tokenizer::Tokenizer,
 };
@@ -334,6 +336,25 @@ fn load_model_config(model_path: &str) -> Result<ModelConfig> {
     }
 }
 
+/// Resolve model and tokenizer paths — handles HF model IDs.
+/// If model is a HF ID (org/model), downloads GGUF + tokenizer.
+/// Returns (model_path, tokenizer_path).
+fn resolve_paths(model: &str, tokenizer: &str) -> Result<(String, String)> {
+    if hub::is_hf_model_id(model) {
+        eprintln!("Detected HuggingFace model ID: {model}");
+        let (gguf_path, tok_path) =
+            hub::resolve_model(model).with_context(|| "failed to resolve HF model")?;
+        eprintln!("Model: {}", gguf_path.display());
+        eprintln!("Tokenizer: {}", tok_path.display());
+        Ok((
+            gguf_path.to_string_lossy().into(),
+            tok_path.to_string_lossy().into(),
+        ))
+    } else {
+        Ok((model.to_string(), tokenizer.to_string()))
+    }
+}
+
 fn cmd_compile(model_path: &str, target: &str, output_path: &str) -> Result<()> {
     println!("Loading model config from {model_path}...");
     let config = load_model_config(model_path)?;
@@ -397,8 +418,8 @@ fn cmd_info(model_path: &str) -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 fn cmd_run(
-    model_path: &str,
-    tokenizer_path: &str,
+    model_path_raw: &str,
+    tokenizer_path_raw: &str,
     prompt: &str,
     max_tokens: usize,
     temperature: f32,
@@ -406,6 +427,10 @@ fn cmd_run(
     top_p: f32,
     repeat_penalty: f32,
 ) -> Result<()> {
+    let (model_path, tokenizer_path) = resolve_paths(model_path_raw, tokenizer_path_raw)?;
+    let model_path = model_path.as_str();
+    let tokenizer_path = tokenizer_path.as_str();
+
     // Load tokenizer
     eprintln!("Loading tokenizer from {tokenizer_path}...");
     let tokenizer =
