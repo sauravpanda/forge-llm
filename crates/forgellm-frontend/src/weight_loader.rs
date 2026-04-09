@@ -63,6 +63,7 @@ pub enum WeightLoadError {
 }
 
 /// Load all tensors from a GGUF file, dequantizing to f32.
+/// Tensor names are remapped from GGUF convention to HuggingFace convention.
 pub fn load_all<R: Read + Seek>(
     reader: &mut R,
     gguf: &GGUFFile,
@@ -71,10 +72,52 @@ pub fn load_all<R: Read + Seek>(
 
     for tensor_info in &gguf.tensors {
         let data = load_tensor(reader, gguf, tensor_info)?;
-        tensors.insert(tensor_info.name.clone(), data);
+        let hf_name = gguf_name_to_hf(&tensor_info.name);
+        tensors.insert(hf_name, data);
     }
 
     Ok(ModelWeights { tensors })
+}
+
+/// Remap GGUF tensor names to HuggingFace convention.
+///
+/// GGUF: `token_embd.weight`, `blk.0.attn_q.weight`, `output_norm.weight`
+/// HF:   `model.embed_tokens.weight`, `model.layers.0.self_attn.q_proj.weight`, `model.norm.weight`
+fn gguf_name_to_hf(name: &str) -> String {
+    // Direct mappings for non-layer tensors
+    match name {
+        "token_embd.weight" => return "model.embed_tokens.weight".to_string(),
+        "output_norm.weight" => return "model.norm.weight".to_string(),
+        "output.weight" => return "lm_head.weight".to_string(),
+        _ => {}
+    }
+
+    // Layer tensor mappings: blk.N.xxx → model.layers.N.yyy
+    if let Some(rest) = name.strip_prefix("blk.") {
+        // Parse layer number
+        if let Some(dot_pos) = rest.find('.') {
+            let layer_num = &rest[..dot_pos];
+            let suffix = &rest[dot_pos + 1..];
+
+            let hf_suffix = match suffix {
+                "attn_norm.weight" => "input_layernorm.weight",
+                "attn_q.weight" => "self_attn.q_proj.weight",
+                "attn_k.weight" => "self_attn.k_proj.weight",
+                "attn_v.weight" => "self_attn.v_proj.weight",
+                "attn_output.weight" => "self_attn.o_proj.weight",
+                "ffn_norm.weight" => "post_attention_layernorm.weight",
+                "ffn_gate.weight" => "mlp.gate_proj.weight",
+                "ffn_up.weight" => "mlp.up_proj.weight",
+                "ffn_down.weight" => "mlp.down_proj.weight",
+                other => other, // Pass through unknown suffixes
+            };
+
+            return format!("model.layers.{layer_num}.{hf_suffix}");
+        }
+    }
+
+    // Fallback: return original name
+    name.to_string()
 }
 
 /// Load a single tensor from a GGUF file, dequantizing to f32.

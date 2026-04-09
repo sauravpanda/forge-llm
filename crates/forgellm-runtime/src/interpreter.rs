@@ -126,8 +126,10 @@ pub fn forward(
         config.rms_norm_eps,
     );
 
-    // Logits projection
-    let lm_head_w = weights.tensor("lm_head.weight");
+    // Logits projection (may use tied embeddings)
+    let lm_head_w = weights
+        .get("lm_head.weight")
+        .unwrap_or_else(|| weights.tensor("model.embed_tokens.weight"));
     let mut logits = vec![0.0f32; vocab];
     matmul(&mut logits, &normed, lm_head_w, 1, hidden, vocab);
 

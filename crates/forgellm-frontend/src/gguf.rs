@@ -15,8 +15,8 @@ use std::io::{self, Read, Seek};
 
 use crate::ir::DType;
 
-/// GGUF magic number: "GGUF" in little-endian.
-const GGUF_MAGIC: u32 = 0x46475547; // "GGUF"
+/// GGUF magic number: "GGUF" as bytes [0x47, 0x47, 0x55, 0x46] read as u32 LE.
+const GGUF_MAGIC: u32 = 0x46554747;
 
 /// Default alignment for tensor data.
 const DEFAULT_ALIGNMENT: u64 = 32;
