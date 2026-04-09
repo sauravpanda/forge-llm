@@ -1,36 +1,67 @@
 # Performance Results
 
-## SmolLM2-135M-Instruct (Q8_0)
+## Verified Models
 
-Tested on Apple Silicon (M-series), reference interpreter (naive f32, no SIMD).
+All benchmarks on Apple Silicon (M-series), optimized kernels (unrolled matmul).
+
+### SmolLM2-135M-Instruct (Q8_0)
 
 | Metric | Value |
 |--------|-------|
-| Model | SmolLM2-135M-Instruct |
-| Quantization | Q8_0 |
 | Parameters | 135M |
-| Weight memory | 538 MB (dequantized to f32) |
-| Weight load time | 0.1s |
-| Prefill throughput | ~20 tok/s |
-| Generation throughput | ~21.6 tok/s |
+| Architecture | Llama |
+| Quantization | Q8_0 |
+| Weight memory | 538 MB |
+| Avg prefill | 46.0 tok/s |
+| Avg generate | **46.3 tok/s** |
 
-### Sample Output
+### SmolLM2-360M-Instruct (Q8_0)
+
+| Metric | Value |
+|--------|-------|
+| Parameters | 360M |
+| Architecture | Llama |
+| Quantization | Q8_0 |
+| Weight memory | 1,447 MB |
+| Avg generate | **17.5 tok/s** |
+
+### Qwen2.5-0.5B-Instruct (Q8_0)
+
+| Metric | Value |
+|--------|-------|
+| Parameters | 494M |
+| Architecture | Qwen2 |
+| Quantization | Q8_0 |
+| Weight memory | 2,521 MB |
+| Avg generate | **12.0 tok/s** |
+
+## Sample Output
 
 ```
-Prompt: "The meaning of life is"
+$ forge run --model SmolLM2-135M-Instruct-Q8_0.gguf \
+            --tokenizer tokenizer.json \
+            --prompt "The meaning of life is"
 
 The meaning of life is a complex and multifaceted concept that has been
 debated by philosophers, scientists, and theologians for centuries. At its
 core, the question of what it means to be human...
+
+Prefill: 5 tokens in 0.13s (37.3 tok/s)
+Generate: 65 tokens in 1.42s (45.7 tok/s)
 ```
 
-## Performance Roadmap
+## Performance History
 
-The current numbers are from the reference interpreter — a naive, unoptimized f32 implementation. Planned optimizations:
+| Version | SmolLM-135M Q8_0 | Improvement |
+|---------|------------------|-------------|
+| v0.1 (reference interpreter) | 21.6 tok/s | baseline |
+| v0.2 (unrolled matmul) | **46.3 tok/s** | **2.1x** |
+
+## Roadmap
 
 | Optimization | Expected Speedup |
 |-------------|-----------------|
-| SIMD matmul (AVX2/NEON) | 3-5x |
+| ARM NEON SIMD intrinsics | 2-3x |
 | Operator fusion | 1.5-2x |
 | Quantized inference (skip dequant) | 2-3x |
 | Static memory planning | 1.2x |
