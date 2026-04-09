@@ -287,6 +287,14 @@ impl GGUFFile {
         })
     }
 
+    /// Get the length of a metadata array by key.
+    pub fn get_array_len(&self, key: &str) -> Option<usize> {
+        self.metadata
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+    }
+
     /// Get a metadata f32 value by key.
     pub fn get_f32(&self, key: &str) -> Option<f32> {
         self.metadata.get(key).and_then(|v| v.as_f32())

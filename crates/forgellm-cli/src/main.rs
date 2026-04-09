@@ -182,8 +182,7 @@ fn load_model_config(model_path: &str) -> Result<ModelConfig> {
             .map(|v| v as usize)
             .unwrap_or(hidden_size * 4);
         let vocab_size = gguf_file
-            .get_u32("tokenizer.ggml.tokens")
-            .map(|v| v as usize)
+            .get_array_len("tokenizer.ggml.tokens")
             .or_else(|| {
                 gguf_file
                     .get_u64(&format!("{prefix}.vocab_size"))

@@ -64,6 +64,17 @@ pub fn forward(
         matmul(&mut k, &normed, k_w, 1, hidden, num_kv_heads * head_dim);
         matmul(&mut v, &normed, v_w, 1, hidden, num_kv_heads * head_dim);
 
+        // Add QKV biases if present (Qwen2 uses biases on QKV)
+        if let Some(q_bias) = weights.get(&format!("{prefix}.self_attn.q_proj.bias")) {
+            elementwise_add_inplace(&mut q, q_bias);
+        }
+        if let Some(k_bias) = weights.get(&format!("{prefix}.self_attn.k_proj.bias")) {
+            elementwise_add_inplace(&mut k, k_bias);
+        }
+        if let Some(v_bias) = weights.get(&format!("{prefix}.self_attn.v_proj.bias")) {
+            elementwise_add_inplace(&mut v, v_bias);
+        }
+
         // RoPE
         rope(&mut q, pos, head_dim, num_heads, config.rope_theta);
         rope(&mut k, pos, head_dim, num_kv_heads, config.rope_theta);
@@ -157,6 +168,12 @@ fn elementwise_mul(output: &mut [f32], a: &[f32], b: &[f32]) {
 
 fn elementwise_add(output: &mut [f32], a: &[f32], b: &[f32]) {
     kernels::elementwise_add(output, a, b);
+}
+
+fn elementwise_add_inplace(a: &mut [f32], b: &[f32]) {
+    for i in 0..a.len() {
+        a[i] += b[i];
+    }
 }
 
 fn softmax(values: &mut [f32]) {
