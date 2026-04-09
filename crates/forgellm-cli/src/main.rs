@@ -1237,31 +1237,40 @@ fn cmd_chat(
             eprintln!("History cleared.\n");
             continue;
         }
+        if user_input == "/help" {
+            eprintln!("Commands: /clear /quit /exit /help\n");
+            continue;
+        }
 
         history.push(ChatMessage::user(user_input));
         let prompt = template.format(&history);
         let prompt_tokens = tokenizer.encode(&prompt)?;
+        let prompt_len = prompt_tokens.len();
 
         let mut cache = KVCache::with_capacity(
             config.num_layers,
             config.num_kv_heads,
             config.head_dim,
-            config
-                .max_seq_len
-                .min(prompt_tokens.len() + max_tokens + 16),
+            config.max_seq_len.min(prompt_len + max_tokens + 16),
         );
 
+        // Prefill
+        let prefill_start = Instant::now();
         let mut next_token = 0u32;
         for (pos, &token) in prompt_tokens.iter().enumerate() {
             let logits = interpreter::forward(token, pos, &graph, &weights, &mut cache);
             cache.advance();
             next_token = sampling::sample(&logits, &sampling_config, pos as u64);
         }
+        let _prefill_time = prefill_start.elapsed();
 
+        // Generate
         eprint!("\nAssistant: ");
+        let gen_start = Instant::now();
         let eos_id = tokenizer.eos_token_id();
         let mut response_text = String::new();
         let mut all_tokens: Vec<u32> = prompt_tokens;
+        let mut gen_count = 0usize;
 
         for i in 0..max_tokens {
             let text = tokenizer.decode_one(next_token).unwrap_or_default();
@@ -1269,6 +1278,7 @@ fn cmd_chat(
             io::stderr().flush()?;
             response_text.push_str(&text);
             all_tokens.push(next_token);
+            gen_count += 1;
             if eos_id.is_some_and(|eos| next_token == eos) {
                 break;
             }
@@ -1278,7 +1288,18 @@ fn cmd_chat(
             sampling::apply_repetition_penalty(&mut logits, &all_tokens, 1.1);
             next_token = sampling::sample(&logits, &sampling_config, (i + 1) as u64);
         }
-        eprintln!("\n");
+        let gen_time = gen_start.elapsed();
+
+        let gen_tps = if gen_time.as_secs_f64() > 0.0 {
+            gen_count as f64 / gen_time.as_secs_f64()
+        } else {
+            0.0
+        };
+        eprintln!(
+            "\n[{gen_count} tokens, {gen_tps:.0} tok/s | context: {}/{} tokens]\n",
+            prompt_len + gen_count,
+            config.max_seq_len,
+        );
         history.push(ChatMessage::assistant(response_text.trim()));
     }
 
