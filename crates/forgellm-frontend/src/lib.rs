@@ -4,8 +4,10 @@
 //! constructing the intermediate representation (IR) used by the
 //! optimizer and code generation backends.
 
+pub mod config;
 pub mod gguf;
 pub mod ir;
+pub mod safetensors;
 
 /// Re-export core IR types at the crate root.
 pub use ir::*;
