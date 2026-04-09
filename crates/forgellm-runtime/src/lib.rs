@@ -6,6 +6,7 @@
 pub mod interpreter;
 pub mod kv_cache;
 pub mod sampling;
+pub mod tokenizer;
 
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
