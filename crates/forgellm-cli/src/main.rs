@@ -463,7 +463,21 @@ fn cmd_run(
     let prompt_tokens = tokenizer
         .encode(prompt)
         .with_context(|| "failed to encode prompt")?;
-    eprintln!("Prompt: {} tokens", prompt_tokens.len());
+    let total_budget = config.max_seq_len.min(prompt_tokens.len() + max_tokens);
+    eprintln!(
+        "Prompt: {} tokens | Budget: {}/{} context",
+        prompt_tokens.len(),
+        total_budget,
+        config.max_seq_len,
+    );
+    if prompt_tokens.len() >= config.max_seq_len {
+        bail!(
+            "prompt ({} tokens) exceeds max context length ({})",
+            prompt_tokens.len(),
+            config.max_seq_len,
+        );
+    }
+    let effective_max_tokens = max_tokens.min(config.max_seq_len - prompt_tokens.len());
 
     // Process prompt tokens (prefill)
     eprintln!("Generating...\n");
@@ -485,7 +499,7 @@ fn cmd_run(
     let eos_id = tokenizer.eos_token_id();
     let gen_start = Instant::now();
 
-    for i in 0..max_tokens {
+    for i in 0..effective_max_tokens {
         // Decode and print the token
         if let Ok(text) = tokenizer.decode_one(next_token) {
             print!("{text}");
@@ -533,6 +547,11 @@ fn cmd_run(
     eprintln!(
         "Generate: {total_gen} tokens in {:.2}s ({tok_per_sec:.1} tok/s)",
         gen_time.as_secs_f64(),
+    );
+    eprintln!(
+        "Context: {}/{} tokens used",
+        prompt_tokens.len() + total_gen,
+        config.max_seq_len,
     );
 
     Ok(())
