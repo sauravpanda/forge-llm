@@ -1,24 +1,10 @@
-//! Forge CPU Code Generation — native CPU code emission.
+//! ForgeLLM CPU Code Generation — emits Rust source from IR graphs.
 //!
-//! Generates Rust source with SIMD intrinsics (AVX2, AVX-512, NEON)
-//! specialized to exact tensor dimensions.
+//! Takes a computation graph and generates standalone Rust source code
+//! with all operations implemented as concrete functions. The generated
+//! code has no dynamic dispatch — every operation is specialized to the
+//! exact tensor dimensions from the model.
 
-use forgellm_frontend::Graph;
+mod emit;
 
-/// Generate CPU-optimized Rust source code from a computation graph.
-pub fn generate(_graph: &Graph) -> String {
-    // Will be implemented in PR 5.
-    String::from("// generated CPU code placeholder")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn generate_placeholder() {
-        let graph = Graph::new("test");
-        let code = generate(&graph);
-        assert!(!code.is_empty());
-    }
-}
+pub use emit::{generate, CodegenError};
