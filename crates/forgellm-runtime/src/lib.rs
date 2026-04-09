@@ -3,6 +3,7 @@
 //! Provides KV cache management, token sampling,
 //! and tokenizer integration for compiled models.
 
+pub mod chat;
 pub mod interpreter;
 pub mod kernels;
 pub mod kv_cache;
