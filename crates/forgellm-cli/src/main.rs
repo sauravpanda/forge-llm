@@ -16,8 +16,16 @@ use forgellm_runtime::{
 
 #[derive(Parser)]
 #[command(name = "forge")]
-#[command(about = "Compile your LLMs, don't interpret them.")]
-#[command(version)]
+#[command(about = "ForgeLLM — Compile your LLMs, don't interpret them.")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
+#[command(long_version = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\n",
+    "Architectures: Llama, Qwen2, Mistral, Phi3, Gemma, StableLM\n",
+    "Quantizations: F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q2_K-Q8_K\n",
+    "Homepage:      https://forgellm.dev\n",
+    "Repository:    https://github.com/sauravpanda/forge-llm",
+))]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
