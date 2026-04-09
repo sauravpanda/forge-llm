@@ -48,13 +48,13 @@ enum Commands {
 
     /// Run inference on a GGUF model
     Run {
-        /// Path to GGUF model file
+        /// Path to GGUF model file or HuggingFace model ID
         #[arg(long)]
         model: String,
 
-        /// Path to tokenizer.json
+        /// Path to tokenizer.json (auto-detected if omitted)
         #[arg(long)]
-        tokenizer: String,
+        tokenizer: Option<String>,
 
         /// Input prompt
         #[arg(long)]
@@ -95,9 +95,9 @@ enum Commands {
         #[arg(long)]
         model: String,
 
-        /// Path to tokenizer.json
+        /// Path to tokenizer.json (auto-detected if omitted)
         #[arg(long)]
-        tokenizer: String,
+        tokenizer: Option<String>,
 
         /// Number of tokens to generate per run
         #[arg(long, default_value = "128")]
@@ -118,9 +118,9 @@ enum Commands {
         #[arg(long)]
         model: String,
 
-        /// Path to tokenizer.json
+        /// Path to tokenizer.json (auto-detected if omitted)
         #[arg(long)]
-        tokenizer: String,
+        tokenizer: Option<String>,
 
         /// System prompt
         #[arg(long, default_value = "You are a helpful assistant.")]
@@ -141,9 +141,9 @@ enum Commands {
         #[arg(long)]
         model: String,
 
-        /// Path to tokenizer.json
+        /// Path to tokenizer.json (auto-detected if omitted)
         #[arg(long)]
-        tokenizer: String,
+        tokenizer: Option<String>,
 
         /// Port to listen on
         #[arg(long, default_value = "8080")]
@@ -193,9 +193,10 @@ fn main() -> Result<()> {
             } else {
                 prompt.clone()
             };
+            let tok = resolve_tokenizer(&tokenizer, &model)?;
             cmd_run(
                 &model,
-                &tokenizer,
+                &tok,
                 &effective_prompt,
                 max_tokens,
                 temperature,
@@ -211,7 +212,10 @@ fn main() -> Result<()> {
             num_tokens,
             runs,
             prompt,
-        } => cmd_bench(&model, &tokenizer, &prompt, num_tokens, runs)?,
+        } => {
+            let tok = resolve_tokenizer(&tokenizer, &model)?;
+            cmd_bench(&model, &tok, &prompt, num_tokens, runs)?
+        }
 
         Commands::Chat {
             model,
@@ -219,13 +223,19 @@ fn main() -> Result<()> {
             system,
             max_tokens,
             temperature,
-        } => cmd_chat(&model, &tokenizer, &system, max_tokens, temperature)?,
+        } => {
+            let tok = resolve_tokenizer(&tokenizer, &model)?;
+            cmd_chat(&model, &tok, &system, max_tokens, temperature)?
+        }
 
         Commands::Serve {
             model,
             tokenizer,
             port,
-        } => cmd_serve(&model, &tokenizer, port)?,
+        } => {
+            let tok = resolve_tokenizer(&tokenizer, &model)?;
+            cmd_serve(&model, &tok, port)?
+        }
     }
 
     Ok(())
@@ -353,6 +363,48 @@ fn resolve_paths(model: &str, tokenizer: &str) -> Result<(String, String)> {
     } else {
         Ok((model.to_string(), tokenizer.to_string()))
     }
+}
+
+/// Find tokenizer.json near a model file.
+/// Searches: same directory, parent directory, sibling directories.
+fn find_tokenizer(model_path: &str) -> Option<String> {
+    let model = Path::new(model_path);
+
+    // Same directory as model
+    if let Some(dir) = model.parent() {
+        let candidate = dir.join("tokenizer.json");
+        if candidate.exists() {
+            return Some(candidate.to_string_lossy().into());
+        }
+        // Parent directory
+        if let Some(parent) = dir.parent() {
+            let candidate = parent.join("tokenizer.json");
+            if candidate.exists() {
+                return Some(candidate.to_string_lossy().into());
+            }
+        }
+    }
+
+    None
+}
+
+/// Resolve tokenizer path — use provided path, or auto-find.
+fn resolve_tokenizer(tokenizer: &Option<String>, model_path: &str) -> Result<String> {
+    if let Some(tok) = tokenizer {
+        return Ok(tok.clone());
+    }
+
+    // Try to auto-find
+    if let Some(found) = find_tokenizer(model_path) {
+        eprintln!("Auto-detected tokenizer: {found}");
+        return Ok(found);
+    }
+
+    bail!(
+        "no tokenizer found. Provide --tokenizer path/to/tokenizer.json\n\
+         Tip: download with: python3 -c \"from huggingface_hub import hf_hub_download; \
+         print(hf_hub_download('MODEL_ID', 'tokenizer.json'))\""
+    )
 }
 
 fn cmd_compile(model_path: &str, target: &str, output_path: &str) -> Result<()> {
