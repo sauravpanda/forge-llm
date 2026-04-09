@@ -321,6 +321,7 @@ dependencies = [
  "forgellm-frontend",
  "forgellm-optimizer",
  "forgellm-runtime",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]

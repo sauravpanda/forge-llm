@@ -20,5 +20,6 @@ forgellm-codegen-gpu = { workspace = true }
 forgellm-runtime = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
+serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
