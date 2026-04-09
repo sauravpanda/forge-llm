@@ -557,7 +557,6 @@ fn cmd_run(
     let effective_max_tokens = max_tokens.min(config.max_seq_len - prompt_tokens.len());
 
     // Process prompt tokens (prefill)
-    eprintln!("Generating...\n");
     print!("{prompt}");
     io::stdout().flush()?;
 
@@ -569,6 +568,12 @@ fn cmd_run(
         next_token = sampling::sample(&logits, &sampling_config, pos as u64);
     }
     let prefill_time = prefill_start.elapsed();
+    eprintln!(
+        "Prefill: {} tokens in {:.2}s ({:.1} tok/s)",
+        prompt_tokens.len(),
+        prefill_time.as_secs_f64(),
+        prompt_tokens.len() as f64 / prefill_time.as_secs_f64(),
+    );
 
     // Generate tokens
     let mut generated_tokens: Vec<u32> = prompt_tokens.clone();
@@ -607,27 +612,21 @@ fn cmd_run(
     println!();
 
     // Stats
-    let total_gen = generated_tokens.len();
+    let gen_count = generated_tokens.len() - prompt_tokens.len();
     let tok_per_sec = if gen_time.as_secs_f64() > 0.0 {
-        total_gen as f64 / gen_time.as_secs_f64()
+        gen_count as f64 / gen_time.as_secs_f64()
     } else {
         0.0
     };
 
     eprintln!("\n--- Stats ---");
     eprintln!(
-        "Prefill: {} tokens in {:.2}s ({:.1} tok/s)",
-        prompt_tokens.len(),
-        prefill_time.as_secs_f64(),
-        prompt_tokens.len() as f64 / prefill_time.as_secs_f64(),
-    );
-    eprintln!(
-        "Generate: {total_gen} tokens in {:.2}s ({tok_per_sec:.1} tok/s)",
+        "Generate: {gen_count} tokens in {:.2}s ({tok_per_sec:.1} tok/s)",
         gen_time.as_secs_f64(),
     );
     eprintln!(
         "Context: {}/{} tokens used",
-        prompt_tokens.len() + total_gen,
+        prompt_tokens.len() + gen_count,
         config.max_seq_len,
     );
 
