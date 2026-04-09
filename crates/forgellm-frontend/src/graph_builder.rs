@@ -13,8 +13,11 @@ use crate::ir::*;
 pub fn build_graph(config: &ModelConfig) -> Result<Graph, GraphBuildError> {
     match config.architecture {
         Architecture::Llama | Architecture::Mistral => build_llama_graph(config),
-        Architecture::Qwen2 => build_llama_graph(config), // Qwen2 is structurally identical to Llama
-        ref arch => Err(GraphBuildError::UnsupportedArchitecture(arch.to_string())),
+        Architecture::Qwen2 => build_llama_graph(config),
+        Architecture::Gemma => build_llama_graph(config), // Gemma uses same structure with GeLU instead of SiLU
+        Architecture::StableLM => build_llama_graph(config),
+        Architecture::Phi3 => build_llama_graph(config), // Phi3 is structurally similar
+                                                         // All remaining Llama-family architectures use the same builder
     }
 }
 
@@ -528,27 +531,33 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_architecture_errors() {
-        let config = ModelConfig {
-            architecture: Architecture::Phi3,
-            hidden_size: 3072,
-            intermediate_size: 8192,
-            num_layers: 32,
-            num_attention_heads: 32,
-            num_kv_heads: 32,
-            head_dim: 96,
-            vocab_size: 32064,
-            max_seq_len: 4096,
-            rms_norm_eps: 1e-5,
-            rope_theta: 10000.0,
-            dtype: DType::F16,
-        };
-
-        let result = build_graph(&config);
-        assert!(matches!(
-            result,
-            Err(GraphBuildError::UnsupportedArchitecture(_))
-        ));
+    fn all_architectures_supported() {
+        // All current architectures should build successfully
+        for arch in [
+            Architecture::Llama,
+            Architecture::Qwen2,
+            Architecture::Mistral,
+            Architecture::Phi3,
+            Architecture::Gemma,
+            Architecture::StableLM,
+        ] {
+            let config = ModelConfig {
+                architecture: arch.clone(),
+                hidden_size: 64,
+                intermediate_size: 128,
+                num_layers: 1,
+                num_attention_heads: 4,
+                num_kv_heads: 2,
+                head_dim: 16,
+                vocab_size: 256,
+                max_seq_len: 64,
+                rms_norm_eps: 1e-5,
+                rope_theta: 10000.0,
+                dtype: DType::F16,
+            };
+            let result = build_graph(&config);
+            assert!(result.is_ok(), "failed to build graph for {arch}");
+        }
     }
 
     #[test]
