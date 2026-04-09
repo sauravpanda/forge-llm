@@ -77,14 +77,27 @@ enum Commands {
         repeat_penalty: f32,
     },
 
-    /// Benchmark a compiled model (not yet implemented)
+    /// Benchmark model inference performance
     Bench {
-        /// Path to compiled model
+        /// Path to GGUF model file
+        #[arg(long)]
         model: String,
 
-        /// Number of iterations
-        #[arg(long, default_value = "100")]
-        iterations: usize,
+        /// Path to tokenizer.json
+        #[arg(long)]
+        tokenizer: String,
+
+        /// Number of tokens to generate per run
+        #[arg(long, default_value = "128")]
+        num_tokens: usize,
+
+        /// Number of benchmark runs
+        #[arg(long, default_value = "3")]
+        runs: usize,
+
+        /// Prompt for benchmarking
+        #[arg(long, default_value = "The quick brown fox jumps over the lazy dog")]
+        prompt: String,
     },
 
     /// Start an OpenAI-compatible API server
@@ -140,10 +153,12 @@ fn main() -> Result<()> {
         )?,
 
         Commands::Bench {
-            model, iterations, ..
-        } => {
-            println!("forge bench is not yet implemented (model={model}, iterations={iterations})");
-        }
+            model,
+            tokenizer,
+            num_tokens,
+            runs,
+            prompt,
+        } => cmd_bench(&model, &tokenizer, &prompt, num_tokens, runs)?,
 
         Commands::Serve {
             model,
@@ -656,4 +671,121 @@ fn handle_completion(
     });
 
     Ok(response.to_string())
+}
+
+fn cmd_bench(
+    model_path: &str,
+    tokenizer_path: &str,
+    prompt: &str,
+    num_tokens: usize,
+    runs: usize,
+) -> Result<()> {
+    eprintln!("Loading tokenizer...");
+    let tokenizer =
+        Tokenizer::from_file(tokenizer_path).with_context(|| "failed to load tokenizer")?;
+
+    eprintln!("Loading model...");
+    let config = load_model_config(model_path)?;
+    let graph = graph_builder::build_graph(&config)?;
+
+    let data = fs::read(model_path)?;
+    let gguf_file = gguf::parse(Cursor::new(&data))?;
+    let weights = weight_loader::load_all(&mut Cursor::new(&data), &gguf_file)?;
+
+    let prompt_tokens = tokenizer.encode(prompt)?;
+
+    println!(
+        "Benchmark: {} | {} layers | hidden={}",
+        config.architecture, config.num_layers, config.hidden_size
+    );
+    println!(
+        "Prompt: {} tokens | Generate: {} tokens | Runs: {}",
+        prompt_tokens.len(),
+        num_tokens,
+        runs
+    );
+    println!();
+
+    let sampling_config = sampling::SamplingConfig::greedy();
+    let mut prefill_times = Vec::with_capacity(runs);
+    let mut gen_times = Vec::with_capacity(runs);
+    let mut gen_counts = Vec::with_capacity(runs);
+
+    for run in 0..runs {
+        let mut cache = KVCache::with_capacity(
+            config.num_layers,
+            config.num_kv_heads,
+            config.head_dim,
+            config
+                .max_seq_len
+                .min(prompt_tokens.len() + num_tokens + 16),
+        );
+
+        // Prefill
+        let prefill_start = Instant::now();
+        let mut next_token = 0u32;
+        for (pos, &token) in prompt_tokens.iter().enumerate() {
+            let logits = interpreter::forward(token, pos, &graph, &weights, &mut cache);
+            cache.advance();
+            next_token = sampling::sample(&logits, &sampling_config, pos as u64);
+        }
+        let prefill_time = prefill_start.elapsed();
+
+        // Generate
+        let gen_start = Instant::now();
+        let eos_id = tokenizer.eos_token_id();
+        let mut gen_count = 0;
+        for i in 0..num_tokens {
+            if eos_id.is_some_and(|eos| next_token == eos) {
+                break;
+            }
+            let pos = prompt_tokens.len() + i;
+            let logits = interpreter::forward(next_token, pos, &graph, &weights, &mut cache);
+            cache.advance();
+            next_token = sampling::sample(&logits, &sampling_config, (pos + 1) as u64);
+            gen_count += 1;
+        }
+        let gen_time = gen_start.elapsed();
+
+        let prefill_tps = prompt_tokens.len() as f64 / prefill_time.as_secs_f64();
+        let gen_tps = gen_count as f64 / gen_time.as_secs_f64();
+
+        println!(
+            "Run {}: prefill {:.1} tok/s ({:.2}s) | generate {:.1} tok/s ({:.2}s, {} tokens)",
+            run + 1,
+            prefill_tps,
+            prefill_time.as_secs_f64(),
+            gen_tps,
+            gen_time.as_secs_f64(),
+            gen_count,
+        );
+
+        prefill_times.push(prefill_time.as_secs_f64());
+        gen_times.push(gen_time.as_secs_f64());
+        gen_counts.push(gen_count);
+    }
+
+    println!();
+    println!("--- Summary ---");
+
+    let avg_prefill_tps: f64 = prefill_times
+        .iter()
+        .map(|t| prompt_tokens.len() as f64 / t)
+        .sum::<f64>()
+        / runs as f64;
+    let avg_gen_tps: f64 = gen_times
+        .iter()
+        .zip(gen_counts.iter())
+        .map(|(t, c)| *c as f64 / t)
+        .sum::<f64>()
+        / runs as f64;
+
+    println!("Avg prefill: {avg_prefill_tps:.1} tok/s");
+    println!("Avg generate: {avg_gen_tps:.1} tok/s");
+    println!(
+        "Memory: {:.1} MB (weights)",
+        weights.memory_bytes() as f64 / 1e6
+    );
+
+    Ok(())
 }
