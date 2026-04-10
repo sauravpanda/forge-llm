@@ -96,7 +96,7 @@ fn generate_main(config: &ModelConfig) -> String {
 mod model;
 
 use std::env;
-use std::io::{{Read, Write}};
+use std::io::Write;
 
 fn load_weights(path: &str) -> Vec<f32> {{
     let file = std::fs::File::open(path).expect("failed to open weights");
