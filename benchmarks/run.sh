@@ -175,7 +175,7 @@ if [ "$INTERP_ONLY" = false ]; then
     TOTAL_TOKS="0.0"
     for run in 1 2 3; do
         echo "  Run $run/3..."
-        AOT_OUTPUT=$("$AOT_BIN" "$AOT_DIR/weights.bin" "$AOT_DIR/tokenizer.json" "The meaning of life is" --max-tokens 64 2>&1) || true
+        AOT_OUTPUT=$("$AOT_BIN" "$AOT_DIR/weights.bin" "$AOT_DIR/tokenizer.json" "The meaning of life is" --max-tokens 64 --quiet --temp 0.7 --top-k 40 2>&1) || true
         RUN_TOKS=$(echo "$AOT_OUTPUT" | grep -oE '[0-9]+\.[0-9]+ tok/s' | tail -1 | grep -oE '[0-9]+\.[0-9]+')
         if [ -n "$RUN_TOKS" ]; then
             echo "    ${RUN_TOKS} tok/s"
