@@ -97,6 +97,19 @@ fn emit_header(code: &mut String, config: &ModelConfig) -> Result<(), CodegenErr
     )?;
     writeln!(code, "pub const ROPE_THETA: f32 = {:e};", config.rope_theta)?;
     writeln!(code)?;
+
+    // Aligned buffer type for SIMD-friendly memory access
+    writeln!(code, "/// Cache-line aligned buffer for optimal SIMD performance.")?;
+    writeln!(code, "#[repr(C, align(64))]")?;
+    writeln!(code, "pub struct AlignedBuf<const N: usize>(pub [f32; N]);")?;
+    writeln!(code)?;
+    writeln!(code, "impl<const N: usize> AlignedBuf<N> {{")?;
+    writeln!(code, "    pub fn new() -> Self {{ Self([0.0f32; N]) }}")?;
+    writeln!(code, "    pub fn as_slice(&self) -> &[f32] {{ &self.0 }}")?;
+    writeln!(code, "    pub fn as_mut_slice(&mut self) -> &mut [f32] {{ &mut self.0 }}")?;
+    writeln!(code, "}}")?;
+    writeln!(code)?;
+
     Ok(())
 }
 
