@@ -477,11 +477,23 @@ fn cmd_compile(
     target: &str,
     output_path: &str,
     run: bool,
-    prompt: Option<&str>,
-    tokenizer_opt: &Option<String>,
+    prompt: Option<&'a str>,
+    tokenizer_opt: &'a Option<String>,
     embed_weights: bool,
-    cross_target: Option<&str>,
-) -> Result<()> {
+    cross_target: Option<&'a str>,
+}
+
+fn cmd_compile(args: CompileArgs<'_>) -> Result<()> {
+    let CompileArgs {
+        model_path,
+        target,
+        output_path,
+        run,
+        prompt,
+        tokenizer_opt,
+        embed_weights,
+        cross_target,
+    } = args;
     println!("Loading model config from {model_path}...");
     let config = load_model_config(model_path)?;
 
