@@ -840,4 +840,78 @@ mod tests {
         let result = generate(&graph);
         assert!(matches!(result, Err(CodegenError::MissingConfig)));
     }
+
+    #[test]
+    fn generated_code_has_fused_ops() {
+        let config = tiny_config();
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let code = generate(&graph).unwrap();
+
+        // Fused silu_mul kernel exists
+        assert!(code.contains("pub fn silu_mul("));
+        // Fused gelu_mul kernel exists
+        assert!(code.contains("pub fn gelu_mul("));
+        // Fused residual_add kernel exists
+        assert!(code.contains("pub fn residual_add("));
+        // Forward uses fused ops
+        assert!(code.contains("silu_mul(&mut ffn_hidden"));
+        assert!(code.contains("residual_add(&mut hidden_state"));
+        // No separate silu+elementwise_mul in forward path
+        assert!(!code.contains("silu(&mut gate_act"));
+    }
+
+    #[test]
+    fn generated_code_has_rayon_parallel() {
+        let config = tiny_config();
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let code = generate(&graph).unwrap();
+
+        // Should have rayon import
+        assert!(code.contains("use rayon::prelude::*;"));
+        // Logits should be parallelized
+        assert!(code.contains("par_iter_mut"));
+    }
+
+    #[test]
+    fn generated_code_has_rope_precomputation() {
+        let config = tiny_config();
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let code = generate(&graph).unwrap();
+
+        assert!(code.contains("pub fn rope_freqs("));
+        assert!(code.contains("let rope_freqs = rope_freqs(HEAD_DIM, ROPE_THETA);"));
+        assert!(code.contains("&rope_freqs)"));
+    }
+
+    #[test]
+    fn generated_code_has_neon_simd() {
+        let config = tiny_config();
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let code = generate(&graph).unwrap();
+
+        // NEON dot product
+        assert!(code.contains("#[cfg(target_arch = \"aarch64\")]"));
+        assert!(code.contains("vfmaq_f32"));
+        // NEON elementwise ops
+        assert!(code.contains("vmulq_f32"));
+        assert!(code.contains("vaddq_f32"));
+        // Scalar fallbacks
+        assert!(code.contains("#[cfg(not(target_arch = \"aarch64\"))]"));
+    }
+
+    #[test]
+    fn generated_code_has_static_memory() {
+        let config = tiny_config();
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let code = generate(&graph).unwrap();
+
+        // Fixed-size stack buffers (not vec!)
+        assert!(code.contains("let mut normed = [0.0f32;"));
+        assert!(code.contains("let mut q = [0.0f32;"));
+        assert!(code.contains("let mut hidden_state = [0.0f32;"));
+        // Pre-allocated KV cache
+        assert!(code.contains("MAX_SEQ_LEN *"));
+        // Attention scores on stack
+        assert!(code.contains("[0.0f32; MAX_SEQ_LEN]"));
+    }
 }
