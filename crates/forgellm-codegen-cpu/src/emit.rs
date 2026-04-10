@@ -25,6 +25,7 @@ pub fn generate(graph: &Graph) -> Result<String, CodegenError> {
 
     emit_header(&mut code, config)?;
     emit_kernel_functions(&mut code)?;
+    emit_specialized_matmul_functions(&mut code, config)?;
     emit_forward_function(&mut code, graph, config)?;
 
     Ok(code)
@@ -230,6 +231,61 @@ pub fn embedding(output: &mut [f32], token_id: u32, weight: &[f32], embed_dim: u
     Ok(())
 }
 
+/// Collect all unique (k, n) matmul shapes used in the forward pass.
+fn matmul_shapes(config: &ModelConfig) -> Vec<(usize, usize)> {
+    let hidden = config.hidden_size;
+    let intermediate = config.intermediate_size;
+    let num_heads = config.num_attention_heads;
+    let num_kv_heads = config.num_kv_heads;
+    let head_dim = config.head_dim;
+    let vocab = config.vocab_size;
+    let qk_size = num_heads * head_dim;
+    let kv_size = num_kv_heads * head_dim;
+
+    let mut shapes = vec![
+        (hidden, qk_size),      // q_proj
+        (hidden, kv_size),      // k_proj, v_proj
+        (qk_size, hidden),      // o_proj
+        (hidden, intermediate), // gate_proj, up_proj
+        (intermediate, hidden), // down_proj
+        (hidden, vocab),        // lm_head
+    ];
+    shapes.sort();
+    shapes.dedup();
+    shapes
+}
+
+/// Emit specialized matmul_vec functions with baked-in K and N dimensions.
+/// Since all our matmuls are m=1 (single-token inference), we generate
+/// `matmul_vec_KxN(output, input, weight)` with no runtime dimension args.
+fn emit_specialized_matmul_functions(
+    code: &mut String,
+    config: &ModelConfig,
+) -> Result<(), CodegenError> {
+    writeln!(code, "// --- Shape-specialized matmul functions (m=1) ---")?;
+    writeln!(code, "// All dimensions baked in at compile time — no runtime size parameters.")?;
+    writeln!(code)?;
+
+    for &(k, n) in &matmul_shapes(config) {
+        writeln!(code, "/// Specialized matmul: [1, {k}] x [{n}, {k}]^T -> [1, {n}]")?;
+        writeln!(code, "#[inline]")?;
+        writeln!(
+            code,
+            "fn matmul_vec_{k}x{n}(output: &mut [f32; {n}], input: &[f32; {k}], weight: &[f32]) {{"
+        )?;
+        writeln!(code, "    for j in 0..{n} {{")?;
+        writeln!(
+            code,
+            "        output[j] = dot_f32(&input[..], &weight[j*{k}..(j+1)*{k}], {k});"
+        )?;
+        writeln!(code, "    }}")?;
+        writeln!(code, "}}")?;
+        writeln!(code)?;
+    }
+
+    Ok(())
+}
+
 fn emit_forward_function(
     code: &mut String,
     _graph: &Graph,
@@ -347,7 +403,7 @@ fn emit_forward_function(
     writeln!(code, "    // Embedding lookup")?;
     writeln!(
         code,
-        "    let mut hidden_state = vec![0.0f32; HIDDEN_SIZE];"
+        "    let mut hidden_state = [0.0f32; HIDDEN_SIZE];"
     )?;
     writeln!(
         code,
@@ -355,35 +411,22 @@ fn emit_forward_function(
     )?;
     writeln!(code)?;
 
-    // Buffers
-    writeln!(code, "    // Pre-allocate buffers")?;
-    writeln!(code, "    let mut normed = vec![0.0f32; HIDDEN_SIZE];")?;
-    writeln!(code, "    let mut q = vec![0.0f32; NUM_HEADS * HEAD_DIM];")?;
-    writeln!(
-        code,
-        "    let mut k = vec![0.0f32; NUM_KV_HEADS * HEAD_DIM];"
-    )?;
-    writeln!(
-        code,
-        "    let mut v = vec![0.0f32; NUM_KV_HEADS * HEAD_DIM];"
-    )?;
-    writeln!(
-        code,
-        "    let mut attn_out = vec![0.0f32; NUM_HEADS * HEAD_DIM];"
-    )?;
-    writeln!(code, "    let mut attn_proj = vec![0.0f32; HIDDEN_SIZE];")?;
-    writeln!(code, "    let mut residual = vec![0.0f32; HIDDEN_SIZE];")?;
-    writeln!(code, "    let mut gate = vec![0.0f32; INTERMEDIATE_SIZE];")?;
-    writeln!(
-        code,
-        "    let mut gate_act = vec![0.0f32; INTERMEDIATE_SIZE];"
-    )?;
-    writeln!(code, "    let mut up = vec![0.0f32; INTERMEDIATE_SIZE];")?;
-    writeln!(
-        code,
-        "    let mut ffn_hidden = vec![0.0f32; INTERMEDIATE_SIZE];"
-    )?;
-    writeln!(code, "    let mut ffn_out = vec![0.0f32; HIDDEN_SIZE];")?;
+    // Buffers — fixed-size arrays, zero heap allocation
+    let qk_size = num_heads * head_dim;
+    let kv_size = num_kv_heads * head_dim;
+    writeln!(code, "    // Fixed-size buffers — zero heap allocation during forward pass")?;
+    writeln!(code, "    let mut normed = [0.0f32; {hidden}];")?;
+    writeln!(code, "    let mut q = [0.0f32; {qk_size}];")?;
+    writeln!(code, "    let mut k = [0.0f32; {kv_size}];")?;
+    writeln!(code, "    let mut v = [0.0f32; {kv_size}];")?;
+    writeln!(code, "    let mut attn_out = [0.0f32; {qk_size}];")?;
+    writeln!(code, "    let mut attn_proj = [0.0f32; {hidden}];")?;
+    writeln!(code, "    let mut residual = [0.0f32; {hidden}];")?;
+    writeln!(code, "    let mut gate = [0.0f32; {intermediate}];")?;
+    writeln!(code, "    let mut gate_act = [0.0f32; {intermediate}];")?;
+    writeln!(code, "    let mut up = [0.0f32; {intermediate}];")?;
+    writeln!(code, "    let mut ffn_hidden = [0.0f32; {intermediate}];")?;
+    writeln!(code, "    let mut ffn_out = [0.0f32; {hidden}];")?;
     writeln!(code)?;
 
     // Transformer layers
@@ -397,18 +440,21 @@ fn emit_forward_function(
         "        rms_norm(&mut normed, &hidden_state, &lw.attn_norm, RMS_NORM_EPS);"
     )?;
     writeln!(code)?;
-    writeln!(code, "        // QKV projections")?;
+    writeln!(code, "        // QKV projections (shape-specialized)")?;
     writeln!(
         code,
-        "        matmul(&mut q, &normed, &lw.q_proj, 1, HIDDEN_SIZE, NUM_HEADS * HEAD_DIM);"
+        "        matmul_vec_{hidden}x{qk_size}(&mut q, &normed, &lw.q_proj);",
+        hidden = hidden, qk_size = qk_size
     )?;
     writeln!(
         code,
-        "        matmul(&mut k, &normed, &lw.k_proj, 1, HIDDEN_SIZE, NUM_KV_HEADS * HEAD_DIM);"
+        "        matmul_vec_{hidden}x{kv_size}(&mut k, &normed, &lw.k_proj);",
+        hidden = hidden, kv_size = kv_size
     )?;
     writeln!(
         code,
-        "        matmul(&mut v, &normed, &lw.v_proj, 1, HIDDEN_SIZE, NUM_KV_HEADS * HEAD_DIM);"
+        "        matmul_vec_{hidden}x{kv_size}(&mut v, &normed, &lw.v_proj);",
+        hidden = hidden, kv_size = kv_size
     )?;
     writeln!(code)?;
     writeln!(code, "        // RoPE")?;
@@ -438,8 +484,12 @@ fn emit_forward_function(
     )?;
     writeln!(code, "        );")?;
     writeln!(code)?;
-    writeln!(code, "        // Output projection + residual")?;
-    writeln!(code, "        matmul(&mut attn_proj, &attn_out, &lw.o_proj, 1, NUM_HEADS * HEAD_DIM, HIDDEN_SIZE);")?;
+    writeln!(code, "        // Output projection + residual (shape-specialized)")?;
+    writeln!(
+        code,
+        "        matmul_vec_{qk_size}x{hidden}(&mut attn_proj, &attn_out, &lw.o_proj);",
+        qk_size = qk_size, hidden = hidden
+    )?;
     writeln!(
         code,
         "        elementwise_add(&mut residual, &hidden_state, &attn_proj);"
@@ -453,22 +503,28 @@ fn emit_forward_function(
     writeln!(code)?;
     writeln!(
         code,
-        "        // FFN: gate_proj -> SiLU, up_proj, multiply, down_proj"
+        "        // FFN: gate_proj -> SiLU, up_proj, multiply, down_proj (shape-specialized)"
     )?;
     writeln!(
         code,
-        "        matmul(&mut gate, &normed, &lw.gate_proj, 1, HIDDEN_SIZE, INTERMEDIATE_SIZE);"
+        "        matmul_vec_{hidden}x{intermediate}(&mut gate, &normed, &lw.gate_proj);",
+        hidden = hidden, intermediate = intermediate
     )?;
     writeln!(code, "        silu(&mut gate_act, &gate);")?;
     writeln!(
         code,
-        "        matmul(&mut up, &normed, &lw.up_proj, 1, HIDDEN_SIZE, INTERMEDIATE_SIZE);"
+        "        matmul_vec_{hidden}x{intermediate}(&mut up, &normed, &lw.up_proj);",
+        hidden = hidden, intermediate = intermediate
     )?;
     writeln!(
         code,
         "        elementwise_mul(&mut ffn_hidden, &gate_act, &up);"
     )?;
-    writeln!(code, "        matmul(&mut ffn_out, &ffn_hidden, &lw.down_proj, 1, INTERMEDIATE_SIZE, HIDDEN_SIZE);")?;
+    writeln!(
+        code,
+        "        matmul_vec_{intermediate}x{hidden}(&mut ffn_out, &ffn_hidden, &lw.down_proj);",
+        intermediate = intermediate, hidden = hidden
+    )?;
     writeln!(code)?;
     writeln!(code, "        // Residual")?;
     writeln!(
@@ -485,12 +541,21 @@ fn emit_forward_function(
         "    rms_norm(&mut normed, &hidden_state, &weights.final_norm, RMS_NORM_EPS);"
     )?;
     writeln!(code)?;
-    writeln!(code, "    // Logits projection")?;
+    writeln!(code, "    // Logits projection (shape-specialized)")?;
     writeln!(code, "    let mut logits = vec![0.0f32; VOCAB_SIZE];")?;
     writeln!(
         code,
-        "    matmul(&mut logits, &normed, &weights.lm_head, 1, HIDDEN_SIZE, VOCAB_SIZE);"
+        "    // Logits uses Vec since VOCAB_SIZE may be too large for stack"
     )?;
+    writeln!(
+        code,
+        "    for j in 0..VOCAB_SIZE {{"
+    )?;
+    writeln!(
+        code,
+        "        logits[j] = dot_f32(&normed[..], &weights.lm_head[j*{hidden}..(j+1)*{hidden}], {hidden});"
+    )?;
+    writeln!(code, "    }}")?;
     writeln!(code)?;
     writeln!(code, "    cache.len += 1;")?;
     writeln!(code, "    logits")?;
@@ -531,7 +596,7 @@ mod tests {
         assert!(code.contains("pub const NUM_LAYERS: usize = 2;"));
         assert!(code.contains("pub const VOCAB_SIZE: usize = 256;"));
         assert!(code.contains("fn rms_norm("));
-        assert!(code.contains("fn matmul("));
+        assert!(code.contains("fn matmul_vec_"));
         assert!(code.contains("fn forward("));
         assert!(code.contains("fn attention("));
     }
@@ -603,6 +668,16 @@ mod tests {
 
         assert!(code.contains("pub const HIDDEN_SIZE: usize = 576;"));
         assert!(code.contains("pub const NUM_LAYERS: usize = 30;"));
+
+        // Shape-specialized matmul: hidden=576, qk=9*64=576, kv=3*64=192, inter=1536
+        assert!(code.contains("fn matmul_vec_576x576("));  // q_proj (hidden→qk)
+        assert!(code.contains("fn matmul_vec_576x192("));  // k/v_proj (hidden→kv)
+        assert!(code.contains("fn matmul_vec_576x1536(")); // gate/up_proj
+        assert!(code.contains("fn matmul_vec_1536x576(")); // down_proj
+        // Forward function uses specialized calls
+        assert!(code.contains("matmul_vec_576x576(&mut q"));
+        assert!(code.contains("matmul_vec_576x192(&mut k"));
+        assert!(!code.contains("matmul(&mut q")); // no generic matmul calls
     }
 
     #[test]
