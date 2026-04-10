@@ -260,6 +260,46 @@ fn main() {{
     }}
     println!();
     eprintln!("Generate: {{}} tokens in {{:.2}}s ({{:.1}} tok/s)", gen_count, t1.elapsed().as_secs_f64(), gen_count as f64 / t1.elapsed().as_secs_f64());
+
+    // Interactive chat mode
+    if args.iter().any(|a| a == "--interactive" || a == "--chat") {{
+        eprintln!("\n--- Interactive mode (type /quit to exit) ---");
+        loop {{
+            eprint!("> ");
+            std::io::stderr().flush().ok();
+            let mut input = String::new();
+            if std::io::stdin().read_line(&mut input).is_err() || input.trim().is_empty() {{ continue; }}
+            let input = input.trim();
+            if input == "/quit" || input == "/exit" {{ break; }}
+            if input == "/clear" {{
+                cache = model::KVCache::new();
+                eprintln!("Cache cleared.");
+                continue;
+            }}
+
+            let enc2 = tokenizer.encode(input, false).expect("encode failed");
+            let toks2 = enc2.get_ids();
+            for &tok in toks2 {{
+                let mut l = model::forward(tok, &weights, &mut cache);
+                next = sample(&mut l, temperature, top_k, top_p, &mut rng_state);
+            }}
+            let t2 = std::time::Instant::now();
+            let mut gen2 = 0usize;
+            for _ in 0..max_tokens {{
+                if eos_tokens.contains(&next) {{ break; }}
+                let text = tokenizer.decode(&[next], true).unwrap_or_default();
+                print!("{{}}", text);
+                std::io::stdout().flush().ok();
+                let mut l = model::forward(next, &weights, &mut cache);
+                apply_repeat_penalty(&mut l, &recent_tokens, repeat_penalty);
+                next = sample(&mut l, temperature, top_k, top_p, &mut rng_state);
+                recent_tokens.push(next);
+                gen2 += 1;
+            }}
+            println!();
+            eprintln!("[{{}} tokens, {{:.1}} tok/s]", gen2, gen2 as f64 / t2.elapsed().as_secs_f64());
+        }}
+    }}
 }}
 "##
     )
