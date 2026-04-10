@@ -17,6 +17,10 @@
 - [Code Generation](./architecture/codegen.md)
 - [Runtime](./architecture/runtime.md)
 
+# Guides
+
+- [AOT Compilation](./guides/aot-compilation.md)
+
 # Benchmarks
 
 - [Performance Results](./benchmarks/results.md)
