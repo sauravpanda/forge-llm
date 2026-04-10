@@ -162,6 +162,27 @@ pub fn silu(output: &mut [f32], input: &[f32]) {
     for (o, &x) in output.iter_mut().zip(input.iter()) { *o = x / (1.0 + (-x).exp()); }
 }
 
+/// GeLU activation (approximate): x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+#[inline]
+pub fn gelu(output: &mut [f32], input: &[f32]) {
+    const SQRT_2_OVER_PI: f32 = 0.7978845608;
+    for (o, &x) in output.iter_mut().zip(input.iter()) {
+        let cdf = 0.5 * (1.0 + (SQRT_2_OVER_PI * (x + 0.044715 * x * x * x)).tanh());
+        *o = x * cdf;
+    }
+}
+
+/// Fused GeLU activation + elementwise multiply: output[i] = gelu(gate[i]) * up[i]
+#[inline]
+pub fn gelu_mul(output: &mut [f32], gate: &[f32], up: &[f32]) {
+    const SQRT_2_OVER_PI: f32 = 0.7978845608;
+    for i in 0..gate.len() {
+        let x = gate[i];
+        let cdf = 0.5 * (1.0 + (SQRT_2_OVER_PI * (x + 0.044715 * x * x * x)).tanh());
+        output[i] = (x * cdf) * up[i];
+    }
+}
+
 /// Fused SiLU activation + elementwise multiply: output[i] = silu(gate[i]) * up[i]
 /// Eliminates one intermediate buffer and one memory pass compared to separate silu+mul.
 #[inline]
