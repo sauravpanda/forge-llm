@@ -707,6 +707,22 @@ mod tests {
     }
 
     #[test]
+    fn seed_flag_supported() {
+        let config = tiny_config();
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let dir = std::env::temp_dir().join("forgellm_test_seed");
+        let _ = fs::remove_dir_all(&dir);
+        generate_project(&graph, &dir, "test-seed", false).unwrap();
+
+        let main = fs::read_to_string(dir.join("src/main.rs")).unwrap();
+        assert!(main.contains("--seed"), "should support --seed flag");
+        assert!(main.contains("let seed = "), "should parse seed");
+        assert!(main.contains("let mut rng_state: u64 = seed;"), "should use parsed seed");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn version_output_has_kv_cache_info() {
         let config = tiny_config();
         let graph = graph_builder::build_graph(&config).unwrap();
