@@ -193,17 +193,74 @@ pub fn silu_mul(output: &mut [f32], gate: &[f32], up: &[f32]) {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn elementwise_mul(output: &mut [f32], a: &[f32], b: &[f32]) {
+    use std::arch::aarch64::*;
+    let n = a.len();
+    let chunks = n / 16;
+    unsafe {
+        for i in 0..chunks {
+            let base = i * 16;
+            vst1q_f32(output.as_mut_ptr().add(base), vmulq_f32(vld1q_f32(a.as_ptr().add(base)), vld1q_f32(b.as_ptr().add(base))));
+            vst1q_f32(output.as_mut_ptr().add(base+4), vmulq_f32(vld1q_f32(a.as_ptr().add(base+4)), vld1q_f32(b.as_ptr().add(base+4))));
+            vst1q_f32(output.as_mut_ptr().add(base+8), vmulq_f32(vld1q_f32(a.as_ptr().add(base+8)), vld1q_f32(b.as_ptr().add(base+8))));
+            vst1q_f32(output.as_mut_ptr().add(base+12), vmulq_f32(vld1q_f32(a.as_ptr().add(base+12)), vld1q_f32(b.as_ptr().add(base+12))));
+        }
+    }
+    for i in (chunks*16)..n { output[i] = a[i] * b[i]; }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
 #[inline]
 pub fn elementwise_mul(output: &mut [f32], a: &[f32], b: &[f32]) {
     for i in 0..a.len() { output[i] = a[i] * b[i]; }
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn elementwise_add(output: &mut [f32], a: &[f32], b: &[f32]) {
+    use std::arch::aarch64::*;
+    let n = a.len();
+    let chunks = n / 16;
+    unsafe {
+        for i in 0..chunks {
+            let base = i * 16;
+            vst1q_f32(output.as_mut_ptr().add(base), vaddq_f32(vld1q_f32(a.as_ptr().add(base)), vld1q_f32(b.as_ptr().add(base))));
+            vst1q_f32(output.as_mut_ptr().add(base+4), vaddq_f32(vld1q_f32(a.as_ptr().add(base+4)), vld1q_f32(b.as_ptr().add(base+4))));
+            vst1q_f32(output.as_mut_ptr().add(base+8), vaddq_f32(vld1q_f32(a.as_ptr().add(base+8)), vld1q_f32(b.as_ptr().add(base+8))));
+            vst1q_f32(output.as_mut_ptr().add(base+12), vaddq_f32(vld1q_f32(a.as_ptr().add(base+12)), vld1q_f32(b.as_ptr().add(base+12))));
+        }
+    }
+    for i in (chunks*16)..n { output[i] = a[i] + b[i]; }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
 #[inline]
 pub fn elementwise_add(output: &mut [f32], a: &[f32], b: &[f32]) {
     for i in 0..a.len() { output[i] = a[i] + b[i]; }
 }
 
-/// Fused residual add: accumulates in-place. a[i] += b[i]
+/// Fused residual add with NEON: a[i] += b[i]
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn residual_add(a: &mut [f32], b: &[f32]) {
+    use std::arch::aarch64::*;
+    let n = a.len();
+    let chunks = n / 16;
+    unsafe {
+        for i in 0..chunks {
+            let base = i * 16;
+            vst1q_f32(a.as_mut_ptr().add(base), vaddq_f32(vld1q_f32(a.as_ptr().add(base)), vld1q_f32(b.as_ptr().add(base))));
+            vst1q_f32(a.as_mut_ptr().add(base+4), vaddq_f32(vld1q_f32(a.as_ptr().add(base+4)), vld1q_f32(b.as_ptr().add(base+4))));
+            vst1q_f32(a.as_mut_ptr().add(base+8), vaddq_f32(vld1q_f32(a.as_ptr().add(base+8)), vld1q_f32(b.as_ptr().add(base+8))));
+            vst1q_f32(a.as_mut_ptr().add(base+12), vaddq_f32(vld1q_f32(a.as_ptr().add(base+12)), vld1q_f32(b.as_ptr().add(base+12))));
+        }
+    }
+    for i in (chunks*16)..n { a[i] += b[i]; }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
 #[inline]
 pub fn residual_add(a: &mut [f32], b: &[f32]) {
     for i in 0..a.len() { a[i] += b[i]; }
