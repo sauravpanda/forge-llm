@@ -547,3 +547,83 @@ pub enum ProjectError {
     #[error("codegen error: {0}")]
     Codegen(#[from] emit::CodegenError),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forgellm_frontend::graph_builder;
+
+    fn tiny_config() -> ModelConfig {
+        ModelConfig {
+            architecture: Architecture::Llama,
+            hidden_size: 64,
+            intermediate_size: 128,
+            num_layers: 2,
+            num_attention_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 16,
+            vocab_size: 256,
+            max_seq_len: 64,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            dtype: DType::F16,
+        }
+    }
+
+    #[test]
+    fn generate_project_creates_files() {
+        let config = tiny_config();
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let dir = std::env::temp_dir().join("forgellm_test_project");
+        let _ = fs::remove_dir_all(&dir);
+
+        generate_project(&graph, &dir, "test-model", false).unwrap();
+
+        assert!(dir.join("Cargo.toml").exists());
+        assert!(dir.join("src/model.rs").exists());
+        assert!(dir.join("src/main.rs").exists());
+
+        let cargo = fs::read_to_string(dir.join("Cargo.toml")).unwrap();
+        assert!(cargo.contains("test-model"));
+        assert!(cargo.contains("rayon"));
+        assert!(cargo.contains("memmap2"));
+        assert!(cargo.contains("tokenizers"));
+
+        let main = fs::read_to_string(dir.join("src/main.rs")).unwrap();
+        assert!(main.contains("load_weights"));
+        assert!(main.contains("fn sample("));
+        assert!(main.contains("--temp"));
+        assert!(main.contains("--top-k"));
+        assert!(main.contains("--top-p"));
+        assert!(main.contains("--repeat-penalty"));
+        assert!(main.contains("--max-tokens"));
+        assert!(main.contains("--interactive"));
+        assert!(main.contains("--version"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn generate_project_embedded_mode() {
+        let config = tiny_config();
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let dir = std::env::temp_dir().join("forgellm_test_embedded");
+        let _ = fs::remove_dir_all(&dir);
+
+        generate_project(&graph, &dir, "test-embedded", true).unwrap();
+
+        let main = fs::read_to_string(dir.join("src/main.rs")).unwrap();
+        assert!(main.contains("include_bytes!"));
+        assert!(main.contains("WEIGHTS_BYTES"));
+        assert!(main.contains("TOKENIZER_BYTES"));
+        assert!(main.contains("from_bytes"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cargo_toml_sanitizes_name() {
+        let toml = generate_cargo_toml("My Model/v2.0");
+        assert!(toml.contains("name = \"my-model-v2-0\""));
+    }
+}
