@@ -474,17 +474,31 @@ fn emit_specialized_matmul_functions(
             writeln!(code, "    }});")?;
             writeln!(code, "}}")?;
         } else {
+            // Sequential with 4-way row unrolling for ILP
             writeln!(code, "#[inline]")?;
             writeln!(
                 code,
                 "fn matmul_vec_{k}x{n}(output: &mut [f32; {n}], input: &[f32; {k}], weight: &[f32]) {{"
             )?;
-            writeln!(code, "    for j in 0..{n} {{")?;
-            writeln!(
-                code,
-                "        output[j] = dot_f32(&input[..], &weight[j*{k}..(j+1)*{k}], {k});"
-            )?;
-            writeln!(code, "    }}")?;
+            let n_chunks = n / 4;
+            let n_remainder = n % 4;
+            if n_chunks > 0 {
+                writeln!(code, "    // Process 4 output rows at a time for instruction-level parallelism")?;
+                writeln!(code, "    for chunk in 0..{n_chunks} {{")?;
+                writeln!(code, "        let j0 = chunk * 4;")?;
+                writeln!(code, "        output[j0]   = dot_f32(&input[..], &weight[j0*{k}..(j0+1)*{k}], {k});")?;
+                writeln!(code, "        output[j0+1] = dot_f32(&input[..], &weight[(j0+1)*{k}..(j0+2)*{k}], {k});")?;
+                writeln!(code, "        output[j0+2] = dot_f32(&input[..], &weight[(j0+2)*{k}..(j0+3)*{k}], {k});")?;
+                writeln!(code, "        output[j0+3] = dot_f32(&input[..], &weight[(j0+3)*{k}..(j0+4)*{k}], {k});")?;
+                writeln!(code, "    }}")?;
+            }
+            if n_remainder > 0 {
+                writeln!(code, "    // Handle remaining {n_remainder} output rows")?;
+                writeln!(code, "    let base = {} * 4;", n_chunks)?;
+                for r in 0..n_remainder {
+                    writeln!(code, "    output[base+{r}] = dot_f32(&input[..], &weight[(base+{r})*{k}..(base+{r}+1)*{k}], {k});")?;
+                }
+            }
             writeln!(code, "}}")?;
         }
         writeln!(code)?;
