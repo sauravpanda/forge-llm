@@ -323,7 +323,8 @@ fn main() {{
             let input = input.trim();
             if input == "/quit" || input == "/exit" {{ break; }}
             if input == "/clear" {{
-                cache = model::KVCache::new();
+                cache.reset();
+                recent_tokens.clear();
                 eprintln!("Cache cleared.");
                 continue;
             }}
