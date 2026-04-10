@@ -9,6 +9,7 @@ Performance tracking across versions. All benchmarks run on SmolLM2-135M-Instruc
 | v0.2.0 | 2026-04-09 | 119.7 | 36.2 avg (best: 40.2) | 29s | 3.8 MB | Darwin arm64 18c (Apple M5 Pro) |
 | v0.3.0-dev | 2026-04-09 | 119.7 | **105.2** avg (best: 105.5) | 32s | 3.8 MB | Darwin arm64 18c (Apple M5 Pro) |
 | v0.3.0-dev2 | 2026-04-09 | 119.7 | **116.2** avg (best: 117.8) | 26s | 3.8 MB | Darwin arm64 18c (Apple M5 Pro) |
+| v0.3.0-dev3 | 2026-04-09 | 119.7 | **119.9** avg (best: 122.1) | 26s | 3.8 MB | Darwin arm64 18c (Apple M5 Pro) |
 
 ## Analysis
 
@@ -32,9 +33,19 @@ First release with AOT compilation. Key observations:
 
 ### v0.3.0-dev Results
 
-- **AOT improved 2.9x: 36.2 → 105.2 tok/s** (88% of interpreter)
-- Upgraded `dot_f32` to 4 NEON accumulators with 16-element unrolled inner loop
-- Bumped Rayon parallelism threshold from 1024 to 4096 (eliminated overhead for SmolLM matmuls)
+**AOT now matches interpreter performance** — 3.3x speedup vs v0.2.0:
+
+- **v0.2.0**: 36.2 tok/s (30% of interpreter)
+- **v0.3.0-dev1**: 105.2 tok/s (88% — 4-acc NEON dot_f32 + Rayon threshold tune)
+- **v0.3.0-dev2**: 116.2 tok/s (97% — 4-way row unrolling in matmul_vec_KxN)
+- **v0.3.0-dev3**: 119.9 tok/s (**100%+** — Rayon par_chunks_mut(256) for logits)
+
+Optimizations:
+1. Upgraded `dot_f32` to 4 NEON accumulators with 16-element unrolled inner loop
+2. Bumped Rayon parallelism threshold 1024 → 4096
+3. 4-way row unrolling in `matmul_vec_KxN` (matches runtime kernels)
+4. `par_chunks_mut(256)` for logits — amortizes Rayon overhead
+5. Cleaned up generated code warnings (`#![allow(dead_code, ...)]`)
 
 ## How to Run
 

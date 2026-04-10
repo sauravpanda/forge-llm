@@ -58,6 +58,7 @@ fn emit_header(code: &mut String, config: &ModelConfig) -> Result<(), CodegenErr
     )?;
     writeln!(code)?;
     writeln!(code, "#![allow(clippy::excessive_precision)]")?;
+    writeln!(code, "#![allow(dead_code, unused_imports, unused_assignments)]")?;
     writeln!(code)?;
     writeln!(code, "use rayon::prelude::*;")?;
     writeln!(code)?;
@@ -313,13 +314,12 @@ pub fn softmax(values: &mut [f32]) {
     use std::arch::aarch64::*;
     // Find max using NEON
     let n = values.len();
-    let mut max_val = f32::NEG_INFINITY;
-    unsafe {
+    let mut max_val = unsafe {
         let chunks = n / 4;
         let mut vmax = vdupq_n_f32(f32::NEG_INFINITY);
         for i in 0..chunks { vmax = vmaxq_f32(vmax, vld1q_f32(values.as_ptr().add(i * 4))); }
-        max_val = vmaxvq_f32(vmax);
-    }
+        vmaxvq_f32(vmax)
+    };
     for i in (n / 4 * 4)..n { if values[i] > max_val { max_val = values[i]; } }
     // Exp and sum
     let mut sum = 0.0f32;
@@ -775,15 +775,23 @@ fn emit_forward_function(
     )?;
     writeln!(code)?;
     writeln!(code, "    // Logits projection (parallelized — largest single matmul)")?;
+    writeln!(code, "    // Uses larger chunks (256) to amortize Rayon overhead")?;
     writeln!(code, "    let mut logits = vec![0.0f32; VOCAB_SIZE];")?;
     writeln!(
         code,
-        "    logits.par_iter_mut().enumerate().for_each(|(j, out)| {{"
+        "    logits.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
+    )?;
+    writeln!(code, "        let base = chunk_idx * 256;")?;
+    writeln!(code, "        for r in 0..out.len() {{")?;
+    writeln!(
+        code,
+        "            let j = base + r;"
     )?;
     writeln!(
         code,
-        "        *out = dot_f32(&normed[..], &weights.lm_head[j*{hidden}..(j+1)*{hidden}], {hidden});"
+        "            out[r] = dot_f32(&normed[..], &weights.lm_head[j*{hidden}..(j+1)*{hidden}], {hidden});"
     )?;
+    writeln!(code, "        }}")?;
     writeln!(code, "    }});")?;
     writeln!(code)?;
     writeln!(code, "    cache.len += 1;")?;
@@ -963,8 +971,8 @@ mod tests {
 
         // Should have rayon import
         assert!(code.contains("use rayon::prelude::*;"));
-        // Logits should be parallelized
-        assert!(code.contains("par_iter_mut"));
+        // Logits should be parallelized (par_chunks_mut for ILP)
+        assert!(code.contains("par_chunks_mut"));
     }
 
     #[test]

@@ -1,0 +1,32 @@
+{
+  "version": "0.3.0-dev3",
+  "date": "2026-04-09T23:50:00Z",
+  "system": {
+    "os": "Darwin",
+    "arch": "arm64",
+    "cpu": "Apple M5 Pro",
+    "cores": "18"
+  },
+  "model": {
+    "name": "SmolLM2-135M-Instruct",
+    "quant": "Q8_0",
+    "params": "135M"
+  },
+  "benchmarks": {
+    "interpreter": {
+      "generate_tok_s_avg": 119.7
+    },
+    "aot": {
+      "generate_tok_s_avg": 119.9,
+      "generate_tok_s_best": 122.1,
+      "generate_tok_s_runs": [118.7, 118.8, 122.1],
+      "prefill_tok_s_avg": 119.8,
+      "build_time_s": 26,
+      "binary_size_mb": 3.8
+    }
+  },
+  "improvements_vs_v0_2_0": {
+    "aot_speedup": "3.3x (36.2 → 119.9 tok/s)",
+    "vs_interpreter": "100%+ (was 30%) — AOT now matches interpreter"
+  }
+}
