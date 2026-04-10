@@ -6,5 +6,7 @@
 //! exact tensor dimensions from the model.
 
 mod emit;
+pub mod project;
 
 pub use emit::{generate, CodegenError};
+pub use project::{generate_project, ProjectError};
