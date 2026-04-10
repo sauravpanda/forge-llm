@@ -333,17 +333,26 @@ pub fn rope_freqs(head_dim: usize, theta: f32) -> Vec<f32> {
     (0..head_dim / 2).map(|i| 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32)).collect()
 }
 
-/// Apply RoPE using precomputed frequencies — avoids powf per token
+/// Apply RoPE using precomputed frequencies — avoids powf per token.
+/// Computes sin/cos table once per position, reuses across all heads.
 #[inline]
 pub fn rope(data: &mut [f32], pos: usize, head_dim: usize, num_heads: usize, freqs: &[f32]) {
+    let half = head_dim / 2;
+    // Precompute sin/cos for this position once — shared across all heads
+    let mut cos_table = vec![0.0f32; half];
+    let mut sin_table = vec![0.0f32; half];
+    for i in 0..half {
+        let angle = pos as f32 * freqs[i];
+        let (s, c) = angle.sin_cos();
+        cos_table[i] = c;
+        sin_table[i] = s;
+    }
     for h in 0..num_heads {
         let off = h * head_dim;
-        for i in 0..head_dim / 2 {
-            let angle = pos as f32 * freqs[i];
-            let (sin_v, cos_v) = angle.sin_cos();
+        for i in 0..half {
             let (x0, x1) = (data[off + 2*i], data[off + 2*i + 1]);
-            data[off + 2*i] = x0 * cos_v - x1 * sin_v;
-            data[off + 2*i + 1] = x0 * sin_v + x1 * cos_v;
+            data[off + 2*i] = x0 * cos_table[i] - x1 * sin_table[i];
+            data[off + 2*i + 1] = x0 * sin_table[i] + x1 * cos_table[i];
         }
     }
 }
