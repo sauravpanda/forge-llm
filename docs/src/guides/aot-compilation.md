@@ -82,6 +82,44 @@ my-model "Hello, world!"
 
 This is ideal for deployment — just copy the single binary. No external files needed.
 
+## Generated Binary CLI Flags
+
+The AOT binary supports the following flags:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--temp T` | 0.0 | Sampling temperature (0 = greedy) |
+| `--top-k K` | 0 | Top-k sampling (0 = disabled) |
+| `--top-p P` | 0.9 | Top-p (nucleus) sampling |
+| `--max-tokens N` | 128 | Maximum tokens to generate |
+| `--repeat-penalty R` | 1.1 | Repetition penalty (>1 = penalize) |
+| `--seed S` | (fixed) | RNG seed for reproducible sampling |
+| `--quiet` / `-q` | off | Suppress generated text output (timing only) |
+| `--interactive` / `--chat` | off | Enter REPL mode after first generation |
+| `--save-cache PATH` | — | Save KV cache to file after generation |
+| `--load-cache PATH` | — | Load KV cache from file before generation |
+| `--version` / `-V` | — | Print model info and exit |
+
+### Examples
+
+```bash
+# Generate with sampling
+./my-model weights.bin tokenizer.json "Hello" --temp 0.7 --top-k 40
+
+# Reproducible benchmark
+./my-model weights.bin tokenizer.json "Hello" --seed 42 --max-tokens 64 --quiet
+
+# Interactive chat
+./my-model weights.bin tokenizer.json "" --interactive --temp 0.7
+
+# Persistent KV cache across runs
+./my-model weights.bin tokenizer.json "Initial context" --save-cache /tmp/cache.bin
+./my-model weights.bin tokenizer.json "Follow-up question" --load-cache /tmp/cache.bin
+
+# Inspect model
+./my-model --version
+```
+
 ## Performance Characteristics
 
 | Feature | Interpreter | AOT Binary |
