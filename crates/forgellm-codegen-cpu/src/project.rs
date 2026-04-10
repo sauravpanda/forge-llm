@@ -108,6 +108,16 @@ fn argmax(logits: &[f32]) -> u32 {{
     logits.iter().enumerate().max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap()).map(|(i, _)| i as u32).unwrap_or(0)
 }}
 
+fn apply_repeat_penalty(logits: &mut [f32], recent_tokens: &[u32], penalty: f32) {{
+    if penalty <= 1.0 {{ return; }}
+    for &tok in recent_tokens {{
+        let idx = tok as usize;
+        if idx < logits.len() {{
+            if logits[idx] > 0.0 {{ logits[idx] /= penalty; }} else {{ logits[idx] *= penalty; }}
+        }}
+    }}
+}}
+
 fn sample(logits: &mut [f32], temperature: f32, top_k: usize, rng_state: &mut u64) -> u32 {{
     if temperature <= 0.0 {{ return argmax(logits); }}
     // Apply temperature
@@ -170,6 +180,7 @@ fn main() {{
     let temperature = parse_f32_arg(&args, "--temp", 0.0);
     let top_k = parse_usize_arg(&args, "--top-k", 0);
     let max_tokens = parse_usize_arg(&args, "--max-tokens", 128);
+    let repeat_penalty = parse_f32_arg(&args, "--repeat-penalty", 1.1);
     let prompt = args.iter().skip(3).filter(|a| !a.starts_with("--")).take_while(|a| !a.starts_with("--")).cloned().collect::<Vec<_>>().join(" ");
     let prompt = if prompt.is_empty() {{ "Hello".to_string() }} else {{ prompt }};
 
@@ -220,13 +231,16 @@ fn main() {{
         tokenizer.token_to_id("<|im_end|>"),
         tokenizer.token_to_id("<|eot_id|>"),
     ].iter().filter_map(|t| *t).collect();
+    let mut recent_tokens: Vec<u32> = tokens.to_vec();
     let mut gen_count = 0usize;
     for _ in 0..max_tokens {{
         if eos_tokens.contains(&next) {{ break; }}
         let text = tokenizer.decode(&[next], true).unwrap_or_default();
         print!("{{}}", text);
         std::io::stdout().flush().ok();
+        recent_tokens.push(next);
         let mut l = model::forward(next, &weights, &mut cache);
+        apply_repeat_penalty(&mut l, &recent_tokens, repeat_penalty);
         next = sample(&mut l, temperature, top_k, &mut rng_state);
         gen_count += 1;
     }}
@@ -268,6 +282,16 @@ fn bytes_to_f32(bytes: &[u8]) -> Vec<f32> {{
 
 fn argmax(logits: &[f32]) -> u32 {{
     logits.iter().enumerate().max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap()).map(|(i, _)| i as u32).unwrap_or(0)
+}}
+
+fn apply_repeat_penalty(logits: &mut [f32], recent_tokens: &[u32], penalty: f32) {{
+    if penalty <= 1.0 {{ return; }}
+    for &tok in recent_tokens {{
+        let idx = tok as usize;
+        if idx < logits.len() {{
+            if logits[idx] > 0.0 {{ logits[idx] /= penalty; }} else {{ logits[idx] *= penalty; }}
+        }}
+    }}
 }}
 
 fn sample(logits: &mut [f32], temperature: f32, top_k: usize, rng_state: &mut u64) -> u32 {{
@@ -320,6 +344,7 @@ fn main() {{
     let temperature = parse_f32_arg(&args, "--temp", 0.0);
     let top_k = parse_usize_arg(&args, "--top-k", 0);
     let max_tokens = parse_usize_arg(&args, "--max-tokens", 128);
+    let repeat_penalty = parse_f32_arg(&args, "--repeat-penalty", 1.1);
     let prompt = args.iter().skip(1).filter(|a| !a.starts_with("--")).take_while(|a| !a.starts_with("--")).cloned().collect::<Vec<_>>().join(" ");
     let prompt = if prompt.is_empty() {{ "Hello".to_string() }} else {{ prompt }};
 
@@ -372,13 +397,16 @@ fn main() {{
         tokenizer.token_to_id("<|im_end|>"),
         tokenizer.token_to_id("<|eot_id|>"),
     ].iter().filter_map(|t| *t).collect();
+    let mut recent_tokens: Vec<u32> = tokens.to_vec();
     let mut gen_count = 0usize;
     for _ in 0..max_tokens {{
         if eos_tokens.contains(&next) {{ break; }}
         let text = tokenizer.decode(&[next], true).unwrap_or_default();
         print!("{{}}", text);
         std::io::stdout().flush().ok();
+        recent_tokens.push(next);
         let mut l = model::forward(next, &weights, &mut cache);
+        apply_repeat_penalty(&mut l, &recent_tokens, repeat_penalty);
         next = sample(&mut l, temperature, top_k, &mut rng_state);
         gen_count += 1;
     }}
