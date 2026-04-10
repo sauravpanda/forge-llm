@@ -226,6 +226,7 @@ fn main() {{
     let top_p = parse_f32_arg(&args, "--top-p", 0.9);
     let max_tokens = parse_usize_arg(&args, "--max-tokens", 128);
     let repeat_penalty = parse_f32_arg(&args, "--repeat-penalty", 1.1);
+    let quiet = args.iter().any(|a| a == "--quiet" || a == "-q");
     let save_cache_path = args.windows(2).find(|w| w[0] == "--save-cache").map(|w| w[1].clone());
     let load_cache_path = args.windows(2).find(|w| w[0] == "--load-cache").map(|w| w[1].clone());
     let prompt = args.iter().skip(3).filter(|a| !a.starts_with("--")).take_while(|a| !a.starts_with("--")).cloned().collect::<Vec<_>>().join(" ");
@@ -272,7 +273,7 @@ fn main() {{
     eprintln!("Prefill: {{:.1}} tok/s", tokens.len() as f64 / t0.elapsed().as_secs_f64());
 
     // Generate
-    print!("{{}}", prompt);
+    if !quiet {{ print!("{{}}", prompt); }}
     let t1 = std::time::Instant::now();
     // Detect EOS tokens from tokenizer
     let eos_tokens: Vec<u32> = [
@@ -285,16 +286,18 @@ fn main() {{
     let mut gen_count = 0usize;
     for _ in 0..max_tokens {{
         if eos_tokens.contains(&next) {{ break; }}
-        let text = tokenizer.decode(&[next], true).unwrap_or_default();
-        print!("{{}}", text);
-        std::io::stdout().flush().ok();
+        if !quiet {{
+            let text = tokenizer.decode(&[next], true).unwrap_or_default();
+            print!("{{}}", text);
+            std::io::stdout().flush().ok();
+        }}
         recent_tokens.push(next);
         let mut l = model::forward(next, &weights, &mut cache);
         apply_repeat_penalty(&mut l, &recent_tokens, repeat_penalty);
         next = sample(&mut l, temperature, top_k, top_p, &mut rng_state);
         gen_count += 1;
     }}
-    println!();
+    if !quiet {{ println!(); }}
     eprintln!("Generate: {{}} tokens in {{:.2}}s ({{:.1}} tok/s)", gen_count, t1.elapsed().as_secs_f64(), gen_count as f64 / t1.elapsed().as_secs_f64());
     if let Some(ref cp) = save_cache_path {{ save_kv_cache(cp, &cache); }}
 
@@ -466,6 +469,7 @@ fn main() {{
     let top_p = parse_f32_arg(&args, "--top-p", 0.9);
     let max_tokens = parse_usize_arg(&args, "--max-tokens", 128);
     let repeat_penalty = parse_f32_arg(&args, "--repeat-penalty", 1.1);
+    let quiet = args.iter().any(|a| a == "--quiet" || a == "-q");
     let save_cache_path = args.windows(2).find(|w| w[0] == "--save-cache").map(|w| w[1].clone());
     let load_cache_path = args.windows(2).find(|w| w[0] == "--load-cache").map(|w| w[1].clone());
     let prompt = args.iter().skip(1).filter(|a| !a.starts_with("--")).take_while(|a| !a.starts_with("--")).cloned().collect::<Vec<_>>().join(" ");
@@ -514,7 +518,7 @@ fn main() {{
     eprintln!("Prefill: {{:.1}} tok/s", tokens.len() as f64 / t0.elapsed().as_secs_f64());
 
     // Generate
-    print!("{{}}", prompt);
+    if !quiet {{ print!("{{}}", prompt); }}
     let t1 = std::time::Instant::now();
     // Detect EOS tokens from tokenizer
     let eos_tokens: Vec<u32> = [
@@ -527,16 +531,18 @@ fn main() {{
     let mut gen_count = 0usize;
     for _ in 0..max_tokens {{
         if eos_tokens.contains(&next) {{ break; }}
-        let text = tokenizer.decode(&[next], true).unwrap_or_default();
-        print!("{{}}", text);
-        std::io::stdout().flush().ok();
+        if !quiet {{
+            let text = tokenizer.decode(&[next], true).unwrap_or_default();
+            print!("{{}}", text);
+            std::io::stdout().flush().ok();
+        }}
         recent_tokens.push(next);
         let mut l = model::forward(next, &weights, &mut cache);
         apply_repeat_penalty(&mut l, &recent_tokens, repeat_penalty);
         next = sample(&mut l, temperature, top_k, top_p, &mut rng_state);
         gen_count += 1;
     }}
-    println!();
+    if !quiet {{ println!(); }}
     eprintln!("Generate: {{}} tokens in {{:.2}}s ({{:.1}} tok/s)", gen_count, t1.elapsed().as_secs_f64(), gen_count as f64 / t1.elapsed().as_secs_f64());
     if let Some(ref cp) = save_cache_path {{ save_kv_cache(cp, &cache); }}
 }}
