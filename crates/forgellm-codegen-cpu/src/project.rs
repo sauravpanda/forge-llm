@@ -108,17 +108,58 @@ fn argmax(logits: &[f32]) -> u32 {{
     logits.iter().enumerate().max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap()).map(|(i, _)| i as u32).unwrap_or(0)
 }}
 
+fn sample(logits: &mut [f32], temperature: f32, top_k: usize, rng_state: &mut u64) -> u32 {{
+    if temperature <= 0.0 {{ return argmax(logits); }}
+    // Apply temperature
+    for l in logits.iter_mut() {{ *l /= temperature; }}
+    // Top-k: zero out everything below the k-th largest
+    if top_k > 0 && top_k < logits.len() {{
+        let mut indices: Vec<usize> = (0..logits.len()).collect();
+        indices.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+        let threshold = logits[indices[top_k - 1]];
+        for l in logits.iter_mut() {{ if *l < threshold {{ *l = f32::NEG_INFINITY; }} }}
+    }}
+    // Softmax
+    let max_val = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    for l in logits.iter_mut() {{ *l = (*l - max_val).exp(); sum += *l; }}
+    for l in logits.iter_mut() {{ *l /= sum; }}
+    // Sample from distribution
+    *rng_state ^= *rng_state << 13;
+    *rng_state ^= *rng_state >> 7;
+    *rng_state ^= *rng_state << 17;
+    let r = (*rng_state as f32) / (u64::MAX as f32);
+    let mut cumsum = 0.0f32;
+    for (i, &p) in logits.iter().enumerate() {{
+        cumsum += p;
+        if cumsum >= r {{ return i as u32; }}
+    }}
+    logits.len() as u32 - 1
+}}
+
+fn parse_f32_arg(args: &[String], flag: &str, default: f32) -> f32 {{
+    args.windows(2).find(|w| w[0] == flag).and_then(|w| w[1].parse().ok()).unwrap_or(default)
+}}
+
+fn parse_usize_arg(args: &[String], flag: &str, default: usize) -> usize {{
+    args.windows(2).find(|w| w[0] == flag).and_then(|w| w[1].parse().ok()).unwrap_or(default)
+}}
+
 fn main() {{
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {{
-        eprintln!("Usage: {{}} <weights.bin> <tokenizer.json> [prompt]", args[0]);
+        eprintln!("Usage: {{}} <weights.bin> <tokenizer.json> [prompt] [--temp T] [--top-k K] [--max-tokens N]", args[0]);
         eprintln!("AOT-compiled {arch} | {num_layers} layers | hidden={hidden}");
         std::process::exit(1);
     }}
 
     let weights_path = &args[1];
     let tokenizer_path = &args[2];
-    let prompt = if args.len() > 3 {{ args[3..].join(" ") }} else {{ "Hello".into() }};
+    let temperature = parse_f32_arg(&args, "--temp", 0.0);
+    let top_k = parse_usize_arg(&args, "--top-k", 0);
+    let max_tokens = parse_usize_arg(&args, "--max-tokens", 128);
+    let prompt = args.iter().skip(3).filter(|a| !a.starts_with("--")).take_while(|a| !a.starts_with("--")).cloned().collect::<Vec<_>>().join(" ");
+    let prompt = if prompt.is_empty() {{ "Hello".to_string() }} else {{ prompt }};
 
     eprintln!("Loading tokenizer...");
     let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path).expect("failed to load tokenizer");
@@ -148,26 +189,29 @@ fn main() {{
 
     let enc = tokenizer.encode(prompt.as_str(), false).expect("encode failed");
     let tokens = enc.get_ids();
-    eprintln!("Prompt: {{}} tokens | Generating...", tokens.len());
+    eprintln!("Prompt: {{}} tokens | temp={{}} top_k={{}} max_tokens={{}}", tokens.len(), temperature, top_k, max_tokens);
 
     // Prefill
     let t0 = std::time::Instant::now();
+    let mut rng_state: u64 = 0xdeadbeef12345678;
     let mut next = 0u32;
-    for &tok in tokens {{ let l = model::forward(tok, &weights, &mut cache); next = argmax(&l); }}
+    for &tok in tokens {{ let mut l = model::forward(tok, &weights, &mut cache); next = sample(&mut l, temperature, top_k, &mut rng_state); }}
     eprintln!("Prefill: {{:.1}} tok/s", tokens.len() as f64 / t0.elapsed().as_secs_f64());
 
     // Generate
     print!("{{}}", prompt);
     let t1 = std::time::Instant::now();
-    for _ in 0..128 {{
+    let mut gen_count = 0usize;
+    for _ in 0..max_tokens {{
         let text = tokenizer.decode(&[next], true).unwrap_or_default();
         print!("{{}}", text);
         std::io::stdout().flush().ok();
-        let l = model::forward(next, &weights, &mut cache);
-        next = argmax(&l);
+        let mut l = model::forward(next, &weights, &mut cache);
+        next = sample(&mut l, temperature, top_k, &mut rng_state);
+        gen_count += 1;
     }}
     println!();
-    eprintln!("Generate: 128 tokens in {{:.2}}s ({{:.1}} tok/s)", t1.elapsed().as_secs_f64(), 128.0 / t1.elapsed().as_secs_f64());
+    eprintln!("Generate: {{}} tokens in {{:.2}}s ({{:.1}} tok/s)", gen_count, t1.elapsed().as_secs_f64(), gen_count as f64 / t1.elapsed().as_secs_f64());
 }}
 "##
     )
@@ -206,9 +250,46 @@ fn argmax(logits: &[f32]) -> u32 {{
     logits.iter().enumerate().max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap()).map(|(i, _)| i as u32).unwrap_or(0)
 }}
 
+fn sample(logits: &mut [f32], temperature: f32, top_k: usize, rng_state: &mut u64) -> u32 {{
+    if temperature <= 0.0 {{ return argmax(logits); }}
+    for l in logits.iter_mut() {{ *l /= temperature; }}
+    if top_k > 0 && top_k < logits.len() {{
+        let mut indices: Vec<usize> = (0..logits.len()).collect();
+        indices.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+        let threshold = logits[indices[top_k - 1]];
+        for l in logits.iter_mut() {{ if *l < threshold {{ *l = f32::NEG_INFINITY; }} }}
+    }}
+    let max_val = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    for l in logits.iter_mut() {{ *l = (*l - max_val).exp(); sum += *l; }}
+    for l in logits.iter_mut() {{ *l /= sum; }}
+    *rng_state ^= *rng_state << 13;
+    *rng_state ^= *rng_state >> 7;
+    *rng_state ^= *rng_state << 17;
+    let r = (*rng_state as f32) / (u64::MAX as f32);
+    let mut cumsum = 0.0f32;
+    for (i, &p) in logits.iter().enumerate() {{
+        cumsum += p;
+        if cumsum >= r {{ return i as u32; }}
+    }}
+    logits.len() as u32 - 1
+}}
+
+fn parse_f32_arg(args: &[String], flag: &str, default: f32) -> f32 {{
+    args.windows(2).find(|w| w[0] == flag).and_then(|w| w[1].parse().ok()).unwrap_or(default)
+}}
+
+fn parse_usize_arg(args: &[String], flag: &str, default: usize) -> usize {{
+    args.windows(2).find(|w| w[0] == flag).and_then(|w| w[1].parse().ok()).unwrap_or(default)
+}}
+
 fn main() {{
     let args: Vec<String> = env::args().collect();
-    let prompt = if args.len() > 1 {{ args[1..].join(" ") }} else {{ "Hello".into() }};
+    let temperature = parse_f32_arg(&args, "--temp", 0.0);
+    let top_k = parse_usize_arg(&args, "--top-k", 0);
+    let max_tokens = parse_usize_arg(&args, "--max-tokens", 128);
+    let prompt = args.iter().skip(1).filter(|a| !a.starts_with("--")).take_while(|a| !a.starts_with("--")).cloned().collect::<Vec<_>>().join(" ");
+    let prompt = if prompt.is_empty() {{ "Hello".to_string() }} else {{ prompt }};
 
     eprintln!("AOT-compiled {arch} | {num_layers} layers | hidden={hidden} | weights embedded");
 
@@ -240,26 +321,29 @@ fn main() {{
 
     let enc = tokenizer.encode(prompt.as_str(), false).expect("encode failed");
     let tokens = enc.get_ids();
-    eprintln!("Prompt: {{}} tokens | Generating...", tokens.len());
+    eprintln!("Prompt: {{}} tokens | temp={{}} top_k={{}} max_tokens={{}}", tokens.len(), temperature, top_k, max_tokens);
 
     // Prefill
     let t0 = std::time::Instant::now();
+    let mut rng_state: u64 = 0xdeadbeef12345678;
     let mut next = 0u32;
-    for &tok in tokens {{ let l = model::forward(tok, &weights, &mut cache); next = argmax(&l); }}
+    for &tok in tokens {{ let mut l = model::forward(tok, &weights, &mut cache); next = sample(&mut l, temperature, top_k, &mut rng_state); }}
     eprintln!("Prefill: {{:.1}} tok/s", tokens.len() as f64 / t0.elapsed().as_secs_f64());
 
     // Generate
     print!("{{}}", prompt);
     let t1 = std::time::Instant::now();
-    for _ in 0..128 {{
+    let mut gen_count = 0usize;
+    for _ in 0..max_tokens {{
         let text = tokenizer.decode(&[next], true).unwrap_or_default();
         print!("{{}}", text);
         std::io::stdout().flush().ok();
-        let l = model::forward(next, &weights, &mut cache);
-        next = argmax(&l);
+        let mut l = model::forward(next, &weights, &mut cache);
+        next = sample(&mut l, temperature, top_k, &mut rng_state);
+        gen_count += 1;
     }}
     println!();
-    eprintln!("Generate: 128 tokens in {{:.2}}s ({{:.1}} tok/s)", t1.elapsed().as_secs_f64(), 128.0 / t1.elapsed().as_secs_f64());
+    eprintln!("Generate: {{}} tokens in {{:.2}}s ({{:.1}} tok/s)", gen_count, t1.elapsed().as_secs_f64(), gen_count as f64 / t1.elapsed().as_secs_f64());
 }}
 "##
     )
