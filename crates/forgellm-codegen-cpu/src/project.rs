@@ -70,8 +70,10 @@ memmap2 = "0.9"
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"
 codegen-units = 1
+panic = "abort"
+strip = true
 "#
     )
 }
