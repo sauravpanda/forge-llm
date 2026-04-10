@@ -220,6 +220,9 @@ fn main() {{
         println!("  Heads:        {num_heads} (KV: {num_kv_heads})");
         println!("  Head dim:     {head_dim}");
         println!("  Intermediate: {inter}");
+        // Compute KV cache size without allocating: NUM_LAYERS * MAX_SEQ_LEN * kv_size * 4 bytes * 2 (k+v)
+        let kv_bytes = model::NUM_LAYERS * model::MAX_SEQ_LEN * model::NUM_KV_HEADS * model::HEAD_DIM * 4 * 2;
+        println!("  KV cache:     {{:.1}} MB (max_seq_len={{}})", (kv_bytes as f64) / 1e6, model::MAX_SEQ_LEN);
         println!("  Compiled by:  ForgeLLM (https://forgellm.dev)");
         return;
     }}
@@ -479,6 +482,8 @@ fn main() {{
         println!("  Head dim:     {head_dim}");
         println!("  Intermediate: {inter}");
         println!("  Weights:      {{:.1}} MB (embedded)", WEIGHTS_BYTES.len() as f64 / 1e6);
+        let kv_bytes = model::NUM_LAYERS * model::MAX_SEQ_LEN * model::NUM_KV_HEADS * model::HEAD_DIM * 4 * 2;
+        println!("  KV cache:     {{:.1}} MB (max_seq_len={{}})", (kv_bytes as f64) / 1e6, model::MAX_SEQ_LEN);
         println!("  Compiled by:  ForgeLLM (https://forgellm.dev)");
         return;
     }}
