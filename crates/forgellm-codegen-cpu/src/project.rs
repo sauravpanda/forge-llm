@@ -147,9 +147,21 @@ fn parse_usize_arg(args: &[String], flag: &str, default: usize) -> usize {{
 
 fn main() {{
     let args: Vec<String> = env::args().collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") {{
+        println!("AOT-compiled {arch} inference binary");
+        println!("  Layers:       {num_layers}");
+        println!("  Hidden size:  {hidden}");
+        println!("  Vocab size:   {vocab}");
+        println!("  Heads:        {num_heads} (KV: {num_kv_heads})");
+        println!("  Head dim:     {head_dim}");
+        println!("  Intermediate: {inter}");
+        println!("  Compiled by:  ForgeLLM (https://forgellm.dev)");
+        return;
+    }}
     if args.len() < 3 {{
         eprintln!("Usage: {{}} <weights.bin> <tokenizer.json> [prompt] [--temp T] [--top-k K] [--max-tokens N]", args[0]);
         eprintln!("AOT-compiled {arch} | {num_layers} layers | hidden={hidden}");
+        eprintln!("       {{}} --version", args[0]);
         std::process::exit(1);
     }}
 
@@ -293,6 +305,18 @@ fn parse_usize_arg(args: &[String], flag: &str, default: usize) -> usize {{
 
 fn main() {{
     let args: Vec<String> = env::args().collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") {{
+        println!("AOT-compiled {arch} inference binary (embedded weights)");
+        println!("  Layers:       {num_layers}");
+        println!("  Hidden size:  {hidden}");
+        println!("  Vocab size:   {vocab}");
+        println!("  Heads:        {num_heads} (KV: {num_kv_heads})");
+        println!("  Head dim:     {head_dim}");
+        println!("  Intermediate: {inter}");
+        println!("  Weights:      {{:.1}} MB (embedded)", WEIGHTS_BYTES.len() as f64 / 1e6);
+        println!("  Compiled by:  ForgeLLM (https://forgellm.dev)");
+        return;
+    }}
     let temperature = parse_f32_arg(&args, "--temp", 0.0);
     let top_k = parse_usize_arg(&args, "--top-k", 0);
     let max_tokens = parse_usize_arg(&args, "--max-tokens", 128);
