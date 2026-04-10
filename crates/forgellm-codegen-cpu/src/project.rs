@@ -231,11 +231,13 @@ fn main() {{
     let prompt = args.iter().skip(3).filter(|a| !a.starts_with("--")).take_while(|a| !a.starts_with("--")).cloned().collect::<Vec<_>>().join(" ");
     let prompt = if prompt.is_empty() {{ "Hello".to_string() }} else {{ prompt }};
 
+    let t_load = std::time::Instant::now();
     eprintln!("Loading tokenizer...");
     let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path).expect("failed to load tokenizer");
 
     eprintln!("Loading weights...");
     let w = load_weights(weights_path);
+    eprintln!("Load time: {{:.2}}s", t_load.elapsed().as_secs_f64());
     let mut off = 0usize;
 
     let embed = w[off..off + {vocab} * {hidden}].to_vec(); off += {vocab} * {hidden};
@@ -471,11 +473,13 @@ fn main() {{
 
     eprintln!("AOT-compiled {arch} | {num_layers} layers | hidden={hidden} | weights embedded");
 
+    let t_load = std::time::Instant::now();
     eprintln!("Loading tokenizer (embedded)...");
     let tokenizer = tokenizers::Tokenizer::from_bytes(TOKENIZER_BYTES).expect("failed to load tokenizer");
 
     eprintln!("Parsing weights (embedded, {{:.1}} MB)...", WEIGHTS_BYTES.len() as f64 / 1e6);
     let w = bytes_to_f32(WEIGHTS_BYTES);
+    eprintln!("Load time: {{:.2}}s", t_load.elapsed().as_secs_f64());
     let mut off = 0usize;
 
     let embed = w[off..off + {vocab} * {hidden}].to_vec(); off += {vocab} * {hidden};
