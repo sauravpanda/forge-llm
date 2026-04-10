@@ -1,0 +1,30 @@
+{
+  "version": "0.3.1-dev",
+  "date": "2026-04-10T00:00:00Z",
+  "system": {
+    "os": "Darwin",
+    "arch": "arm64",
+    "cpu": "Apple M5 Pro",
+    "cores": 18
+  },
+  "model": {
+    "name": "SmolLM2-135M-Instruct",
+    "quant": "Q8_0",
+    "params": "135M"
+  },
+  "benchmarks": {
+    "interpreter": {
+      "generate_tok_s_avg": 119.7
+    },
+    "aot": {
+      "generate_tok_s_avg": 114.8,
+      "generate_tok_s_best": 120.8,
+      "generate_tok_s_runs": [110.0, 105.4, 110.6, 113.0, 117.5, 120.8, 116.7, 119.1, 120.4, 119.0],
+      "num_tokens": 64,
+      "runs": 10,
+      "load_time_s": 0.09,
+      "binary_size_mb": 2.7
+    }
+  },
+  "notes": "First few runs are slower (page faults / CPU thermal), settles to ~118-120 after run 5. v0.3.0 results were already at this level — no regression from v0.3.1-dev refactoring (KVCache reset, version info, --quiet, direct memcpy load)."
+}
