@@ -200,15 +200,16 @@ pub fn attention(output: &mut [f32], q: &[f32], k_cache: &[f32], v_cache: &[f32]
     let gsize = num_heads / num_kv_heads;
     let scale = 1.0 / (head_dim as f32).sqrt();
     let kv_stride = num_kv_heads * head_dim;
+    // Fixed-size scores buffer — no heap allocation
+    let mut scores = [0.0f32; MAX_SEQ_LEN];
     for h in 0..num_heads {
         let kv_h = h / gsize;
         let qo = h * head_dim;
-        let mut scores = vec![0.0f32; seq_len];
         for t in 0..seq_len {
             let ko = t * kv_stride + kv_h * head_dim;
             scores[t] = dot_f32(&q[qo..qo+head_dim], &k_cache[ko..ko+head_dim], head_dim) * scale;
         }
-        softmax(&mut scores);
+        softmax(&mut scores[..seq_len]);
         for d in 0..head_dim {
             let mut sum = 0.0f32;
             for t in 0..seq_len {
@@ -297,6 +298,8 @@ fn emit_forward_function(
     let num_kv_heads = config.num_kv_heads;
     let head_dim = config.head_dim;
     let vocab = config.vocab_size;
+    let qk_size = num_heads * head_dim;
+    let kv_size = num_kv_heads * head_dim;
 
     writeln!(
         code,
@@ -355,16 +358,17 @@ fn emit_forward_function(
     writeln!(code)?;
 
     writeln!(code, "/// KV cache for autoregressive generation.")?;
+    writeln!(code, "/// Pre-allocated to MAX_SEQ_LEN — zero allocations during inference.")?;
     writeln!(code, "pub struct KVCache {{")?;
     writeln!(
         code,
-        "    pub k: Vec<Vec<f32>>,  // [num_layers][seq_len * {} * {}]",
-        num_kv_heads, head_dim
+        "    pub k: Vec<Vec<f32>>,  // [num_layers][MAX_SEQ_LEN * {}]  (pre-allocated)",
+        kv_size
     )?;
     writeln!(
         code,
-        "    pub v: Vec<Vec<f32>>,  // [num_layers][seq_len * {} * {}]",
-        num_kv_heads, head_dim
+        "    pub v: Vec<Vec<f32>>,  // [num_layers][MAX_SEQ_LEN * {}]  (pre-allocated)",
+        kv_size
     )?;
     writeln!(code, "    pub len: usize,")?;
     writeln!(code, "}}")?;
@@ -375,11 +379,13 @@ fn emit_forward_function(
     writeln!(code, "        Self {{")?;
     writeln!(
         code,
-        "            k: (0..NUM_LAYERS).map(|_| Vec::new()).collect(),"
+        "            k: (0..NUM_LAYERS).map(|_| vec![0.0f32; MAX_SEQ_LEN * {kv_size}]).collect(),",
+        kv_size = kv_size
     )?;
     writeln!(
         code,
-        "            v: (0..NUM_LAYERS).map(|_| Vec::new()).collect(),"
+        "            v: (0..NUM_LAYERS).map(|_| vec![0.0f32; MAX_SEQ_LEN * {kv_size}]).collect(),",
+        kv_size = kv_size
     )?;
     writeln!(code, "            len: 0,")?;
     writeln!(code, "        }}")?;
@@ -412,8 +418,6 @@ fn emit_forward_function(
     writeln!(code)?;
 
     // Buffers — fixed-size arrays, zero heap allocation
-    let qk_size = num_heads * head_dim;
-    let kv_size = num_kv_heads * head_dim;
     writeln!(code, "    // Fixed-size buffers — zero heap allocation during forward pass")?;
     writeln!(code, "    let mut normed = [0.0f32; {hidden}];")?;
     writeln!(code, "    let mut q = [0.0f32; {qk_size}];")?;
@@ -467,16 +471,25 @@ fn emit_forward_function(
         "        rope(&mut k, pos, HEAD_DIM, NUM_KV_HEADS, ROPE_THETA);"
     )?;
     writeln!(code)?;
-    writeln!(code, "        // Update KV cache")?;
-    writeln!(code, "        cache.k[layer_idx].extend_from_slice(&k);")?;
-    writeln!(code, "        cache.v[layer_idx].extend_from_slice(&v);")?;
+    writeln!(code, "        // Update KV cache (direct indexed write, no allocation)")?;
+    writeln!(
+        code,
+        "        cache.k[layer_idx][pos*{kv_size}..(pos+1)*{kv_size}].copy_from_slice(&k);",
+        kv_size = kv_size
+    )?;
+    writeln!(
+        code,
+        "        cache.v[layer_idx][pos*{kv_size}..(pos+1)*{kv_size}].copy_from_slice(&v);",
+        kv_size = kv_size
+    )?;
     writeln!(code)?;
-    writeln!(code, "        // Attention")?;
+    writeln!(code, "        // Attention (cache sliced to valid region)")?;
     writeln!(code, "        attention(")?;
     writeln!(code, "            &mut attn_out, &q,")?;
     writeln!(
         code,
-        "            &cache.k[layer_idx], &cache.v[layer_idx],"
+        "            &cache.k[layer_idx][..(pos+1)*{kv_size}], &cache.v[layer_idx][..(pos+1)*{kv_size}],",
+        kv_size = kv_size
     )?;
     writeln!(
         code,
