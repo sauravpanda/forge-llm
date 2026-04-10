@@ -67,13 +67,17 @@ Supports 12 GGUF quantization formats: F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q2_K th
 
 ## Performance
 
-Optimized kernels (unrolled matmul) on Apple Silicon:
+v0.3.0 benchmarks on Apple M5 Pro (Q8_0 quantization, 64 tokens):
 
-| Model | Params | Generation |
-|-------|--------|------------|
-| SmolLM2-135M Q8_0 | 135M | **46.3 tok/s** |
-| SmolLM2-360M Q8_0 | 360M | **17.5 tok/s** |
-| Qwen2.5-0.5B Q8_0 | 494M | **12.0 tok/s** |
+| Model | Params | Interpreter | AOT Binary |
+|-------|--------|-------------|------------|
+| SmolLM2-135M | 135M | 119.7 tok/s | **119.5 tok/s** |
+| SmolLM2-360M | 360M | 46.3 tok/s | **47.3 tok/s** |
+| Qwen2.5-0.5B | 494M | 33.6 tok/s | **35.8 tok/s** |
+
+AOT binaries match or exceed interpreter performance with the bonus of
+single-file deployment, smaller memory footprint, and faster startup.
+See [`benchmarks/HISTORY.md`](benchmarks/HISTORY.md) for version-over-version progress.
 
 ## AOT Compilation
 
