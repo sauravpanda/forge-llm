@@ -712,11 +712,22 @@ mod tests {
 
         let main = fs::read_to_string(dir.join("src/main.rs")).unwrap();
         // Find /clear handler and verify it uses cache.reset()
-        let clear_idx = main.find("if input == \"/clear\"").expect("clear handler missing");
-        let after_clear = &main[clear_idx..clear_idx+200];
-        assert!(after_clear.contains("cache.reset()"), "expected cache.reset() in /clear handler");
-        assert!(after_clear.contains("recent_tokens.clear()"), "expected recent_tokens.clear() in /clear handler");
-        assert!(!after_clear.contains("KVCache::new()"), "should not re-allocate cache on /clear");
+        let clear_idx = main
+            .find("if input == \"/clear\"")
+            .expect("clear handler missing");
+        let after_clear = &main[clear_idx..clear_idx + 200];
+        assert!(
+            after_clear.contains("cache.reset()"),
+            "expected cache.reset() in /clear handler"
+        );
+        assert!(
+            after_clear.contains("recent_tokens.clear()"),
+            "expected recent_tokens.clear() in /clear handler"
+        );
+        assert!(
+            !after_clear.contains("KVCache::new()"),
+            "should not re-allocate cache on /clear"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -732,7 +743,10 @@ mod tests {
         let main = fs::read_to_string(dir.join("src/main.rs")).unwrap();
         assert!(main.contains("--seed"), "should support --seed flag");
         assert!(main.contains("let seed = "), "should parse seed");
-        assert!(main.contains("let mut rng_state: u64 = seed;"), "should use parsed seed");
+        assert!(
+            main.contains("let mut rng_state: u64 = seed;"),
+            "should use parsed seed"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -746,8 +760,14 @@ mod tests {
         generate_project(&graph, &dir, "test-ver", false).unwrap();
 
         let main = fs::read_to_string(dir.join("src/main.rs")).unwrap();
-        assert!(main.contains("KV cache:"), "version output should show KV cache size");
-        assert!(main.contains("kv_bytes"), "should compute KV bytes from constants");
+        assert!(
+            main.contains("KV cache:"),
+            "version output should show KV cache size"
+        );
+        assert!(
+            main.contains("kv_bytes"),
+            "should compute KV bytes from constants"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

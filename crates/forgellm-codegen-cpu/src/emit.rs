@@ -58,7 +58,10 @@ fn emit_header(code: &mut String, config: &ModelConfig) -> Result<(), CodegenErr
     )?;
     writeln!(code)?;
     writeln!(code, "#![allow(clippy::excessive_precision)]")?;
-    writeln!(code, "#![allow(dead_code, unused_imports, unused_assignments)]")?;
+    writeln!(
+        code,
+        "#![allow(dead_code, unused_imports, unused_assignments)]"
+    )?;
     writeln!(code)?;
     writeln!(code, "use rayon::prelude::*;")?;
     writeln!(code)?;
@@ -104,14 +107,20 @@ fn emit_header(code: &mut String, config: &ModelConfig) -> Result<(), CodegenErr
     writeln!(code)?;
 
     // Aligned buffer type for SIMD-friendly memory access
-    writeln!(code, "/// Cache-line aligned buffer for optimal SIMD performance.")?;
+    writeln!(
+        code,
+        "/// Cache-line aligned buffer for optimal SIMD performance."
+    )?;
     writeln!(code, "#[repr(C, align(64))]")?;
     writeln!(code, "pub struct AlignedBuf<const N: usize>(pub [f32; N]);")?;
     writeln!(code)?;
     writeln!(code, "impl<const N: usize> AlignedBuf<N> {{")?;
     writeln!(code, "    pub fn new() -> Self {{ Self([0.0f32; N]) }}")?;
     writeln!(code, "    pub fn as_slice(&self) -> &[f32] {{ &self.0 }}")?;
-    writeln!(code, "    pub fn as_mut_slice(&mut self) -> &mut [f32] {{ &mut self.0 }}")?;
+    writeln!(
+        code,
+        "    pub fn as_mut_slice(&mut self) -> &mut [f32] {{ &mut self.0 }}"
+    )?;
     writeln!(code, "}}")?;
     writeln!(code)?;
 
@@ -451,7 +460,10 @@ fn emit_specialized_matmul_functions(
     config: &ModelConfig,
 ) -> Result<(), CodegenError> {
     writeln!(code, "// --- Shape-specialized matmul functions (m=1) ---")?;
-    writeln!(code, "// All dimensions baked in at compile time — no runtime size parameters.")?;
+    writeln!(
+        code,
+        "// All dimensions baked in at compile time — no runtime size parameters."
+    )?;
     writeln!(code)?;
 
     // Threshold for parallelization: only parallelize if N >= 4096
@@ -459,10 +471,16 @@ fn emit_specialized_matmul_functions(
     let par_threshold = 4096;
 
     for &(k, n) in &matmul_shapes(config) {
-        writeln!(code, "/// Specialized matmul: [1, {k}] x [{n}, {k}]^T -> [1, {n}]")?;
+        writeln!(
+            code,
+            "/// Specialized matmul: [1, {k}] x [{n}, {k}]^T -> [1, {n}]"
+        )?;
         if n >= par_threshold {
             // Parallel path: par_chunks_mut(256) for cache locality + amortized Rayon overhead
-            writeln!(code, "/// Parallelized: par_chunks_mut(256) with 4-way row ILP per thread")?;
+            writeln!(
+                code,
+                "/// Parallelized: par_chunks_mut(256) with 4-way row ILP per thread"
+            )?;
             writeln!(code, "#[inline]")?;
             writeln!(
                 code,
@@ -478,14 +496,29 @@ fn emit_specialized_matmul_functions(
             writeln!(code, "        for c in 0..chunks4 {{")?;
             writeln!(code, "            let r = c * 4;")?;
             writeln!(code, "            let j = base + r;")?;
-            writeln!(code, "            out[r]   = dot_f32(&input[..], &weight[j*{k}..(j+1)*{k}], {k});")?;
-            writeln!(code, "            out[r+1] = dot_f32(&input[..], &weight[(j+1)*{k}..(j+2)*{k}], {k});")?;
-            writeln!(code, "            out[r+2] = dot_f32(&input[..], &weight[(j+2)*{k}..(j+3)*{k}], {k});")?;
-            writeln!(code, "            out[r+3] = dot_f32(&input[..], &weight[(j+3)*{k}..(j+4)*{k}], {k});")?;
+            writeln!(
+                code,
+                "            out[r]   = dot_f32(&input[..], &weight[j*{k}..(j+1)*{k}], {k});"
+            )?;
+            writeln!(
+                code,
+                "            out[r+1] = dot_f32(&input[..], &weight[(j+1)*{k}..(j+2)*{k}], {k});"
+            )?;
+            writeln!(
+                code,
+                "            out[r+2] = dot_f32(&input[..], &weight[(j+2)*{k}..(j+3)*{k}], {k});"
+            )?;
+            writeln!(
+                code,
+                "            out[r+3] = dot_f32(&input[..], &weight[(j+3)*{k}..(j+4)*{k}], {k});"
+            )?;
             writeln!(code, "        }}")?;
             writeln!(code, "        for r in (chunks4*4)..len {{")?;
             writeln!(code, "            let j = base + r;")?;
-            writeln!(code, "            out[r] = dot_f32(&input[..], &weight[j*{k}..(j+1)*{k}], {k});")?;
+            writeln!(
+                code,
+                "            out[r] = dot_f32(&input[..], &weight[j*{k}..(j+1)*{k}], {k});"
+            )?;
             writeln!(code, "        }}")?;
             writeln!(code, "    }});")?;
             writeln!(code, "}}")?;
@@ -499,10 +532,16 @@ fn emit_specialized_matmul_functions(
             let n_chunks = n / 4;
             let n_remainder = n % 4;
             if n_chunks > 0 {
-                writeln!(code, "    // Process 4 output rows at a time for instruction-level parallelism")?;
+                writeln!(
+                    code,
+                    "    // Process 4 output rows at a time for instruction-level parallelism"
+                )?;
                 writeln!(code, "    for chunk in 0..{n_chunks} {{")?;
                 writeln!(code, "        let j0 = chunk * 4;")?;
-                writeln!(code, "        output[j0]   = dot_f32(&input[..], &weight[j0*{k}..(j0+1)*{k}], {k});")?;
+                writeln!(
+                    code,
+                    "        output[j0]   = dot_f32(&input[..], &weight[j0*{k}..(j0+1)*{k}], {k});"
+                )?;
                 writeln!(code, "        output[j0+1] = dot_f32(&input[..], &weight[(j0+1)*{k}..(j0+2)*{k}], {k});")?;
                 writeln!(code, "        output[j0+2] = dot_f32(&input[..], &weight[(j0+2)*{k}..(j0+3)*{k}], {k});")?;
                 writeln!(code, "        output[j0+3] = dot_f32(&input[..], &weight[(j0+3)*{k}..(j0+4)*{k}], {k});")?;
@@ -594,7 +633,10 @@ fn emit_forward_function(
     writeln!(code)?;
 
     writeln!(code, "/// KV cache for autoregressive generation.")?;
-    writeln!(code, "/// Pre-allocated to MAX_SEQ_LEN — zero allocations during inference.")?;
+    writeln!(
+        code,
+        "/// Pre-allocated to MAX_SEQ_LEN — zero allocations during inference."
+    )?;
     writeln!(code, "pub struct KVCache {{")?;
     writeln!(
         code,
@@ -634,7 +676,10 @@ fn emit_forward_function(
     writeln!(code)?;
     writeln!(code, "    /// Memory used by KV cache in bytes")?;
     writeln!(code, "    pub fn memory_bytes(&self) -> usize {{")?;
-    writeln!(code, "        NUM_LAYERS * MAX_SEQ_LEN * {kv_size} * 4 * 2  // k + v, f32")?;
+    writeln!(
+        code,
+        "        NUM_LAYERS * MAX_SEQ_LEN * {kv_size} * 4 * 2  // k + v, f32"
+    )?;
     writeln!(code, "    }}")?;
     writeln!(code, "}}")?;
     writeln!(code)?;
@@ -657,10 +702,7 @@ fn emit_forward_function(
 
     // Embedding
     writeln!(code, "    // Embedding lookup")?;
-    writeln!(
-        code,
-        "    let mut hidden_state = [0.0f32; HIDDEN_SIZE];"
-    )?;
+    writeln!(code, "    let mut hidden_state = [0.0f32; HIDDEN_SIZE];")?;
     writeln!(
         code,
         "    embedding(&mut hidden_state, token_id, &weights.embed_tokens, HIDDEN_SIZE);"
@@ -668,7 +710,10 @@ fn emit_forward_function(
     writeln!(code)?;
 
     // Buffers — fixed-size arrays, zero heap allocation
-    writeln!(code, "    // Fixed-size buffers — zero heap allocation during forward pass")?;
+    writeln!(
+        code,
+        "    // Fixed-size buffers — zero heap allocation during forward pass"
+    )?;
     writeln!(code, "    let mut normed = [0.0f32; {hidden}];")?;
     writeln!(code, "    let mut q = [0.0f32; {qk_size}];")?;
     writeln!(code, "    let mut k = [0.0f32; {kv_size}];")?;
@@ -680,8 +725,14 @@ fn emit_forward_function(
     writeln!(code, "    let mut ffn_hidden = [0.0f32; {intermediate}];")?;
     writeln!(code, "    let mut ffn_out = [0.0f32; {hidden}];")?;
     writeln!(code)?;
-    writeln!(code, "    // Precomputed RoPE frequencies — avoids powf per token")?;
-    writeln!(code, "    let rope_freqs = rope_freqs(HEAD_DIM, ROPE_THETA);")?;
+    writeln!(
+        code,
+        "    // Precomputed RoPE frequencies — avoids powf per token"
+    )?;
+    writeln!(
+        code,
+        "    let rope_freqs = rope_freqs(HEAD_DIM, ROPE_THETA);"
+    )?;
     writeln!(code)?;
 
     // Transformer layers
@@ -699,17 +750,20 @@ fn emit_forward_function(
     writeln!(
         code,
         "        matmul_vec_{hidden}x{qk_size}(&mut q, &normed, &lw.q_proj);",
-        hidden = hidden, qk_size = qk_size
+        hidden = hidden,
+        qk_size = qk_size
     )?;
     writeln!(
         code,
         "        matmul_vec_{hidden}x{kv_size}(&mut k, &normed, &lw.k_proj);",
-        hidden = hidden, kv_size = kv_size
+        hidden = hidden,
+        kv_size = kv_size
     )?;
     writeln!(
         code,
         "        matmul_vec_{hidden}x{kv_size}(&mut v, &normed, &lw.v_proj);",
-        hidden = hidden, kv_size = kv_size
+        hidden = hidden,
+        kv_size = kv_size
     )?;
     writeln!(code)?;
     writeln!(code, "        // RoPE")?;
@@ -722,7 +776,10 @@ fn emit_forward_function(
         "        rope(&mut k, pos, HEAD_DIM, NUM_KV_HEADS, &rope_freqs);"
     )?;
     writeln!(code)?;
-    writeln!(code, "        // Update KV cache (direct indexed write, no allocation)")?;
+    writeln!(
+        code,
+        "        // Update KV cache (direct indexed write, no allocation)"
+    )?;
     writeln!(
         code,
         "        cache.k[layer_idx][pos*{kv_size}..(pos+1)*{kv_size}].copy_from_slice(&k);",
@@ -752,12 +809,10 @@ fn emit_forward_function(
     writeln!(
         code,
         "        matmul_vec_{qk_size}x{hidden}(&mut attn_proj, &attn_out, &lw.o_proj);",
-        qk_size = qk_size, hidden = hidden
+        qk_size = qk_size,
+        hidden = hidden
     )?;
-    writeln!(
-        code,
-        "        residual_add(&mut hidden_state, &attn_proj);"
-    )?;
+    writeln!(code, "        residual_add(&mut hidden_state, &attn_proj);")?;
     writeln!(code)?;
     writeln!(code, "        // FFN norm")?;
     writeln!(
@@ -772,28 +827,25 @@ fn emit_forward_function(
     writeln!(
         code,
         "        matmul_vec_{hidden}x{intermediate}(&mut gate, &normed, &lw.gate_proj);",
-        hidden = hidden, intermediate = intermediate
+        hidden = hidden,
+        intermediate = intermediate
     )?;
     writeln!(
         code,
         "        matmul_vec_{hidden}x{intermediate}(&mut up, &normed, &lw.up_proj);",
-        hidden = hidden, intermediate = intermediate
+        hidden = hidden,
+        intermediate = intermediate
     )?;
-    writeln!(
-        code,
-        "        silu_mul(&mut ffn_hidden, &gate, &up);"
-    )?;
+    writeln!(code, "        silu_mul(&mut ffn_hidden, &gate, &up);")?;
     writeln!(
         code,
         "        matmul_vec_{intermediate}x{hidden}(&mut ffn_out, &ffn_hidden, &lw.down_proj);",
-        intermediate = intermediate, hidden = hidden
+        intermediate = intermediate,
+        hidden = hidden
     )?;
     writeln!(code)?;
     writeln!(code, "        // Fused residual add")?;
-    writeln!(
-        code,
-        "        residual_add(&mut hidden_state, &ffn_out);"
-    )?;
+    writeln!(code, "        residual_add(&mut hidden_state, &ffn_out);")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
@@ -804,8 +856,14 @@ fn emit_forward_function(
         "    rms_norm(&mut normed, &hidden_state, &weights.final_norm, RMS_NORM_EPS);"
     )?;
     writeln!(code)?;
-    writeln!(code, "    // Logits projection (parallelized — largest single matmul)")?;
-    writeln!(code, "    // Uses larger chunks (256) to amortize Rayon overhead")?;
+    writeln!(
+        code,
+        "    // Logits projection (parallelized — largest single matmul)"
+    )?;
+    writeln!(
+        code,
+        "    // Uses larger chunks (256) to amortize Rayon overhead"
+    )?;
     writeln!(code, "    let mut logits = vec![0.0f32; VOCAB_SIZE];")?;
     writeln!(
         code,
@@ -813,10 +871,7 @@ fn emit_forward_function(
     )?;
     writeln!(code, "        let base = chunk_idx * 256;")?;
     writeln!(code, "        for r in 0..out.len() {{")?;
-    writeln!(
-        code,
-        "            let j = base + r;"
-    )?;
+    writeln!(code, "            let j = base + r;")?;
     writeln!(
         code,
         "            out[r] = dot_f32(&normed[..], &weights.lm_head[j*{hidden}..(j+1)*{hidden}], {hidden});"
@@ -939,11 +994,11 @@ mod tests {
         assert!(code.contains("pub const NUM_LAYERS: usize = 30;"));
 
         // Shape-specialized matmul: hidden=576, qk=9*64=576, kv=3*64=192, inter=1536
-        assert!(code.contains("fn matmul_vec_576x576("));  // q_proj (hidden→qk)
-        assert!(code.contains("fn matmul_vec_576x192("));  // k/v_proj (hidden→kv)
+        assert!(code.contains("fn matmul_vec_576x576(")); // q_proj (hidden→qk)
+        assert!(code.contains("fn matmul_vec_576x192(")); // k/v_proj (hidden→kv)
         assert!(code.contains("fn matmul_vec_576x1536(")); // gate/up_proj
         assert!(code.contains("fn matmul_vec_1536x576(")); // down_proj
-        // Forward function uses specialized calls
+                                                           // Forward function uses specialized calls
         assert!(code.contains("matmul_vec_576x576(&mut q"));
         assert!(code.contains("matmul_vec_576x192(&mut k"));
         assert!(!code.contains("matmul(&mut q")); // no generic matmul calls
