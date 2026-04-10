@@ -58,6 +58,10 @@ enum Commands {
         /// Path to tokenizer.json (auto-detected if omitted)
         #[arg(long)]
         tokenizer: Option<String>,
+
+        /// Embed weights directly in the binary via include_bytes! (single-file deployment)
+        #[arg(long)]
+        embed_weights: bool,
     },
 
     /// Export model weights as a flat binary file for AOT binaries
@@ -204,7 +208,8 @@ fn main() -> Result<()> {
             run,
             prompt,
             tokenizer,
-        } => cmd_compile(&model, &target, &output, run, prompt.as_deref(), &tokenizer)?,
+            embed_weights,
+        } => cmd_compile(&model, &target, &output, run, prompt.as_deref(), &tokenizer, embed_weights)?,
 
         Commands::ExportWeights { model, output } => cmd_export_weights(&model, &output)?,
 
@@ -459,6 +464,7 @@ fn cmd_compile(
     run: bool,
     prompt: Option<&str>,
     tokenizer_opt: &Option<String>,
+    embed_weights: bool,
 ) -> Result<()> {
     println!("Loading model config from {model_path}...");
     let config = load_model_config(model_path)?;
@@ -473,6 +479,22 @@ fn cmd_compile(
         config.vocab_size,
     );
 
+    // If embedding weights, export them first so they're available for generate_project
+    let output_dir = Path::new(output_path);
+    fs::create_dir_all(output_dir).with_context(|| "failed to create output directory")?;
+
+    if embed_weights {
+        println!("Exporting weights for embedding...");
+        let weights_path = output_dir.join("weights.bin");
+        cmd_export_weights(model_path, &weights_path.to_string_lossy())?;
+
+        println!("Copying tokenizer for embedding...");
+        let tokenizer_src = resolve_tokenizer(tokenizer_opt, model_path)?;
+        let tokenizer_dst = output_dir.join("tokenizer.json");
+        fs::copy(&tokenizer_src, &tokenizer_dst)
+            .with_context(|| format!("failed to copy tokenizer from {tokenizer_src}"))?;
+    }
+
     println!("Building computation graph...");
     let graph =
         graph_builder::build_graph(&config).with_context(|| "failed to build computation graph")?;
@@ -486,14 +508,13 @@ fn cmd_compile(
     let optimized = forgellm_optimizer::optimize(&graph);
 
     println!("Generating {target} project...");
-    let output_dir = Path::new(output_path);
     let model_name = output_dir
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "model".to_string());
 
     match target {
-        "cpu" => forgellm_codegen_cpu::generate_project(&optimized, output_dir, &model_name)
+        "cpu" => forgellm_codegen_cpu::generate_project(&optimized, output_dir, &model_name, embed_weights)
             .map_err(|e| anyhow::anyhow!("project generation failed: {e}"))?,
         _ => bail!("unsupported target: {target} (supported: cpu)"),
     }
@@ -502,36 +523,52 @@ fn cmd_compile(
     println!("  src/model.rs  — kernels + forward function");
     println!("  src/main.rs   — weight loader + CLI");
     println!("  Cargo.toml    — build configuration");
+    if embed_weights {
+        println!("  weights.bin   — embedded via include_bytes!");
+        println!("  tokenizer.json — embedded via include_bytes!");
+    }
 
     if !run {
-        println!();
-        println!("Next steps:");
-        println!("  1. Export weights:  forge export-weights --model {model_path} --output {output_path}/weights.bin");
-        println!("  2. Build:           cd {output_path} && cargo build --release");
-        println!("  3. Run:             ./target/release/{model_name} weights.bin tokenizer.json \"Hello\"");
+        if embed_weights {
+            println!();
+            println!("Next steps:");
+            println!("  1. Build:  cd {output_path} && cargo build --release");
+            println!("  2. Run:    ./target/release/{model_name} \"Hello, world!\"");
+            println!("  (weights + tokenizer are baked into the binary)");
+        } else {
+            println!();
+            println!("Next steps:");
+            println!("  1. Export weights:  forge export-weights --model {model_path} --output {output_path}/weights.bin");
+            println!("  2. Build:           cd {output_path} && cargo build --release");
+            println!("  3. Run:             ./target/release/{model_name} weights.bin tokenizer.json \"Hello\"");
+        }
         return Ok(());
     }
 
-    // --run: export weights, copy tokenizer, build, and execute
+    // --run: build and execute
     println!();
     println!("=== --run: building and executing AOT binary ===");
     println!();
 
-    // Step 1: Export weights
-    let weights_path = output_dir.join("weights.bin");
-    let weights_path_str = weights_path.to_string_lossy().to_string();
-    println!("[1/4] Exporting weights...");
-    cmd_export_weights(model_path, &weights_path_str)?;
+    if !embed_weights {
+        // Export weights and copy tokenizer for non-embedded mode
+        let weights_path = output_dir.join("weights.bin");
+        let weights_path_str = weights_path.to_string_lossy().to_string();
+        println!("[1/4] Exporting weights...");
+        cmd_export_weights(model_path, &weights_path_str)?;
 
-    // Step 2: Copy tokenizer
-    println!("[2/4] Resolving tokenizer...");
-    let tokenizer_src = resolve_tokenizer(tokenizer_opt, model_path)?;
-    let tokenizer_dst = output_dir.join("tokenizer.json");
-    fs::copy(&tokenizer_src, &tokenizer_dst)
-        .with_context(|| format!("failed to copy tokenizer from {tokenizer_src}"))?;
-    println!("  Copied tokenizer to {}", tokenizer_dst.display());
+        println!("[2/4] Resolving tokenizer...");
+        let tokenizer_src = resolve_tokenizer(tokenizer_opt, model_path)?;
+        let tokenizer_dst = output_dir.join("tokenizer.json");
+        fs::copy(&tokenizer_src, &tokenizer_dst)
+            .with_context(|| format!("failed to copy tokenizer from {tokenizer_src}"))?;
+        println!("  Copied tokenizer to {}", tokenizer_dst.display());
+    } else {
+        println!("[1/4] Weights already exported for embedding.");
+        println!("[2/4] Tokenizer already copied for embedding.");
+    }
 
-    // Step 3: Build with cargo
+    // Build with cargo
     println!("[3/4] Building release binary (cargo build --release)...");
     let build_status = std::process::Command::new("cargo")
         .arg("build")
@@ -545,7 +582,7 @@ fn cmd_compile(
     }
     println!("  Build complete.");
 
-    // Step 4: Run the binary
+    // Run the binary
     let binary_path = output_dir.join("target").join("release").join(&model_name);
     if !binary_path.exists() {
         bail!(
@@ -555,13 +592,17 @@ fn cmd_compile(
     }
 
     let run_prompt = prompt.unwrap_or("Hello, world!");
-    println!("[4/4] Running: {} weights.bin tokenizer.json \"{}\"", model_name, run_prompt);
+    println!("[4/4] Running: {} \"{}\"", model_name, run_prompt);
     println!();
 
-    let run_status = std::process::Command::new(&binary_path)
-        .arg(weights_path_str)
-        .arg(tokenizer_dst.to_string_lossy().to_string())
-        .arg(run_prompt)
+    let mut cmd = std::process::Command::new(&binary_path);
+    if !embed_weights {
+        cmd.arg(output_dir.join("weights.bin").to_string_lossy().to_string());
+        cmd.arg(output_dir.join("tokenizer.json").to_string_lossy().to_string());
+    }
+    cmd.arg(run_prompt);
+
+    let run_status = cmd
         .status()
         .with_context(|| "failed to execute AOT binary")?;
 
