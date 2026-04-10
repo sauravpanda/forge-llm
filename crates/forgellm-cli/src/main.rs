@@ -39,7 +39,7 @@ enum Commands {
         #[arg(long)]
         model: String,
 
-        /// Target backend: cpu
+        /// Target backend: cpu, wasm
         #[arg(long, default_value = "cpu")]
         target: String,
 
@@ -548,20 +548,34 @@ fn cmd_compile(args: CompileArgs<'_>) -> Result<()> {
             embed_weights,
         )
         .map_err(|e| anyhow::anyhow!("project generation failed: {e}"))?,
-        _ => bail!("unsupported target: {target} (supported: cpu)"),
+        "wasm" => forgellm_codegen_wasm::generate_wasm_project(&optimized, output_dir, &model_name)
+            .map_err(|e| anyhow::anyhow!("WASM project generation failed: {e}"))?,
+        _ => bail!("unsupported target: {target} (supported: cpu, wasm)"),
     }
 
     println!("Generated project at {output_path}/");
-    println!("  src/model.rs  — kernels + forward function");
-    println!("  src/main.rs   — weight loader + CLI");
-    println!("  Cargo.toml    — build configuration");
-    if embed_weights {
-        println!("  weights.bin   — embedded via include_bytes!");
-        println!("  tokenizer.json — embedded via include_bytes!");
+    if target == "wasm" {
+        println!("  src/lib.rs    — SIMD128 kernels + WasmModel export");
+        println!("  pkg/model.js  — JS glue layer for browser integration");
+        println!("  Cargo.toml    — wasm32-unknown-unknown build configuration");
+    } else {
+        println!("  src/model.rs  — kernels + forward function");
+        println!("  src/main.rs   — weight loader + CLI");
+        println!("  Cargo.toml    — build configuration");
+        if embed_weights {
+            println!("  weights.bin   — embedded via include_bytes!");
+            println!("  tokenizer.json — embedded via include_bytes!");
+        }
     }
 
     if !run {
-        if embed_weights {
+        if target == "wasm" {
+            println!();
+            println!("Next steps:");
+            println!("  1. Install wasm-pack:  cargo install wasm-pack");
+            println!("  2. Build:              cd {output_path} && wasm-pack build --target web --release");
+            println!("  3. Output:             pkg/ directory with .wasm + JS bindings");
+        } else if embed_weights {
             println!();
             println!("Next steps:");
             println!("  1. Build:  cd {output_path} && cargo build --release");

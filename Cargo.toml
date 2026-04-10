@@ -49,3 +49,4 @@ memmap2 = "0.9"
 
 # Testing
 pretty_assertions = "1"
+tempfile = "3"
