@@ -9,6 +9,109 @@ use std::path::Path;
 
 use crate::gguf::{self, GGMLType, GGUFFile, GGUFTensorInfo};
 
+/// Raw weight data — either f32 (dequantized) or Q8_0 raw bytes.
+#[derive(Debug, Clone)]
+pub enum WeightData {
+    /// Fully dequantized f32 tensor.
+    F32(Vec<f32>),
+    /// Raw Q8_0 bytes: N_blocks * 34 bytes each block = [2 bytes f16 scale][32 bytes int8].
+    Q8_0Raw(Vec<u8>),
+}
+
+/// Model weights with mixed storage: Q8_0 kept as raw bytes, others as f32.
+#[derive(Debug, Clone)]
+pub struct ModelWeightsRaw {
+    pub tensors: HashMap<String, WeightData>,
+}
+
+impl ModelWeightsRaw {
+    /// Get an f32 tensor by name.
+    pub fn get_f32(&self, name: &str) -> Option<&[f32]> {
+        match self.tensors.get(name) {
+            Some(WeightData::F32(v)) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// Get a Q8_0 raw byte tensor by name.
+    pub fn get_q8_raw(&self, name: &str) -> Option<&[u8]> {
+        match self.tensors.get(name) {
+            Some(WeightData::Q8_0Raw(v)) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// Number of loaded tensors.
+    pub fn len(&self) -> usize {
+        self.tensors.len()
+    }
+
+    /// Whether no tensors are loaded.
+    pub fn is_empty(&self) -> bool {
+        self.tensors.is_empty()
+    }
+
+    /// Total memory usage in bytes.
+    pub fn memory_bytes(&self) -> usize {
+        self.tensors
+            .values()
+            .map(|v| match v {
+                WeightData::F32(f) => f.len() * 4,
+                WeightData::Q8_0Raw(b) => b.len(),
+            })
+            .sum()
+    }
+
+    /// Get a tensor by name regardless of type — for non-Q8_0 tensors only.
+    pub fn get(&self, name: &str) -> Option<&WeightData> {
+        self.tensors.get(name)
+    }
+}
+
+/// Load all tensors from a GGUF file with mixed storage:
+/// - Q8_0 tensors are kept as raw bytes (`WeightData::Q8_0Raw`)
+/// - All other tensor types are dequantized to f32 (`WeightData::F32`)
+pub fn load_from_file_mixed(
+    path: impl AsRef<std::path::Path>,
+) -> Result<(crate::gguf::GGUFFile, ModelWeightsRaw), WeightLoadError> {
+    let file = std::fs::File::open(path.as_ref())?;
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    let mut cursor = std::io::Cursor::new(&mmap[..]);
+
+    let gguf = crate::gguf::parse(&mut cursor)
+        .map_err(|e| WeightLoadError::Io(std::io::Error::other(e)))?;
+
+    let mut tensors = HashMap::with_capacity(gguf.tensors.len());
+    for tensor_info in &gguf.tensors {
+        let data_offset = gguf.tensor_data_offset + tensor_info.offset;
+        let data_size = tensor_info.data_size() as usize;
+        let numel = tensor_info.numel() as usize;
+
+        let start = data_offset as usize;
+        let end = start + data_size;
+        if end > mmap.len() {
+            return Err(WeightLoadError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("tensor {} extends past end of file", tensor_info.name),
+            )));
+        }
+
+        let raw = &mmap[start..end];
+        let hf_name = gguf_name_to_hf(&tensor_info.name);
+
+        let weight_data = if tensor_info.ggml_type == crate::gguf::GGMLType::Q8_0 {
+            WeightData::Q8_0Raw(raw.to_vec())
+        } else {
+            let f32_data = dequantize(raw, tensor_info.ggml_type, numel)?;
+            WeightData::F32(f32_data)
+        };
+
+        tensors.insert(hf_name, weight_data);
+    }
+
+    Ok((gguf, ModelWeightsRaw { tensors }))
+}
+
 /// Loaded model weights — all tensors dequantized to f32.
 #[derive(Debug, Clone)]
 pub struct ModelWeights {
@@ -780,5 +883,28 @@ mod tests {
         assert_eq!(weights.memory_bytes(), 1200);
         assert_eq!(weights.get("w1").unwrap().len(), 100);
         assert_eq!(weights.tensor("w2").len(), 200);
+    }
+
+    #[test]
+    fn model_weights_raw_accessors() {
+        let mut tensors = HashMap::new();
+        tensors.insert("norm.weight".to_string(), WeightData::F32(vec![1.0f32; 64]));
+        tensors.insert(
+            "q_proj.weight".to_string(),
+            WeightData::Q8_0Raw(vec![0u8; 68]),
+        ); // 2 blocks * 34 bytes
+        let raw = ModelWeightsRaw { tensors };
+
+        assert_eq!(raw.len(), 2);
+        assert!(!raw.is_empty());
+        assert!(raw.get_f32("norm.weight").is_some());
+        assert_eq!(raw.get_f32("norm.weight").unwrap().len(), 64);
+        assert!(raw.get_q8_raw("q_proj.weight").is_some());
+        assert_eq!(raw.get_q8_raw("q_proj.weight").unwrap().len(), 68);
+        // Cross-type accessors should return None
+        assert!(raw.get_f32("q_proj.weight").is_none());
+        assert!(raw.get_q8_raw("norm.weight").is_none());
+        // Memory bytes: 64*4 + 68 = 256 + 68 = 324
+        assert_eq!(raw.memory_bytes(), 64 * 4 + 68);
     }
 }

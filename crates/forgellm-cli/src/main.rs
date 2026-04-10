@@ -214,7 +214,16 @@ fn main() -> Result<()> {
             tokenizer,
             embed_weights,
             cross_target,
-        } => cmd_compile(&model, &target, &output, run, prompt.as_deref(), &tokenizer, embed_weights, cross_target.as_deref())?,
+        } => cmd_compile(
+            &model,
+            &target,
+            &output,
+            run,
+            prompt.as_deref(),
+            &tokenizer,
+            embed_weights,
+            cross_target.as_deref(),
+        )?,
 
         Commands::ExportWeights { model, output } => cmd_export_weights(&model, &output)?,
 
@@ -462,6 +471,7 @@ fn resolve_tokenizer(tokenizer: &Option<String>, model_path: &str) -> Result<Str
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_compile(
     model_path: &str,
     target: &str,
@@ -520,8 +530,13 @@ fn cmd_compile(
         .unwrap_or_else(|| "model".to_string());
 
     match target {
-        "cpu" => forgellm_codegen_cpu::generate_project(&optimized, output_dir, &model_name, embed_weights)
-            .map_err(|e| anyhow::anyhow!("project generation failed: {e}"))?,
+        "cpu" => forgellm_codegen_cpu::generate_project(
+            &optimized,
+            output_dir,
+            &model_name,
+            embed_weights,
+        )
+        .map_err(|e| anyhow::anyhow!("project generation failed: {e}"))?,
         _ => bail!("unsupported target: {target} (supported: cpu)"),
     }
 
@@ -575,31 +590,42 @@ fn cmd_compile(
     }
 
     // Build with cargo
-    let target_info = cross_target.map(|t| format!(" --target {t}")).unwrap_or_default();
+    let target_info = cross_target
+        .map(|t| format!(" --target {t}"))
+        .unwrap_or_default();
     println!("[3/4] Building release binary (cargo build --release{target_info})...");
     let mut build_cmd = std::process::Command::new("cargo");
-    build_cmd.arg("build").arg("--release").current_dir(output_dir);
+    build_cmd
+        .arg("build")
+        .arg("--release")
+        .current_dir(output_dir);
     if let Some(ct) = cross_target {
         build_cmd.arg("--target").arg(ct);
     }
-    let build_status = build_cmd.status().with_context(|| "failed to run cargo build")?;
+    let build_status = build_cmd
+        .status()
+        .with_context(|| "failed to run cargo build")?;
 
     if !build_status.success() {
-        bail!("cargo build --release failed with exit code: {}", build_status);
+        bail!(
+            "cargo build --release failed with exit code: {}",
+            build_status
+        );
     }
     println!("  Build complete.");
 
     // Run the binary
     let binary_path = if let Some(ct) = cross_target {
-        output_dir.join("target").join(ct).join("release").join(&model_name)
+        output_dir
+            .join("target")
+            .join(ct)
+            .join("release")
+            .join(&model_name)
     } else {
         output_dir.join("target").join("release").join(&model_name)
     };
     if !binary_path.exists() {
-        bail!(
-            "expected binary not found at {}",
-            binary_path.display()
-        );
+        bail!("expected binary not found at {}", binary_path.display());
     }
 
     let run_prompt = prompt.unwrap_or("Hello, world!");
@@ -609,7 +635,12 @@ fn cmd_compile(
     let mut cmd = std::process::Command::new(&binary_path);
     if !embed_weights {
         cmd.arg(output_dir.join("weights.bin").to_string_lossy().to_string());
-        cmd.arg(output_dir.join("tokenizer.json").to_string_lossy().to_string());
+        cmd.arg(
+            output_dir
+                .join("tokenizer.json")
+                .to_string_lossy()
+                .to_string(),
+        );
     }
     cmd.arg(run_prompt);
 
@@ -1530,103 +1561,197 @@ fn cmd_models(dir: &str) -> Result<()> {
 }
 
 fn cmd_export_weights(model_path: &str, output_path: &str) -> Result<()> {
+    use forgellm_frontend::ir::DType;
+    use forgellm_frontend::weight_loader::{load_from_file_mixed, WeightData};
+
     eprintln!("Loading model from {model_path}...");
     let config = load_model_config(model_path)?;
-    let (_gguf_file, weights) =
-        weight_loader::load_from_file(model_path).with_context(|| "failed to load weights")?;
 
-    eprintln!(
-        "Model: {} | {} layers | {} tensors | {:.1} MB",
-        config.architecture,
-        config.num_layers,
-        weights.len(),
-        weights.memory_bytes() as f64 / 1e6,
-    );
+    let is_q8 = config.dtype == DType::Q8_0;
 
-    // Write weights in a deterministic order matching the AOT binary's expected layout:
-    // embed_tokens, then per-layer weights, then final_norm, then lm_head
-    let mut output_data: Vec<u8> = Vec::with_capacity(weights.memory_bytes());
+    if is_q8 {
+        // Q8_0: keep projection weights as raw bytes, dequantize norm/embed to f32
+        let (_gguf_file, weights) =
+            load_from_file_mixed(model_path).with_context(|| "failed to load weights")?;
 
-    let write_tensor = |data: &mut Vec<u8>, name: &str, weights: &weight_loader::ModelWeights| {
-        let tensor = weights.get(name).unwrap_or_else(|| {
-            // For lm_head, fall back to embed_tokens (tied weights)
-            if name == "lm_head.weight" {
-                weights
-                    .get("model.embed_tokens.weight")
-                    .expect("neither lm_head nor embed_tokens found")
-            } else {
-                panic!("weight not found: {name}")
+        eprintln!(
+            "Model: {} | {} layers | {} tensors | {:.1} MB (Q8_0 raw)",
+            config.architecture,
+            config.num_layers,
+            weights.len(),
+            weights.memory_bytes() as f64 / 1e6,
+        );
+
+        let mut output_data: Vec<u8> = Vec::with_capacity(weights.memory_bytes());
+
+        // Write a tensor — for Q8_0 models: f32 tensors as f32 bytes, Q8_0 as raw bytes
+        let write_mixed = |data: &mut Vec<u8>, name: &str| {
+            match weights.get(name) {
+                Some(WeightData::F32(v)) => {
+                    for &val in v {
+                        data.extend_from_slice(&val.to_le_bytes());
+                    }
+                }
+                Some(WeightData::Q8_0Raw(b)) => {
+                    data.extend_from_slice(b);
+                }
+                None => {
+                    // lm_head fallback: use embed_tokens
+                    if name == "lm_head.weight" {
+                        match weights.get("model.embed_tokens.weight") {
+                            Some(WeightData::F32(v)) => {
+                                for &val in v {
+                                    data.extend_from_slice(&val.to_le_bytes());
+                                }
+                            }
+                            Some(WeightData::Q8_0Raw(b)) => {
+                                data.extend_from_slice(b);
+                            }
+                            None => panic!("neither lm_head nor embed_tokens found"),
+                        }
+                    } else {
+                        panic!("weight not found: {name}");
+                    }
+                }
             }
-        });
-        for &val in tensor {
-            data.extend_from_slice(&val.to_le_bytes());
+        };
+
+        write_mixed(&mut output_data, "model.embed_tokens.weight");
+
+        for layer_idx in 0..config.num_layers {
+            let prefix = format!("model.layers.{layer_idx}");
+            write_mixed(
+                &mut output_data,
+                &format!("{prefix}.input_layernorm.weight"),
+            );
+            write_mixed(
+                &mut output_data,
+                &format!("{prefix}.self_attn.q_proj.weight"),
+            );
+            write_mixed(
+                &mut output_data,
+                &format!("{prefix}.self_attn.k_proj.weight"),
+            );
+            write_mixed(
+                &mut output_data,
+                &format!("{prefix}.self_attn.v_proj.weight"),
+            );
+            write_mixed(
+                &mut output_data,
+                &format!("{prefix}.self_attn.o_proj.weight"),
+            );
+            write_mixed(
+                &mut output_data,
+                &format!("{prefix}.post_attention_layernorm.weight"),
+            );
+            write_mixed(&mut output_data, &format!("{prefix}.mlp.gate_proj.weight"));
+            write_mixed(&mut output_data, &format!("{prefix}.mlp.up_proj.weight"));
+            write_mixed(&mut output_data, &format!("{prefix}.mlp.down_proj.weight"));
         }
-    };
 
-    // Embedding
-    write_tensor(&mut output_data, "model.embed_tokens.weight", &weights);
+        write_mixed(&mut output_data, "model.norm.weight");
+        write_mixed(&mut output_data, "lm_head.weight");
 
-    // Per-layer weights
-    for layer_idx in 0..config.num_layers {
-        let prefix = format!("model.layers.{layer_idx}");
-        write_tensor(
-            &mut output_data,
-            &format!("{prefix}.input_layernorm.weight"),
-            &weights,
+        fs::write(output_path, &output_data)
+            .with_context(|| format!("failed to write {output_path}"))?;
+
+        eprintln!(
+            "Exported {:.1} MB to {output_path} (Q8_0 raw bytes)",
+            output_data.len() as f64 / 1e6,
         );
-        write_tensor(
-            &mut output_data,
-            &format!("{prefix}.self_attn.q_proj.weight"),
-            &weights,
+    } else {
+        // Non-Q8_0: dequantize everything to f32
+        let (_gguf_file, weights) =
+            weight_loader::load_from_file(model_path).with_context(|| "failed to load weights")?;
+
+        eprintln!(
+            "Model: {} | {} layers | {} tensors | {:.1} MB",
+            config.architecture,
+            config.num_layers,
+            weights.len(),
+            weights.memory_bytes() as f64 / 1e6,
         );
-        write_tensor(
-            &mut output_data,
-            &format!("{prefix}.self_attn.k_proj.weight"),
-            &weights,
-        );
-        write_tensor(
-            &mut output_data,
-            &format!("{prefix}.self_attn.v_proj.weight"),
-            &weights,
-        );
-        write_tensor(
-            &mut output_data,
-            &format!("{prefix}.self_attn.o_proj.weight"),
-            &weights,
-        );
-        write_tensor(
-            &mut output_data,
-            &format!("{prefix}.post_attention_layernorm.weight"),
-            &weights,
-        );
-        write_tensor(
-            &mut output_data,
-            &format!("{prefix}.mlp.gate_proj.weight"),
-            &weights,
-        );
-        write_tensor(
-            &mut output_data,
-            &format!("{prefix}.mlp.up_proj.weight"),
-            &weights,
-        );
-        write_tensor(
-            &mut output_data,
-            &format!("{prefix}.mlp.down_proj.weight"),
-            &weights,
+
+        let mut output_data: Vec<u8> = Vec::with_capacity(weights.memory_bytes());
+
+        let write_tensor =
+            |data: &mut Vec<u8>, name: &str, weights: &weight_loader::ModelWeights| {
+                let tensor = weights.get(name).unwrap_or_else(|| {
+                    if name == "lm_head.weight" {
+                        weights
+                            .get("model.embed_tokens.weight")
+                            .expect("neither lm_head nor embed_tokens found")
+                    } else {
+                        panic!("weight not found: {name}")
+                    }
+                });
+                for &val in tensor {
+                    data.extend_from_slice(&val.to_le_bytes());
+                }
+            };
+
+        write_tensor(&mut output_data, "model.embed_tokens.weight", &weights);
+
+        for layer_idx in 0..config.num_layers {
+            let prefix = format!("model.layers.{layer_idx}");
+            write_tensor(
+                &mut output_data,
+                &format!("{prefix}.input_layernorm.weight"),
+                &weights,
+            );
+            write_tensor(
+                &mut output_data,
+                &format!("{prefix}.self_attn.q_proj.weight"),
+                &weights,
+            );
+            write_tensor(
+                &mut output_data,
+                &format!("{prefix}.self_attn.k_proj.weight"),
+                &weights,
+            );
+            write_tensor(
+                &mut output_data,
+                &format!("{prefix}.self_attn.v_proj.weight"),
+                &weights,
+            );
+            write_tensor(
+                &mut output_data,
+                &format!("{prefix}.self_attn.o_proj.weight"),
+                &weights,
+            );
+            write_tensor(
+                &mut output_data,
+                &format!("{prefix}.post_attention_layernorm.weight"),
+                &weights,
+            );
+            write_tensor(
+                &mut output_data,
+                &format!("{prefix}.mlp.gate_proj.weight"),
+                &weights,
+            );
+            write_tensor(
+                &mut output_data,
+                &format!("{prefix}.mlp.up_proj.weight"),
+                &weights,
+            );
+            write_tensor(
+                &mut output_data,
+                &format!("{prefix}.mlp.down_proj.weight"),
+                &weights,
+            );
+        }
+
+        write_tensor(&mut output_data, "model.norm.weight", &weights);
+        write_tensor(&mut output_data, "lm_head.weight", &weights);
+
+        fs::write(output_path, &output_data)
+            .with_context(|| format!("failed to write {output_path}"))?;
+
+        eprintln!(
+            "Exported {:.1} MB to {output_path}",
+            output_data.len() as f64 / 1e6,
         );
     }
-
-    // Final norm + lm_head
-    write_tensor(&mut output_data, "model.norm.weight", &weights);
-    write_tensor(&mut output_data, "lm_head.weight", &weights);
-
-    fs::write(output_path, &output_data)
-        .with_context(|| format!("failed to write {output_path}"))?;
-
-    eprintln!(
-        "Exported {:.1} MB to {output_path}",
-        output_data.len() as f64 / 1e6,
-    );
 
     Ok(())
 }
