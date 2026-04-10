@@ -220,7 +220,19 @@ fn main() {{
         println!("  Heads:        {num_heads} (KV: {num_kv_heads})");
         println!("  Head dim:     {head_dim}");
         println!("  Intermediate: {inter}");
-        // Compute KV cache size without allocating: NUM_LAYERS * MAX_SEQ_LEN * kv_size * 4 bytes * 2 (k+v)
+        // Compute weight count (per layer + embeddings + final norm + lm_head)
+        let per_layer = model::HIDDEN_SIZE
+            + model::HIDDEN_SIZE * model::NUM_HEADS * model::HEAD_DIM
+            + 2 * model::HIDDEN_SIZE * model::NUM_KV_HEADS * model::HEAD_DIM
+            + model::HIDDEN_SIZE * model::NUM_HEADS * model::HEAD_DIM
+            + model::HIDDEN_SIZE
+            + 3 * model::HIDDEN_SIZE * model::INTERMEDIATE_SIZE;
+        let total_params = 2 * model::VOCAB_SIZE * model::HIDDEN_SIZE
+            + model::NUM_LAYERS * per_layer
+            + model::HIDDEN_SIZE;
+        println!("  Parameters:   {{:.1}}M", (total_params as f64) / 1e6);
+        println!("  Weights:      {{:.1}} MB (f32)", (total_params as f64 * 4.0) / 1e6);
+        // Compute KV cache size without allocating
         let kv_bytes = model::NUM_LAYERS * model::MAX_SEQ_LEN * model::NUM_KV_HEADS * model::HEAD_DIM * 4 * 2;
         println!("  KV cache:     {{:.1}} MB (max_seq_len={{}})", (kv_bytes as f64) / 1e6, model::MAX_SEQ_LEN);
         println!("  Compiled by:  ForgeLLM (https://forgellm.dev)");
