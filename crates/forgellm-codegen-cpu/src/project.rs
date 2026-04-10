@@ -118,22 +118,35 @@ fn apply_repeat_penalty(logits: &mut [f32], recent_tokens: &[u32], penalty: f32)
     }}
 }}
 
-fn sample(logits: &mut [f32], temperature: f32, top_k: usize, rng_state: &mut u64) -> u32 {{
+fn sample(logits: &mut [f32], temperature: f32, top_k: usize, top_p: f32, rng_state: &mut u64) -> u32 {{
     if temperature <= 0.0 {{ return argmax(logits); }}
     // Apply temperature
     for l in logits.iter_mut() {{ *l /= temperature; }}
-    // Top-k: zero out everything below the k-th largest
-    if top_k > 0 && top_k < logits.len() {{
-        let mut indices: Vec<usize> = (0..logits.len()).collect();
-        indices.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
-        let threshold = logits[indices[top_k - 1]];
-        for l in logits.iter_mut() {{ if *l < threshold {{ *l = f32::NEG_INFINITY; }} }}
-    }}
     // Softmax
     let max_val = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0f32;
     for l in logits.iter_mut() {{ *l = (*l - max_val).exp(); sum += *l; }}
     for l in logits.iter_mut() {{ *l /= sum; }}
+    // Sort indices by probability (descending)
+    let mut indices: Vec<usize> = (0..logits.len()).collect();
+    indices.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+    // Apply top-k
+    if top_k > 0 && top_k < logits.len() {{
+        for &idx in &indices[top_k..] {{ logits[idx] = 0.0; }}
+    }}
+    // Apply top-p (nucleus sampling)
+    if top_p > 0.0 && top_p < 1.0 {{
+        let mut cumsum = 0.0f32;
+        for &idx in &indices {{
+            cumsum += logits[idx];
+            if cumsum > top_p {{
+                logits[idx] = 0.0;
+            }}
+        }}
+    }}
+    // Renormalize
+    sum = logits.iter().copied().sum();
+    if sum > 0.0 {{ for l in logits.iter_mut() {{ *l /= sum; }} }}
     // Sample from distribution
     *rng_state ^= *rng_state << 13;
     *rng_state ^= *rng_state >> 7;
@@ -179,6 +192,7 @@ fn main() {{
     let tokenizer_path = &args[2];
     let temperature = parse_f32_arg(&args, "--temp", 0.0);
     let top_k = parse_usize_arg(&args, "--top-k", 0);
+    let top_p = parse_f32_arg(&args, "--top-p", 0.9);
     let max_tokens = parse_usize_arg(&args, "--max-tokens", 128);
     let repeat_penalty = parse_f32_arg(&args, "--repeat-penalty", 1.1);
     let prompt = args.iter().skip(3).filter(|a| !a.starts_with("--")).take_while(|a| !a.starts_with("--")).cloned().collect::<Vec<_>>().join(" ");
@@ -218,7 +232,7 @@ fn main() {{
     let t0 = std::time::Instant::now();
     let mut rng_state: u64 = 0xdeadbeef12345678;
     let mut next = 0u32;
-    for &tok in tokens {{ let mut l = model::forward(tok, &weights, &mut cache); next = sample(&mut l, temperature, top_k, &mut rng_state); }}
+    for &tok in tokens {{ let mut l = model::forward(tok, &weights, &mut cache); next = sample(&mut l, temperature, top_k, top_p, &mut rng_state); }}
     eprintln!("Prefill: {{:.1}} tok/s", tokens.len() as f64 / t0.elapsed().as_secs_f64());
 
     // Generate
@@ -241,7 +255,7 @@ fn main() {{
         recent_tokens.push(next);
         let mut l = model::forward(next, &weights, &mut cache);
         apply_repeat_penalty(&mut l, &recent_tokens, repeat_penalty);
-        next = sample(&mut l, temperature, top_k, &mut rng_state);
+        next = sample(&mut l, temperature, top_k, top_p, &mut rng_state);
         gen_count += 1;
     }}
     println!();
@@ -343,6 +357,7 @@ fn main() {{
     }}
     let temperature = parse_f32_arg(&args, "--temp", 0.0);
     let top_k = parse_usize_arg(&args, "--top-k", 0);
+    let top_p = parse_f32_arg(&args, "--top-p", 0.9);
     let max_tokens = parse_usize_arg(&args, "--max-tokens", 128);
     let repeat_penalty = parse_f32_arg(&args, "--repeat-penalty", 1.1);
     let prompt = args.iter().skip(1).filter(|a| !a.starts_with("--")).take_while(|a| !a.starts_with("--")).cloned().collect::<Vec<_>>().join(" ");
@@ -384,7 +399,7 @@ fn main() {{
     let t0 = std::time::Instant::now();
     let mut rng_state: u64 = 0xdeadbeef12345678;
     let mut next = 0u32;
-    for &tok in tokens {{ let mut l = model::forward(tok, &weights, &mut cache); next = sample(&mut l, temperature, top_k, &mut rng_state); }}
+    for &tok in tokens {{ let mut l = model::forward(tok, &weights, &mut cache); next = sample(&mut l, temperature, top_k, top_p, &mut rng_state); }}
     eprintln!("Prefill: {{:.1}} tok/s", tokens.len() as f64 / t0.elapsed().as_secs_f64());
 
     // Generate
@@ -407,7 +422,7 @@ fn main() {{
         recent_tokens.push(next);
         let mut l = model::forward(next, &weights, &mut cache);
         apply_repeat_penalty(&mut l, &recent_tokens, repeat_penalty);
-        next = sample(&mut l, temperature, top_k, &mut rng_state);
+        next = sample(&mut l, temperature, top_k, top_p, &mut rng_state);
         gen_count += 1;
     }}
     println!();
