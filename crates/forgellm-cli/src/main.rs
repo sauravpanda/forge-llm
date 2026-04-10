@@ -62,6 +62,10 @@ enum Commands {
         /// Embed weights directly in the binary via include_bytes! (single-file deployment)
         #[arg(long)]
         embed_weights: bool,
+
+        /// Rust target triple for cross-compilation (e.g., x86_64-unknown-linux-gnu)
+        #[arg(long)]
+        cross_target: Option<String>,
     },
 
     /// Export model weights as a flat binary file for AOT binaries
@@ -209,7 +213,8 @@ fn main() -> Result<()> {
             prompt,
             tokenizer,
             embed_weights,
-        } => cmd_compile(&model, &target, &output, run, prompt.as_deref(), &tokenizer, embed_weights)?,
+            cross_target,
+        } => cmd_compile(&model, &target, &output, run, prompt.as_deref(), &tokenizer, embed_weights, cross_target.as_deref())?,
 
         Commands::ExportWeights { model, output } => cmd_export_weights(&model, &output)?,
 
@@ -465,6 +470,7 @@ fn cmd_compile(
     prompt: Option<&str>,
     tokenizer_opt: &Option<String>,
     embed_weights: bool,
+    cross_target: Option<&str>,
 ) -> Result<()> {
     println!("Loading model config from {model_path}...");
     let config = load_model_config(model_path)?;
@@ -569,13 +575,14 @@ fn cmd_compile(
     }
 
     // Build with cargo
-    println!("[3/4] Building release binary (cargo build --release)...");
-    let build_status = std::process::Command::new("cargo")
-        .arg("build")
-        .arg("--release")
-        .current_dir(output_dir)
-        .status()
-        .with_context(|| "failed to run cargo build")?;
+    let target_info = cross_target.map(|t| format!(" --target {t}")).unwrap_or_default();
+    println!("[3/4] Building release binary (cargo build --release{target_info})...");
+    let mut build_cmd = std::process::Command::new("cargo");
+    build_cmd.arg("build").arg("--release").current_dir(output_dir);
+    if let Some(ct) = cross_target {
+        build_cmd.arg("--target").arg(ct);
+    }
+    let build_status = build_cmd.status().with_context(|| "failed to run cargo build")?;
 
     if !build_status.success() {
         bail!("cargo build --release failed with exit code: {}", build_status);
@@ -583,7 +590,11 @@ fn cmd_compile(
     println!("  Build complete.");
 
     // Run the binary
-    let binary_path = output_dir.join("target").join("release").join(&model_name);
+    let binary_path = if let Some(ct) = cross_target {
+        output_dir.join("target").join(ct).join("release").join(&model_name)
+    } else {
+        output_dir.join("target").join("release").join(&model_name)
+    };
     if !binary_path.exists() {
         bail!(
             "expected binary not found at {}",
