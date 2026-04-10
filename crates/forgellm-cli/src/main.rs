@@ -195,6 +195,37 @@ enum Commands {
         #[arg(long, default_value = "8080")]
         port: u16,
     },
+
+    /// Compile draft + target models and generate a speculative decoding runner
+    Speculative {
+        /// Path to the draft GGUF model file (small, fast model)
+        #[arg(long)]
+        draft: String,
+
+        /// Path to the target GGUF model file (large, accurate model)
+        #[arg(long)]
+        target_model: String,
+
+        /// Output directory for the generated projects
+        #[arg(long)]
+        output: String,
+
+        /// Path to tokenizer.json (shared by both models)
+        #[arg(long)]
+        tokenizer: Option<String>,
+
+        /// Number of tokens the draft model generates per speculative step
+        #[arg(long, default_value_t = 4)]
+        draft_steps: usize,
+
+        /// Build and run the speculative runner immediately after compilation
+        #[arg(long)]
+        run: bool,
+
+        /// Prompt to use when --run is specified
+        #[arg(long)]
+        prompt: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -300,6 +331,24 @@ fn main() -> Result<()> {
             let tok = resolve_tokenizer(&tokenizer, &model)?;
             cmd_serve(&model, &tok, port)?
         }
+
+        Commands::Speculative {
+            draft,
+            target_model,
+            output,
+            tokenizer,
+            draft_steps,
+            run,
+            prompt,
+        } => cmd_speculative(SpeculativeArgs {
+            draft_path: &draft,
+            target_path: &target_model,
+            output_path: &output,
+            tokenizer_opt: &tokenizer,
+            draft_steps,
+            run,
+            prompt: prompt.as_deref(),
+        })?,
     }
 
     Ok(())
@@ -675,6 +724,159 @@ fn cmd_compile(args: CompileArgs<'_>) -> Result<()> {
 
     if !run_status.success() {
         bail!("AOT binary exited with code: {}", run_status);
+    }
+
+    Ok(())
+}
+
+struct SpeculativeArgs<'a> {
+    draft_path: &'a str,
+    target_path: &'a str,
+    output_path: &'a str,
+    tokenizer_opt: &'a Option<String>,
+    draft_steps: usize,
+    run: bool,
+    prompt: Option<&'a str>,
+}
+
+fn cmd_speculative(args: SpeculativeArgs<'_>) -> Result<()> {
+    let SpeculativeArgs {
+        draft_path,
+        target_path,
+        output_path,
+        tokenizer_opt,
+        draft_steps,
+        run,
+        prompt,
+    } = args;
+
+    let output_dir = Path::new(output_path);
+    fs::create_dir_all(output_dir).with_context(|| "failed to create output directory")?;
+
+    // --- Compile draft model as lib ---
+    println!("[1/4] Loading draft model config from {draft_path}...");
+    let draft_config = load_model_config(draft_path)?;
+    println!(
+        "  Draft: {} | {} layers | hidden={}",
+        draft_config.architecture, draft_config.num_layers, draft_config.hidden_size,
+    );
+
+    let draft_graph = forgellm_frontend::graph_builder::build_graph(&draft_config)
+        .with_context(|| "failed to build draft computation graph")?;
+    let draft_optimized = forgellm_optimizer::optimize(&draft_graph);
+
+    let draft_dir = output_dir.join("draft");
+    forgellm_codegen_cpu::generate_project_as_lib(&draft_optimized, &draft_dir, "draft")
+        .map_err(|e| anyhow::anyhow!("draft lib generation failed: {e}"))?;
+    println!("  Draft library generated at {}/", draft_dir.display());
+
+    // --- Compile target model as lib ---
+    println!("[2/4] Loading target model config from {target_path}...");
+    let target_config = load_model_config(target_path)?;
+    println!(
+        "  Target: {} | {} layers | hidden={}",
+        target_config.architecture, target_config.num_layers, target_config.hidden_size,
+    );
+
+    let target_graph = forgellm_frontend::graph_builder::build_graph(&target_config)
+        .with_context(|| "failed to build target computation graph")?;
+    let target_optimized = forgellm_optimizer::optimize(&target_graph);
+
+    let target_dir = output_dir.join("target");
+    forgellm_codegen_cpu::generate_project_as_lib(&target_optimized, &target_dir, "target")
+        .map_err(|e| anyhow::anyhow!("target lib generation failed: {e}"))?;
+    println!("  Target library generated at {}/", target_dir.display());
+
+    // Derive a model name from the output directory
+    let model_name = output_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "model".to_string());
+
+    // --- Generate speculative runner ---
+    println!("[3/4] Generating speculative runner (draft_steps={draft_steps})...");
+    let runner_cfg = forgellm_codegen_cpu::SpeculativeRunnerConfig {
+        model_name: &model_name,
+        draft_steps,
+    };
+    forgellm_codegen_cpu::generate_speculative_runner(&runner_cfg, output_dir)
+        .map_err(|e| anyhow::anyhow!("speculative runner generation failed: {e}"))?;
+    println!("  Runner generated at {}/runner/", output_dir.display());
+
+    println!("[4/4] Generated speculative decoding project at {output_path}/");
+    println!("  draft/   — AOT draft model library");
+    println!("  target/  — AOT target model library");
+    println!("  runner/  — speculative decoding runner binary");
+
+    if !run {
+        println!();
+        println!("Next steps:");
+        println!("  1. Export draft weights:   forge export-weights --model {draft_path} --output {output_path}/draft/weights.bin");
+        println!("  2. Export target weights:  forge export-weights --model {target_path} --output {output_path}/target/weights.bin");
+
+        // Resolve tokenizer path for the hint
+        let tok_hint = resolve_tokenizer(tokenizer_opt, draft_path)
+            .unwrap_or_else(|_| "path/to/tokenizer.json".to_string());
+        println!("  3. Build runner:           cd {output_path}/runner && cargo build --release");
+        println!(
+            "  4. Run:                    {output_path}/runner/target/release/{model_name}-speculative \\"
+        );
+        println!("                               {output_path}/draft/weights.bin \\");
+        println!("                               {output_path}/target/weights.bin \\");
+        println!("                               {tok_hint} \"Hello, world!\"");
+        return Ok(());
+    }
+
+    // --run: export weights, build, and execute
+    println!();
+    println!("=== --run: exporting weights, building, and executing ===");
+
+    let draft_weights = output_dir.join("draft").join("weights.bin");
+    println!("  Exporting draft weights...");
+    cmd_export_weights(draft_path, &draft_weights.to_string_lossy())?;
+
+    let target_weights = output_dir.join("target").join("weights.bin");
+    println!("  Exporting target weights...");
+    cmd_export_weights(target_path, &target_weights.to_string_lossy())?;
+
+    let tokenizer_src = resolve_tokenizer(tokenizer_opt, draft_path)?;
+    let runner_dir = output_dir.join("runner");
+
+    println!("  Building runner (cargo build --release)...");
+    let build_status = std::process::Command::new("cargo")
+        .args(["build", "--release"])
+        .current_dir(&runner_dir)
+        .status()
+        .with_context(|| "failed to run cargo build for speculative runner")?;
+
+    if !build_status.success() {
+        bail!("cargo build --release failed for speculative runner");
+    }
+
+    let binary_name = format!("{model_name}-speculative");
+    let binary_path = runner_dir.join("target").join("release").join(&binary_name);
+
+    if !binary_path.exists() {
+        bail!(
+            "expected runner binary not found at {}",
+            binary_path.display()
+        );
+    }
+
+    let run_prompt = prompt.unwrap_or("Hello, world!");
+    println!("  Running: {binary_name} \"{run_prompt}\"");
+    println!();
+
+    let run_status = std::process::Command::new(&binary_path)
+        .arg(draft_weights.to_string_lossy().to_string())
+        .arg(target_weights.to_string_lossy().to_string())
+        .arg(&tokenizer_src)
+        .arg(run_prompt)
+        .status()
+        .with_context(|| "failed to execute speculative runner")?;
+
+    if !run_status.success() {
+        bail!("speculative runner exited with code: {run_status}");
     }
 
     Ok(())

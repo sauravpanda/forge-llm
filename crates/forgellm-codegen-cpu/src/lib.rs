@@ -7,6 +7,8 @@
 
 mod emit;
 pub mod project;
+pub mod speculative;
 
 pub use emit::{generate, CodegenError};
-pub use project::{generate_project, ProjectError};
+pub use project::{generate_project, generate_project_as_lib, ProjectError};
+pub use speculative::{generate_speculative_runner, SpeculativeError, SpeculativeRunnerConfig};
