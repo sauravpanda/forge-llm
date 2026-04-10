@@ -634,6 +634,27 @@ mod tests {
         assert!(main.contains("--max-tokens"));
         assert!(main.contains("--interactive"));
         assert!(main.contains("--version"));
+        assert!(main.contains("--quiet"));
+        assert!(main.contains("--save-cache"));
+        assert!(main.contains("Load time:"));
+
+        // Verify Cargo.toml has all profile settings
+        assert!(cargo.contains("lto = \"fat\""));
+        assert!(cargo.contains("strip = true"));
+        assert!(cargo.contains("panic = \"abort\""));
+        assert!(cargo.contains("codegen-units = 1"));
+
+        // Model.rs should have key constants and functions
+        let model_rs = fs::read_to_string(dir.join("src/model.rs")).unwrap();
+        assert!(model_rs.contains("pub const HIDDEN_SIZE"));
+        assert!(model_rs.contains("pub const NUM_LAYERS"));
+        assert!(model_rs.contains("pub const MAX_SEQ_LEN"));
+        assert!(model_rs.contains("pub fn forward("));
+        assert!(model_rs.contains("pub struct Weights"));
+        assert!(model_rs.contains("pub struct KVCache"));
+        assert!(model_rs.contains("pub fn reset"));
+        assert!(model_rs.contains("pub fn memory_bytes"));
+        assert!(model_rs.contains("impl Default for KVCache"));
 
         let _ = fs::remove_dir_all(&dir);
     }
