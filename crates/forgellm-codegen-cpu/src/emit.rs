@@ -1029,4 +1029,72 @@ mod tests {
         // Attention scores on stack
         assert!(code.contains("[0.0f32; MAX_SEQ_LEN]"));
     }
+
+    #[test]
+    fn generated_code_has_4_accumulator_dot_f32() {
+        let config = tiny_config();
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let code = generate(&graph).unwrap();
+
+        // dot_f32 should use 4 accumulators (s0..s3)
+        assert!(code.contains("let mut s0 = vdupq_n_f32(0.0);"));
+        assert!(code.contains("let mut s1 = vdupq_n_f32(0.0);"));
+        assert!(code.contains("let mut s2 = vdupq_n_f32(0.0);"));
+        assert!(code.contains("let mut s3 = vdupq_n_f32(0.0);"));
+        // 16-element unrolled loop
+        assert!(code.contains("len / 16"));
+    }
+
+    #[test]
+    fn parallel_path_uses_chunks_with_ilp() {
+        // Use a config with N >= 4096 to trigger parallel path
+        let config = ModelConfig {
+            architecture: Architecture::Llama,
+            hidden_size: 896,
+            intermediate_size: 4864, // > 4096 threshold
+            num_layers: 24,
+            num_attention_heads: 14,
+            num_kv_heads: 2,
+            head_dim: 64,
+            vocab_size: 151936,
+            max_seq_len: 2048,
+            rms_norm_eps: 1e-6,
+            rope_theta: 1e6,
+            dtype: DType::F16,
+        };
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let code = generate(&graph).unwrap();
+
+        // Should use par_chunks_mut(256) for parallel matmul
+        assert!(code.contains("par_chunks_mut(256)"));
+        // Should have 4-way row ILP within parallel chunks
+        assert!(code.contains("let chunks4 = len / 4;"));
+        // Specialized matmul for the intermediate size
+        assert!(code.contains("matmul_vec_896x4864("));
+    }
+
+    #[test]
+    fn generated_code_has_4_way_row_unrolling() {
+        let config = tiny_config();
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let code = generate(&graph).unwrap();
+
+        // Sequential matmul should process 4 rows at a time
+        assert!(code.contains("Process 4 output rows at a time"));
+        assert!(code.contains("output[j0]"));
+        assert!(code.contains("output[j0+1]"));
+        assert!(code.contains("output[j0+2]"));
+        assert!(code.contains("output[j0+3]"));
+    }
+
+    #[test]
+    fn generated_code_has_release_profile_optimizations() {
+        // Verified at the project.rs level — emit.rs only generates model.rs
+        // This test verifies the model file has the dead_code allow
+        let config = tiny_config();
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let code = generate(&graph).unwrap();
+
+        assert!(code.contains("#![allow(dead_code, unused_imports, unused_assignments)]"));
+    }
 }
