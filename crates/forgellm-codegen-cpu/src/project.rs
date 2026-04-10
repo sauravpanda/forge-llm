@@ -201,8 +201,16 @@ fn main() {{
     // Generate
     print!("{{}}", prompt);
     let t1 = std::time::Instant::now();
+    // Detect EOS tokens from tokenizer
+    let eos_tokens: Vec<u32> = [
+        tokenizer.token_to_id("</s>"),
+        tokenizer.token_to_id("<|endoftext|>"),
+        tokenizer.token_to_id("<|im_end|>"),
+        tokenizer.token_to_id("<|eot_id|>"),
+    ].iter().filter_map(|t| *t).collect();
     let mut gen_count = 0usize;
     for _ in 0..max_tokens {{
+        if eos_tokens.contains(&next) {{ break; }}
         let text = tokenizer.decode(&[next], true).unwrap_or_default();
         print!("{{}}", text);
         std::io::stdout().flush().ok();
@@ -333,8 +341,16 @@ fn main() {{
     // Generate
     print!("{{}}", prompt);
     let t1 = std::time::Instant::now();
+    // Detect EOS tokens from tokenizer
+    let eos_tokens: Vec<u32> = [
+        tokenizer.token_to_id("</s>"),
+        tokenizer.token_to_id("<|endoftext|>"),
+        tokenizer.token_to_id("<|im_end|>"),
+        tokenizer.token_to_id("<|eot_id|>"),
+    ].iter().filter_map(|t| *t).collect();
     let mut gen_count = 0usize;
     for _ in 0..max_tokens {{
+        if eos_tokens.contains(&next) {{ break; }}
         let text = tokenizer.decode(&[next], true).unwrap_or_default();
         print!("{{}}", text);
         std::io::stdout().flush().ok();
