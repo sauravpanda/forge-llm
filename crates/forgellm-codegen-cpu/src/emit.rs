@@ -98,225 +98,134 @@ fn emit_header(code: &mut String, config: &ModelConfig) -> Result<(), CodegenErr
 }
 
 fn emit_kernel_functions(code: &mut String) -> Result<(), CodegenError> {
-    // RMSNorm kernel
-    writeln!(
-        code,
-        "/// RMS normalization: output = (x / rms(x)) * weight"
-    )?;
-    writeln!(code, "#[inline]")?;
-    writeln!(
-        code,
-        "pub fn rms_norm(output: &mut [f32], input: &[f32], weight: &[f32], eps: f32) {{"
-    )?;
-    writeln!(code, "    let n = input.len();")?;
-    writeln!(code, "    let mut sum_sq: f32 = 0.0;")?;
-    writeln!(code, "    for i in 0..n {{")?;
-    writeln!(code, "        sum_sq += input[i] * input[i];")?;
-    writeln!(code, "    }}")?;
-    writeln!(code, "    let rms = (sum_sq / n as f32 + eps).sqrt();")?;
-    writeln!(code, "    let inv_rms = 1.0 / rms;")?;
-    writeln!(code, "    for i in 0..n {{")?;
-    writeln!(code, "        output[i] = input[i] * inv_rms * weight[i];")?;
-    writeln!(code, "    }}")?;
-    writeln!(code, "}}")?;
-    writeln!(code)?;
+    // Emit all kernels as a template string — includes NEON SIMD with scalar fallback
+    code.push_str(
+        r#"
+// --- NEON SIMD dot product ---
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn dot_f32(a: &[f32], b: &[f32], len: usize) -> f32 {
+    use std::arch::aarch64::*;
+    unsafe {
+        let mut s0 = vdupq_n_f32(0.0);
+        let mut s1 = vdupq_n_f32(0.0);
+        let chunks = len / 8;
+        for i in 0..chunks {
+            let base = i * 8;
+            s0 = vfmaq_f32(s0, vld1q_f32(a.as_ptr().add(base)), vld1q_f32(b.as_ptr().add(base)));
+            s1 = vfmaq_f32(s1, vld1q_f32(a.as_ptr().add(base+4)), vld1q_f32(b.as_ptr().add(base+4)));
+        }
+        let mut r = vaddvq_f32(vaddq_f32(s0, s1));
+        for i in (chunks*8)..len { r += *a.get_unchecked(i) * *b.get_unchecked(i); }
+        r
+    }
+}
 
-    // MatMul kernel: output[m][n] = input[m][k] * weight[n][k]^T
-    writeln!(
-        code,
-        "/// Matrix multiply: output[m,n] = input[m,k] * weight^T[k,n]"
-    )?;
-    writeln!(
-        code,
-        "/// Weight is stored as [n, k] (row-major), so weight[j] is row j."
-    )?;
-    writeln!(code, "#[inline]")?;
-    writeln!(code, "pub fn matmul(output: &mut [f32], input: &[f32], weight: &[f32], m: usize, k: usize, n: usize) {{")?;
-    writeln!(code, "    for i in 0..m {{")?;
-    writeln!(code, "        for j in 0..n {{")?;
-    writeln!(code, "            let mut sum: f32 = 0.0;")?;
-    writeln!(code, "            for l in 0..k {{")?;
-    writeln!(
-        code,
-        "                sum += input[i * k + l] * weight[j * k + l];"
-    )?;
-    writeln!(code, "            }}")?;
-    writeln!(code, "            output[i * n + j] = sum;")?;
-    writeln!(code, "        }}")?;
-    writeln!(code, "    }}")?;
-    writeln!(code, "}}")?;
-    writeln!(code)?;
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+fn dot_f32(a: &[f32], b: &[f32], len: usize) -> f32 {
+    let mut sum = 0.0f32;
+    for i in 0..len { sum += a[i] * b[i]; }
+    sum
+}
 
-    // SiLU activation
-    writeln!(code, "/// SiLU activation: x * sigmoid(x)")?;
-    writeln!(code, "#[inline]")?;
-    writeln!(code, "pub fn silu(output: &mut [f32], input: &[f32]) {{")?;
-    writeln!(code, "    for i in 0..input.len() {{")?;
-    writeln!(code, "        let x = input[i];")?;
-    writeln!(code, "        output[i] = x / (1.0 + (-x).exp());")?;
-    writeln!(code, "    }}")?;
-    writeln!(code, "}}")?;
-    writeln!(code)?;
+/// RMS normalization with NEON dot product
+#[inline]
+pub fn rms_norm(output: &mut [f32], input: &[f32], weight: &[f32], eps: f32) {
+    let n = input.len();
+    let sum_sq = dot_f32(input, input, n);
+    let inv_rms = 1.0 / (sum_sq / n as f32 + eps).sqrt();
+    for i in 0..n { output[i] = input[i] * inv_rms * weight[i]; }
+}
 
-    // Elementwise multiply
-    writeln!(code, "/// Elementwise multiply: output = a * b")?;
-    writeln!(code, "#[inline]")?;
-    writeln!(
-        code,
-        "pub fn elementwise_mul(output: &mut [f32], a: &[f32], b: &[f32]) {{"
-    )?;
-    writeln!(code, "    for i in 0..a.len() {{")?;
-    writeln!(code, "        output[i] = a[i] * b[i];")?;
-    writeln!(code, "    }}")?;
-    writeln!(code, "}}")?;
-    writeln!(code)?;
+/// Matrix multiply with NEON dot product per output element
+#[inline]
+pub fn matmul(output: &mut [f32], input: &[f32], weight: &[f32], m: usize, k: usize, n: usize) {
+    for i in 0..m {
+        let row = &input[i*k..(i+1)*k];
+        for j in 0..n {
+            output[i*n+j] = dot_f32(row, &weight[j*k..(j+1)*k], k);
+        }
+    }
+}
 
-    // Elementwise add (residual)
-    writeln!(
-        code,
-        "/// Elementwise add (residual connection): output = a + b"
-    )?;
-    writeln!(code, "#[inline]")?;
-    writeln!(
-        code,
-        "pub fn elementwise_add(output: &mut [f32], a: &[f32], b: &[f32]) {{"
-    )?;
-    writeln!(code, "    for i in 0..a.len() {{")?;
-    writeln!(code, "        output[i] = a[i] + b[i];")?;
-    writeln!(code, "    }}")?;
-    writeln!(code, "}}")?;
-    writeln!(code)?;
+"#,
+    );
 
-    // Softmax
-    writeln!(code, "/// Softmax over a slice")?;
-    writeln!(code, "#[inline]")?;
-    writeln!(code, "pub fn softmax(values: &mut [f32]) {{")?;
-    writeln!(
-        code,
-        "    let max_val = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);"
-    )?;
-    writeln!(code, "    let mut sum: f32 = 0.0;")?;
-    writeln!(code, "    for v in values.iter_mut() {{")?;
-    writeln!(code, "        *v = (*v - max_val).exp();")?;
-    writeln!(code, "        sum += *v;")?;
-    writeln!(code, "    }}")?;
-    writeln!(code, "    for v in values.iter_mut() {{")?;
-    writeln!(code, "        *v /= sum;")?;
-    writeln!(code, "    }}")?;
-    writeln!(code, "}}")?;
-    writeln!(code)?;
+    // Remaining kernels as template string
+    code.push_str(
+        r#"#[inline]
+pub fn silu(output: &mut [f32], input: &[f32]) {
+    for (o, &x) in output.iter_mut().zip(input.iter()) { *o = x / (1.0 + (-x).exp()); }
+}
 
-    // RoPE
-    writeln!(code, "/// Apply Rotary Position Embedding to Q or K")?;
-    writeln!(code, "#[inline]")?;
-    writeln!(code, "pub fn rope(data: &mut [f32], pos: usize, head_dim: usize, num_heads: usize, theta: f32) {{")?;
-    writeln!(code, "    for h in 0..num_heads {{")?;
-    writeln!(code, "        let head_offset = h * head_dim;")?;
-    writeln!(code, "        for i in (0..head_dim).step_by(2) {{")?;
-    writeln!(
-        code,
-        "            let freq = 1.0 / theta.powf(i as f32 / head_dim as f32);"
-    )?;
-    writeln!(code, "            let angle = pos as f32 * freq;")?;
-    writeln!(code, "            let cos_val = angle.cos();")?;
-    writeln!(code, "            let sin_val = angle.sin();")?;
-    writeln!(code, "            let x0 = data[head_offset + i];")?;
-    writeln!(code, "            let x1 = data[head_offset + i + 1];")?;
-    writeln!(
-        code,
-        "            data[head_offset + i] = x0 * cos_val - x1 * sin_val;"
-    )?;
-    writeln!(
-        code,
-        "            data[head_offset + i + 1] = x0 * sin_val + x1 * cos_val;"
-    )?;
-    writeln!(code, "        }}")?;
-    writeln!(code, "    }}")?;
-    writeln!(code, "}}")?;
-    writeln!(code)?;
+#[inline]
+pub fn elementwise_mul(output: &mut [f32], a: &[f32], b: &[f32]) {
+    for i in 0..a.len() { output[i] = a[i] * b[i]; }
+}
 
-    // Attention
-    writeln!(
-        code,
-        "/// Single-token grouped-query attention (for generation)"
-    )?;
-    writeln!(code, "#[inline]")?;
-    writeln!(code, "pub fn attention(")?;
-    writeln!(code, "    output: &mut [f32],")?;
-    writeln!(code, "    q: &[f32],        // [num_heads * head_dim]")?;
-    writeln!(
-        code,
-        "    k_cache: &[f32],   // [seq_len, num_kv_heads * head_dim]"
-    )?;
-    writeln!(
-        code,
-        "    v_cache: &[f32],   // [seq_len, num_kv_heads * head_dim]"
-    )?;
-    writeln!(code, "    seq_len: usize,")?;
-    writeln!(code, "    num_heads: usize,")?;
-    writeln!(code, "    num_kv_heads: usize,")?;
-    writeln!(code, "    head_dim: usize,")?;
-    writeln!(code, ") {{")?;
-    writeln!(code, "    let kv_group_size = num_heads / num_kv_heads;")?;
-    writeln!(code, "    let scale = 1.0 / (head_dim as f32).sqrt();")?;
-    writeln!(code)?;
-    writeln!(code, "    for h in 0..num_heads {{")?;
-    writeln!(code, "        let kv_h = h / kv_group_size;")?;
-    writeln!(code, "        let q_offset = h * head_dim;")?;
-    writeln!(code)?;
-    writeln!(code, "        // Compute attention scores")?;
-    writeln!(code, "        let mut scores = vec![0.0f32; seq_len];")?;
-    writeln!(code, "        for t in 0..seq_len {{")?;
-    writeln!(
-        code,
-        "            let k_offset = t * num_kv_heads * head_dim + kv_h * head_dim;"
-    )?;
-    writeln!(code, "            let mut dot: f32 = 0.0;")?;
-    writeln!(code, "            for d in 0..head_dim {{")?;
-    writeln!(
-        code,
-        "                dot += q[q_offset + d] * k_cache[k_offset + d];"
-    )?;
-    writeln!(code, "            }}")?;
-    writeln!(code, "            scores[t] = dot * scale;")?;
-    writeln!(code, "        }}")?;
-    writeln!(code)?;
-    writeln!(code, "        // Softmax")?;
-    writeln!(code, "        softmax(&mut scores);")?;
-    writeln!(code)?;
-    writeln!(code, "        // Weighted sum of values")?;
-    writeln!(code, "        for d in 0..head_dim {{")?;
-    writeln!(code, "            let mut sum: f32 = 0.0;")?;
-    writeln!(code, "            for t in 0..seq_len {{")?;
-    writeln!(
-        code,
-        "                let v_offset = t * num_kv_heads * head_dim + kv_h * head_dim;"
-    )?;
-    writeln!(
-        code,
-        "                sum += scores[t] * v_cache[v_offset + d];"
-    )?;
-    writeln!(code, "            }}")?;
-    writeln!(code, "            output[q_offset + d] = sum;")?;
-    writeln!(code, "        }}")?;
-    writeln!(code, "    }}")?;
-    writeln!(code, "}}")?;
-    writeln!(code)?;
+#[inline]
+pub fn elementwise_add(output: &mut [f32], a: &[f32], b: &[f32]) {
+    for i in 0..a.len() { output[i] = a[i] + b[i]; }
+}
 
-    // Embedding lookup
-    writeln!(code, "/// Token embedding lookup")?;
-    writeln!(code, "#[inline]")?;
-    writeln!(
-        code,
-        "pub fn embedding(output: &mut [f32], token_id: u32, weight: &[f32], embed_dim: usize) {{"
-    )?;
-    writeln!(code, "    let offset = token_id as usize * embed_dim;")?;
-    writeln!(
-        code,
-        "    output.copy_from_slice(&weight[offset..offset + embed_dim]);"
-    )?;
-    writeln!(code, "}}")?;
-    writeln!(code)?;
+#[inline]
+pub fn softmax(values: &mut [f32]) {
+    let max_val = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    for v in values.iter_mut() { *v = (*v - max_val).exp(); sum += *v; }
+    let inv = 1.0 / sum;
+    for v in values.iter_mut() { *v *= inv; }
+}
+
+#[inline]
+pub fn rope(data: &mut [f32], pos: usize, head_dim: usize, num_heads: usize, theta: f32) {
+    for h in 0..num_heads {
+        let off = h * head_dim;
+        for i in (0..head_dim).step_by(2) {
+            let freq = 1.0 / theta.powf(i as f32 / head_dim as f32);
+            let angle = pos as f32 * freq;
+            let (sin_v, cos_v) = angle.sin_cos();
+            let (x0, x1) = (data[off+i], data[off+i+1]);
+            data[off+i] = x0 * cos_v - x1 * sin_v;
+            data[off+i+1] = x0 * sin_v + x1 * cos_v;
+        }
+    }
+}
+
+#[inline]
+pub fn attention(output: &mut [f32], q: &[f32], k_cache: &[f32], v_cache: &[f32],
+    seq_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize) {
+    let gsize = num_heads / num_kv_heads;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let kv_stride = num_kv_heads * head_dim;
+    for h in 0..num_heads {
+        let kv_h = h / gsize;
+        let qo = h * head_dim;
+        let mut scores = vec![0.0f32; seq_len];
+        for t in 0..seq_len {
+            let ko = t * kv_stride + kv_h * head_dim;
+            scores[t] = dot_f32(&q[qo..qo+head_dim], &k_cache[ko..ko+head_dim], head_dim) * scale;
+        }
+        softmax(&mut scores);
+        for d in 0..head_dim {
+            let mut sum = 0.0f32;
+            for t in 0..seq_len {
+                sum += scores[t] * v_cache[t * kv_stride + kv_h * head_dim + d];
+            }
+            output[qo+d] = sum;
+        }
+    }
+}
+
+#[inline]
+pub fn embedding(output: &mut [f32], token_id: u32, weight: &[f32], embed_dim: usize) {
+    let off = token_id as usize * embed_dim;
+    output.copy_from_slice(&weight[off..off + embed_dim]);
+}
+
+"#,
+    );
 
     Ok(())
 }
