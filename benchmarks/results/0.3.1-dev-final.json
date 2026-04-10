@@ -1,0 +1,41 @@
+{
+  "version": "0.3.1-dev-final",
+  "date": "2026-04-10T00:30:00Z",
+  "system": {
+    "os": "Darwin",
+    "arch": "arm64",
+    "cpu": "Apple M5 Pro",
+    "cores": 18
+  },
+  "model": {
+    "name": "SmolLM2-135M-Instruct",
+    "quant": "Q8_0",
+    "params": 162.8,
+    "weight_mb": 651.3,
+    "flops_per_token_g": 0.33,
+    "layers": 30,
+    "hidden": 576,
+    "vocab": 49152
+  },
+  "benchmarks": {
+    "interpreter": {
+      "generate_tok_s_avg": 119.7
+    },
+    "aot": {
+      "generate_tok_s_avg": 117.2,
+      "generate_tok_s_runs": [118.2, 117.0, 116.0, 117.5, 117.2],
+      "num_tokens": 64,
+      "runs": 5,
+      "seed": 42,
+      "load_time_s": 0.09,
+      "binary_size_mb": 2.7,
+      "kv_cache_mb": 188.7,
+      "max_seq_len": 4096
+    },
+    "vs_v0_2_0": {
+      "aot_tok_s": "36.2 → 117.2 (3.2x speedup)",
+      "binary_size": "3.8 MB → 2.7 MB (-29%)"
+    }
+  },
+  "notes": "Reproducible with --seed 42. v0.3.1-dev includes all PRs since v0.3.0: KVCache.reset(), --quiet, --seed, --version with FLOPs, direct memcpy load, MAX_SEQ_LEN cap at 4096."
+}
