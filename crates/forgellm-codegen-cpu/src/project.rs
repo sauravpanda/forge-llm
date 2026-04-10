@@ -103,7 +103,18 @@ use std::io::Write;
 fn load_weights(path: &str) -> Vec<f32> {{
     let file = std::fs::File::open(path).expect("failed to open weights");
     let mmap = unsafe {{ memmap2::Mmap::map(&file) }}.expect("failed to mmap weights");
-    mmap.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    // Fast path: direct memcpy from mmap to f32 Vec (assumes little-endian, aligned)
+    let n = mmap.len() / 4;
+    let mut out = Vec::<f32>::with_capacity(n);
+    unsafe {{
+        std::ptr::copy_nonoverlapping(
+            mmap.as_ptr() as *const f32,
+            out.as_mut_ptr(),
+            n,
+        );
+        out.set_len(n);
+    }}
+    out
 }}
 
 fn save_kv_cache(path: &str, cache: &model::KVCache) {{
