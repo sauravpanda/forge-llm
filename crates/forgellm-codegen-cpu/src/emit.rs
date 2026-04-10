@@ -275,17 +275,23 @@ pub fn softmax(values: &mut [f32]) {
     for v in values.iter_mut() { *v *= inv; }
 }
 
+/// Precompute RoPE frequency table: freqs[i] = 1/theta^(2i/head_dim) for i in 0..head_dim/2
 #[inline]
-pub fn rope(data: &mut [f32], pos: usize, head_dim: usize, num_heads: usize, theta: f32) {
+pub fn rope_freqs(head_dim: usize, theta: f32) -> Vec<f32> {
+    (0..head_dim / 2).map(|i| 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32)).collect()
+}
+
+/// Apply RoPE using precomputed frequencies — avoids powf per token
+#[inline]
+pub fn rope(data: &mut [f32], pos: usize, head_dim: usize, num_heads: usize, freqs: &[f32]) {
     for h in 0..num_heads {
         let off = h * head_dim;
-        for i in (0..head_dim).step_by(2) {
-            let freq = 1.0 / theta.powf(i as f32 / head_dim as f32);
-            let angle = pos as f32 * freq;
+        for i in 0..head_dim / 2 {
+            let angle = pos as f32 * freqs[i];
             let (sin_v, cos_v) = angle.sin_cos();
-            let (x0, x1) = (data[off+i], data[off+i+1]);
-            data[off+i] = x0 * cos_v - x1 * sin_v;
-            data[off+i+1] = x0 * sin_v + x1 * cos_v;
+            let (x0, x1) = (data[off + 2*i], data[off + 2*i + 1]);
+            data[off + 2*i] = x0 * cos_v - x1 * sin_v;
+            data[off + 2*i + 1] = x0 * sin_v + x1 * cos_v;
         }
     }
 }
@@ -549,6 +555,9 @@ fn emit_forward_function(
     writeln!(code, "    let mut ffn_hidden = [0.0f32; {intermediate}];")?;
     writeln!(code, "    let mut ffn_out = [0.0f32; {hidden}];")?;
     writeln!(code)?;
+    writeln!(code, "    // Precomputed RoPE frequencies — avoids powf per token")?;
+    writeln!(code, "    let rope_freqs = rope_freqs(HEAD_DIM, ROPE_THETA);")?;
+    writeln!(code)?;
 
     // Transformer layers
     writeln!(code, "    // Transformer layers")?;
@@ -581,11 +590,11 @@ fn emit_forward_function(
     writeln!(code, "        // RoPE")?;
     writeln!(
         code,
-        "        rope(&mut q, pos, HEAD_DIM, NUM_HEADS, ROPE_THETA);"
+        "        rope(&mut q, pos, HEAD_DIM, NUM_HEADS, &rope_freqs);"
     )?;
     writeln!(
         code,
-        "        rope(&mut k, pos, HEAD_DIM, NUM_KV_HEADS, ROPE_THETA);"
+        "        rope(&mut k, pos, HEAD_DIM, NUM_KV_HEADS, &rope_freqs);"
     )?;
     writeln!(code)?;
     writeln!(code, "        // Update KV cache (direct indexed write, no allocation)")?;
