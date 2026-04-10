@@ -25,6 +25,10 @@ pub fn generate(graph: &Graph) -> Result<String, CodegenError> {
 
     emit_header(&mut code, config)?;
     emit_kernel_functions(&mut code)?;
+    if config.dtype == DType::Q8_0 {
+        emit_q8_0_kernel(&mut code)?;
+        emit_specialized_q8_matmul_functions(&mut code, config)?;
+    }
     emit_specialized_matmul_functions(&mut code, config)?;
     emit_forward_function(&mut code, graph, config)?;
 
@@ -562,6 +566,154 @@ fn emit_specialized_matmul_functions(
     Ok(())
 }
 
+/// Emit the Q8_0 dot-product helper and f16→f32 conversion used by Q8_0 matmul.
+fn emit_q8_0_kernel(code: &mut String) -> Result<(), CodegenError> {
+    code.push_str(
+        r#"
+// --- Q8_0 quantized dot product (no dequantization at load time) ---
+/// Convert IEEE 754 half-precision (f16) bit pattern to f32.
+#[inline]
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exponent = ((bits >> 10) & 0x1F) as u32;
+    let mantissa = (bits & 0x3FF) as u32;
+    if exponent == 0 {
+        if mantissa == 0 { return f32::from_bits(sign << 31); }
+        let mut m = mantissa;
+        let mut e: i32 = -14;
+        while m & 0x400 == 0 { m <<= 1; e -= 1; }
+        m &= 0x3FF;
+        let f32_exp = ((e + 127) as u32) & 0xFF;
+        return f32::from_bits((sign << 31) | (f32_exp << 23) | (m << 13));
+    }
+    if exponent == 31 {
+        return f32::from_bits((sign << 31) | (0xFF << 23) | (mantissa << 13));
+    }
+    let f32_exp = (exponent as i32 - 15 + 127) as u32;
+    f32::from_bits((sign << 31) | (f32_exp << 23) | (mantissa << 13))
+}
+
+/// Dot product of f32 input against a Q8_0 weight row without prior dequantization.
+/// `weight_row`: raw Q8_0 bytes — layout: [2 bytes f16 scale][32 bytes int8] per block.
+/// `k`: number of input/weight elements.
+#[inline]
+fn dot_q8_0(input: &[f32], weight_row: &[u8], k: usize) -> f32 {
+    const BLOCK_SIZE: usize = 32;
+    const TYPE_SIZE: usize = 34; // 2 scale bytes + 32 data bytes
+    let num_blocks = k.div_ceil(BLOCK_SIZE);
+    let mut sum = 0.0f32;
+    for b in 0..num_blocks {
+        let bs = b * TYPE_SIZE;
+        let scale_bits = u16::from_le_bytes([weight_row[bs], weight_row[bs + 1]]);
+        let scale = f16_bits_to_f32(scale_bits);
+        let block_start = b * BLOCK_SIZE;
+        let block_end = (block_start + BLOCK_SIZE).min(k);
+        for j in 0..(block_end - block_start) {
+            let q = weight_row[bs + 2 + j] as i8;
+            sum += input[block_start + j] * (q as f32 * scale);
+        }
+    }
+    sum
+}
+
+"#,
+    );
+    Ok(())
+}
+
+/// Collect all unique (k, n) matmul shapes needed for Q8_0 projection weights.
+/// Same shapes as the f32 version but used for Q8_0 `matmul_vec_q8_0_KxN` variants.
+fn q8_matmul_shapes(config: &ModelConfig) -> Vec<(usize, usize)> {
+    matmul_shapes(config)
+}
+
+/// Emit shape-specialized Q8_0 matmul functions: `matmul_vec_q8_0_KxN`.
+/// These take `weight: &[u8]` (raw Q8_0 bytes) and call `dot_q8_0()` per output row.
+fn emit_specialized_q8_matmul_functions(
+    code: &mut String,
+    config: &ModelConfig,
+) -> Result<(), CodegenError> {
+    writeln!(
+        code,
+        "// --- Shape-specialized Q8_0 matmul functions (m=1, weight is &[u8]) ---"
+    )?;
+    writeln!(code)?;
+
+    let par_threshold = 4096;
+
+    for &(k, n) in &q8_matmul_shapes(config) {
+        // Byte size per row: ceil(k/32)*34
+        let row_bytes = k.div_ceil(32) * 34;
+        writeln!(
+            code,
+            "/// Q8_0 matmul: [1, {k}] x [{n}, {k}]^T -> [1, {n}] (weight stored as raw Q8_0 bytes)"
+        )?;
+        if n >= par_threshold {
+            writeln!(code, "#[inline]")?;
+            writeln!(
+                code,
+                "fn matmul_vec_q8_0_{k}x{n}(output: &mut [f32; {n}], input: &[f32; {k}], weight: &[u8]) {{"
+            )?;
+            writeln!(
+                code,
+                "    output.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
+            )?;
+            writeln!(code, "        let base = chunk_idx * 256;")?;
+            writeln!(code, "        for r in 0..out.len() {{")?;
+            writeln!(code, "            let j = base + r;")?;
+            writeln!(
+                code,
+                "            out[r] = dot_q8_0(&input[..], &weight[j*{row_bytes}..(j+1)*{row_bytes}], {k});"
+            )?;
+            writeln!(code, "        }}")?;
+            writeln!(code, "    }});")?;
+            writeln!(code, "}}")?;
+        } else {
+            writeln!(code, "#[inline]")?;
+            writeln!(
+                code,
+                "fn matmul_vec_q8_0_{k}x{n}(output: &mut [f32; {n}], input: &[f32; {k}], weight: &[u8]) {{"
+            )?;
+            let n_chunks = n / 4;
+            let n_remainder = n % 4;
+            if n_chunks > 0 {
+                writeln!(code, "    for chunk in 0..{n_chunks} {{")?;
+                writeln!(code, "        let j0 = chunk * 4;")?;
+                writeln!(
+                    code,
+                    "        output[j0]   = dot_q8_0(&input[..], &weight[j0*{row_bytes}..(j0+1)*{row_bytes}], {k});"
+                )?;
+                writeln!(
+                    code,
+                    "        output[j0+1] = dot_q8_0(&input[..], &weight[(j0+1)*{row_bytes}..(j0+2)*{row_bytes}], {k});"
+                )?;
+                writeln!(
+                    code,
+                    "        output[j0+2] = dot_q8_0(&input[..], &weight[(j0+2)*{row_bytes}..(j0+3)*{row_bytes}], {k});"
+                )?;
+                writeln!(
+                    code,
+                    "        output[j0+3] = dot_q8_0(&input[..], &weight[(j0+3)*{row_bytes}..(j0+4)*{row_bytes}], {k});"
+                )?;
+                writeln!(code, "    }}")?;
+            }
+            if n_remainder > 0 {
+                writeln!(code, "    let base = {n_chunks} * 4;")?;
+                for r in 0..n_remainder {
+                    writeln!(
+                        code,
+                        "    output[base+{r}] = dot_q8_0(&input[..], &weight[(base+{r})*{row_bytes}..(base+{r}+1)*{row_bytes}], {k});"
+                    )?;
+                }
+            }
+            writeln!(code, "}}")?;
+        }
+        writeln!(code)?;
+    }
+
+    Ok(())
+}
+
 fn emit_forward_function(
     code: &mut String,
     _graph: &Graph,
@@ -576,6 +728,11 @@ fn emit_forward_function(
     let qk_size = num_heads * head_dim;
     let kv_size = num_kv_heads * head_dim;
 
+    let is_q8 = config.dtype == DType::Q8_0;
+    // Projection weight type: raw Q8_0 bytes for Q8_0 models, f32 otherwise
+    let proj_type = if is_q8 { "Vec<u8>" } else { "Vec<f32>" };
+    let lm_head_type = if is_q8 { "Vec<u8>" } else { "Vec<f32>" };
+
     writeln!(
         code,
         "/// Model weights — loaded once, passed to forward()."
@@ -589,7 +746,7 @@ fn emit_forward_function(
     writeln!(code, "    pub final_norm: Vec<f32>,          // [{hidden}]")?;
     writeln!(
         code,
-        "    pub lm_head: Vec<f32>,             // [{vocab} * {hidden}]"
+        "    pub lm_head: {lm_head_type},             // [{vocab} * {hidden}]"
     )?;
     writeln!(code, "}}")?;
     writeln!(code)?;
@@ -598,36 +755,36 @@ fn emit_forward_function(
     writeln!(code, "    pub attn_norm: Vec<f32>,           // [{hidden}]")?;
     writeln!(
         code,
-        "    pub q_proj: Vec<f32>,              // [{} * {hidden}]",
+        "    pub q_proj: {proj_type},              // [{} * {hidden}]",
         num_heads * head_dim
     )?;
     writeln!(
         code,
-        "    pub k_proj: Vec<f32>,              // [{} * {hidden}]",
+        "    pub k_proj: {proj_type},              // [{} * {hidden}]",
         num_kv_heads * head_dim
     )?;
     writeln!(
         code,
-        "    pub v_proj: Vec<f32>,              // [{} * {hidden}]",
+        "    pub v_proj: {proj_type},              // [{} * {hidden}]",
         num_kv_heads * head_dim
     )?;
     writeln!(
         code,
-        "    pub o_proj: Vec<f32>,              // [{hidden} * {}]",
+        "    pub o_proj: {proj_type},              // [{hidden} * {}]",
         num_heads * head_dim
     )?;
     writeln!(code, "    pub ffn_norm: Vec<f32>,            // [{hidden}]")?;
     writeln!(
         code,
-        "    pub gate_proj: Vec<f32>,           // [{intermediate} * {hidden}]"
+        "    pub gate_proj: {proj_type},           // [{intermediate} * {hidden}]"
     )?;
     writeln!(
         code,
-        "    pub up_proj: Vec<f32>,             // [{intermediate} * {hidden}]"
+        "    pub up_proj: {proj_type},             // [{intermediate} * {hidden}]"
     )?;
     writeln!(
         code,
-        "    pub down_proj: Vec<f32>,           // [{hidden} * {intermediate}]"
+        "    pub down_proj: {proj_type},           // [{hidden} * {intermediate}]"
     )?;
     writeln!(code, "}}")?;
     writeln!(code)?;
@@ -747,24 +904,45 @@ fn emit_forward_function(
     )?;
     writeln!(code)?;
     writeln!(code, "        // QKV projections (shape-specialized)")?;
-    writeln!(
-        code,
-        "        matmul_vec_{hidden}x{qk_size}(&mut q, &normed, &lw.q_proj);",
-        hidden = hidden,
-        qk_size = qk_size
-    )?;
-    writeln!(
-        code,
-        "        matmul_vec_{hidden}x{kv_size}(&mut k, &normed, &lw.k_proj);",
-        hidden = hidden,
-        kv_size = kv_size
-    )?;
-    writeln!(
-        code,
-        "        matmul_vec_{hidden}x{kv_size}(&mut v, &normed, &lw.v_proj);",
-        hidden = hidden,
-        kv_size = kv_size
-    )?;
+    if is_q8 {
+        writeln!(
+            code,
+            "        matmul_vec_q8_0_{hidden}x{qk_size}(&mut q, &normed, &lw.q_proj);",
+            hidden = hidden,
+            qk_size = qk_size
+        )?;
+        writeln!(
+            code,
+            "        matmul_vec_q8_0_{hidden}x{kv_size}(&mut k, &normed, &lw.k_proj);",
+            hidden = hidden,
+            kv_size = kv_size
+        )?;
+        writeln!(
+            code,
+            "        matmul_vec_q8_0_{hidden}x{kv_size}(&mut v, &normed, &lw.v_proj);",
+            hidden = hidden,
+            kv_size = kv_size
+        )?;
+    } else {
+        writeln!(
+            code,
+            "        matmul_vec_{hidden}x{qk_size}(&mut q, &normed, &lw.q_proj);",
+            hidden = hidden,
+            qk_size = qk_size
+        )?;
+        writeln!(
+            code,
+            "        matmul_vec_{hidden}x{kv_size}(&mut k, &normed, &lw.k_proj);",
+            hidden = hidden,
+            kv_size = kv_size
+        )?;
+        writeln!(
+            code,
+            "        matmul_vec_{hidden}x{kv_size}(&mut v, &normed, &lw.v_proj);",
+            hidden = hidden,
+            kv_size = kv_size
+        )?;
+    }
     writeln!(code)?;
     writeln!(code, "        // RoPE")?;
     writeln!(
@@ -806,12 +984,21 @@ fn emit_forward_function(
     writeln!(code, "        );")?;
     writeln!(code)?;
     writeln!(code, "        // Output projection + fused residual add")?;
-    writeln!(
-        code,
-        "        matmul_vec_{qk_size}x{hidden}(&mut attn_proj, &attn_out, &lw.o_proj);",
-        qk_size = qk_size,
-        hidden = hidden
-    )?;
+    if is_q8 {
+        writeln!(
+            code,
+            "        matmul_vec_q8_0_{qk_size}x{hidden}(&mut attn_proj, &attn_out, &lw.o_proj);",
+            qk_size = qk_size,
+            hidden = hidden
+        )?;
+    } else {
+        writeln!(
+            code,
+            "        matmul_vec_{qk_size}x{hidden}(&mut attn_proj, &attn_out, &lw.o_proj);",
+            qk_size = qk_size,
+            hidden = hidden
+        )?;
+    }
     writeln!(code, "        residual_add(&mut hidden_state, &attn_proj);")?;
     writeln!(code)?;
     writeln!(code, "        // FFN norm")?;
@@ -824,25 +1011,48 @@ fn emit_forward_function(
         code,
         "        // FFN: fused silu_mul eliminates gate_act buffer"
     )?;
-    writeln!(
-        code,
-        "        matmul_vec_{hidden}x{intermediate}(&mut gate, &normed, &lw.gate_proj);",
-        hidden = hidden,
-        intermediate = intermediate
-    )?;
-    writeln!(
-        code,
-        "        matmul_vec_{hidden}x{intermediate}(&mut up, &normed, &lw.up_proj);",
-        hidden = hidden,
-        intermediate = intermediate
-    )?;
+    if is_q8 {
+        writeln!(
+            code,
+            "        matmul_vec_q8_0_{hidden}x{intermediate}(&mut gate, &normed, &lw.gate_proj);",
+            hidden = hidden,
+            intermediate = intermediate
+        )?;
+        writeln!(
+            code,
+            "        matmul_vec_q8_0_{hidden}x{intermediate}(&mut up, &normed, &lw.up_proj);",
+            hidden = hidden,
+            intermediate = intermediate
+        )?;
+    } else {
+        writeln!(
+            code,
+            "        matmul_vec_{hidden}x{intermediate}(&mut gate, &normed, &lw.gate_proj);",
+            hidden = hidden,
+            intermediate = intermediate
+        )?;
+        writeln!(
+            code,
+            "        matmul_vec_{hidden}x{intermediate}(&mut up, &normed, &lw.up_proj);",
+            hidden = hidden,
+            intermediate = intermediate
+        )?;
+    }
     writeln!(code, "        silu_mul(&mut ffn_hidden, &gate, &up);")?;
-    writeln!(
-        code,
-        "        matmul_vec_{intermediate}x{hidden}(&mut ffn_out, &ffn_hidden, &lw.down_proj);",
-        intermediate = intermediate,
-        hidden = hidden
-    )?;
+    if is_q8 {
+        writeln!(
+            code,
+            "        matmul_vec_q8_0_{intermediate}x{hidden}(&mut ffn_out, &ffn_hidden, &lw.down_proj);",
+            intermediate = intermediate, hidden = hidden
+        )?;
+    } else {
+        writeln!(
+            code,
+            "        matmul_vec_{intermediate}x{hidden}(&mut ffn_out, &ffn_hidden, &lw.down_proj);",
+            intermediate = intermediate,
+            hidden = hidden
+        )?;
+    }
     writeln!(code)?;
     writeln!(code, "        // Fused residual add")?;
     writeln!(code, "        residual_add(&mut hidden_state, &ffn_out);")?;
@@ -872,10 +1082,18 @@ fn emit_forward_function(
     writeln!(code, "        let base = chunk_idx * 256;")?;
     writeln!(code, "        for r in 0..out.len() {{")?;
     writeln!(code, "            let j = base + r;")?;
-    writeln!(
-        code,
-        "            out[r] = dot_f32(&normed[..], &weights.lm_head[j*{hidden}..(j+1)*{hidden}], {hidden});"
-    )?;
+    if is_q8 {
+        let lm_row_bytes = hidden.div_ceil(32) * 34;
+        writeln!(
+            code,
+            "            out[r] = dot_q8_0(&normed[..], &weights.lm_head[j*{lm_row_bytes}..(j+1)*{lm_row_bytes}], {hidden});"
+        )?;
+    } else {
+        writeln!(
+            code,
+            "            out[r] = dot_f32(&normed[..], &weights.lm_head[j*{hidden}..(j+1)*{hidden}], {hidden});"
+        )?;
+    }
     writeln!(code, "        }}")?;
     writeln!(code, "    }});")?;
     writeln!(code)?;
@@ -1169,5 +1387,130 @@ mod tests {
         let code = generate(&graph).unwrap();
 
         assert!(code.contains("#![allow(dead_code, unused_imports, unused_assignments)]"));
+    }
+
+    fn tiny_q8_config() -> ModelConfig {
+        ModelConfig {
+            architecture: Architecture::Llama,
+            hidden_size: 64,
+            intermediate_size: 128,
+            num_layers: 2,
+            num_attention_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 16,
+            vocab_size: 256,
+            max_seq_len: 64,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            dtype: DType::Q8_0,
+        }
+    }
+
+    #[test]
+    fn q8_0_model_generates_vec_u8_fields() {
+        let config = tiny_q8_config();
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let code = generate(&graph).unwrap();
+
+        // Projection weights should be Vec<u8>
+        assert!(
+            code.contains("pub q_proj: Vec<u8>"),
+            "q_proj should be Vec<u8> for Q8_0 model"
+        );
+        assert!(
+            code.contains("pub k_proj: Vec<u8>"),
+            "k_proj should be Vec<u8> for Q8_0 model"
+        );
+        assert!(
+            code.contains("pub v_proj: Vec<u8>"),
+            "v_proj should be Vec<u8> for Q8_0 model"
+        );
+        assert!(
+            code.contains("pub o_proj: Vec<u8>"),
+            "o_proj should be Vec<u8> for Q8_0 model"
+        );
+        assert!(
+            code.contains("pub gate_proj: Vec<u8>"),
+            "gate_proj should be Vec<u8> for Q8_0 model"
+        );
+        assert!(
+            code.contains("pub up_proj: Vec<u8>"),
+            "up_proj should be Vec<u8> for Q8_0 model"
+        );
+        assert!(
+            code.contains("pub down_proj: Vec<u8>"),
+            "down_proj should be Vec<u8> for Q8_0 model"
+        );
+        assert!(
+            code.contains("pub lm_head: Vec<u8>"),
+            "lm_head should be Vec<u8> for Q8_0 model"
+        );
+        // Norm and embedding weights are always f32
+        assert!(
+            code.contains("pub attn_norm: Vec<f32>"),
+            "attn_norm should remain Vec<f32>"
+        );
+        assert!(
+            code.contains("pub embed_tokens: Vec<f32>"),
+            "embed_tokens should remain Vec<f32>"
+        );
+        assert!(
+            code.contains("pub final_norm: Vec<f32>"),
+            "final_norm should remain Vec<f32>"
+        );
+    }
+
+    #[test]
+    fn q8_0_model_generates_dot_q8_0_function() {
+        let config = tiny_q8_config();
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let code = generate(&graph).unwrap();
+
+        assert!(
+            code.contains("fn dot_q8_0("),
+            "Q8_0 model should emit dot_q8_0 function"
+        );
+        assert!(
+            code.contains("fn f16_bits_to_f32("),
+            "Q8_0 model should emit f16_bits_to_f32 helper"
+        );
+    }
+
+    #[test]
+    fn q8_0_model_calls_q8_matmul_in_forward() {
+        let config = tiny_q8_config();
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let code = generate(&graph).unwrap();
+
+        // Forward function should use q8_0 matmul variants
+        assert!(
+            code.contains("matmul_vec_q8_0_"),
+            "Q8_0 model should call matmul_vec_q8_0_* variants"
+        );
+        // Should not use regular f32 matmul for projections in forward
+        assert!(
+            !code.contains("matmul_vec_64x64(&mut q"),
+            "Q8_0 model should not call f32 matmul for q_proj"
+        );
+    }
+
+    #[test]
+    fn f32_model_does_not_generate_q8_0_kernels() {
+        let config = tiny_config(); // F16 dtype
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let code = generate(&graph).unwrap();
+
+        // Non-Q8_0 models should not have q8_0 functions
+        assert!(
+            !code.contains("fn dot_q8_0("),
+            "non-Q8_0 model should not emit dot_q8_0"
+        );
+        assert!(
+            !code.contains("matmul_vec_q8_0_"),
+            "non-Q8_0 model should not emit Q8_0 matmul variants"
+        );
+        // Should use regular Vec<f32> for all weight fields
+        assert!(code.contains("pub q_proj: Vec<f32>"));
+        assert!(code.contains("pub lm_head: Vec<f32>"));
     }
 }

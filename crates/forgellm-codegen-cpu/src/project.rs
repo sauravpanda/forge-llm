@@ -90,6 +90,145 @@ fn generate_main(config: &ModelConfig) -> String {
     let num_layers = config.num_layers;
     let qk_size = num_heads * head_dim;
     let kv_size = num_kv_heads * head_dim;
+    let is_q8 = config.dtype == DType::Q8_0;
+
+    // Pre-compute Q8_0 row byte sizes (ceil(numel/32)*34 per row)
+    let q8_row_bytes = |numel: usize| -> usize { numel.div_ceil(32) * 34 };
+
+    // Byte sizes for Q8_0 weight tensors
+    let qp_bytes = qk_size * q8_row_bytes(hidden);
+    let kp_bytes = kv_size * q8_row_bytes(hidden);
+    let vp_bytes = kv_size * q8_row_bytes(hidden);
+    let op_bytes = hidden * q8_row_bytes(qk_size);
+    let gp_bytes = inter * q8_row_bytes(hidden);
+    let up_bytes = inter * q8_row_bytes(hidden);
+    let dp_bytes = hidden * q8_row_bytes(inter);
+    let lmh_bytes = vocab * q8_row_bytes(hidden);
+
+    let weight_loading_code = if is_q8 {
+        // Q8_0: load raw bytes; norm/embed are still f32
+        r##"fn load_weights_q8(path: &str) -> Vec<u8> {
+    let file = std::fs::File::open(path).expect("failed to open weights");
+    let mmap = unsafe { memmap2::Mmap::map(&file) }.expect("failed to mmap weights");
+    mmap.to_vec()
+}
+"##
+        .to_string()
+    } else {
+        r##"fn load_weights(path: &str) -> Vec<f32> {
+    let file = std::fs::File::open(path).expect("failed to open weights");
+    let mmap = unsafe { memmap2::Mmap::map(&file) }.expect("failed to mmap weights");
+    // Fast path: direct memcpy from mmap to f32 Vec (assumes little-endian, aligned)
+    let n = mmap.len() / 4;
+    let mut out = Vec::<f32>::with_capacity(n);
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            mmap.as_ptr() as *const f32,
+            out.as_mut_ptr(),
+            n,
+        );
+        out.set_len(n);
+    }
+    out
+}
+"##
+        .to_string()
+    };
+
+    let weight_slice_code = if is_q8 {
+        // Q8_0: byte offsets for projection weights, f32 element offsets for norm/embed
+        format!(
+            r##"    let w = load_weights_q8(weights_path);
+    let mut boff = 0usize;  // byte offset into raw buffer
+
+    // embed_tokens: f32, interpreted from raw bytes
+    let embed_bytes = {vocab} * {hidden} * 4;
+    let embed: Vec<f32> = {{
+        let n = embed_bytes / 4;
+        let mut v = Vec::<f32>::with_capacity(n);
+        unsafe {{
+            std::ptr::copy_nonoverlapping(w[boff..boff+embed_bytes].as_ptr() as *const f32, v.as_mut_ptr(), n);
+            v.set_len(n);
+        }}
+        v
+    }};
+    boff += embed_bytes;
+    let mut layers = Vec::new();
+    for _ in 0..{num_layers} {{
+        // attn_norm: f32
+        let an_bytes = {hidden} * 4;
+        let an: Vec<f32> = {{
+            let n = an_bytes / 4;
+            let mut v = Vec::<f32>::with_capacity(n);
+            unsafe {{
+                std::ptr::copy_nonoverlapping(w[boff..boff+an_bytes].as_ptr() as *const f32, v.as_mut_ptr(), n);
+                v.set_len(n);
+            }}
+            v
+        }};
+        boff += an_bytes;
+        // Projection weights: Q8_0 raw bytes
+        let qp = w[boff..boff+{qp_bytes}].to_vec(); boff += {qp_bytes};
+        let kp = w[boff..boff+{kp_bytes}].to_vec(); boff += {kp_bytes};
+        let vp = w[boff..boff+{vp_bytes}].to_vec(); boff += {vp_bytes};
+        let op = w[boff..boff+{op_bytes}].to_vec(); boff += {op_bytes};
+        // ffn_norm: f32
+        let fn_bytes = {hidden} * 4;
+        let fn_: Vec<f32> = {{
+            let n = fn_bytes / 4;
+            let mut v = Vec::<f32>::with_capacity(n);
+            unsafe {{
+                std::ptr::copy_nonoverlapping(w[boff..boff+fn_bytes].as_ptr() as *const f32, v.as_mut_ptr(), n);
+                v.set_len(n);
+            }}
+            v
+        }};
+        boff += fn_bytes;
+        let gp = w[boff..boff+{gp_bytes}].to_vec(); boff += {gp_bytes};
+        let up = w[boff..boff+{up_bytes}].to_vec(); boff += {up_bytes};
+        let dp = w[boff..boff+{dp_bytes}].to_vec(); boff += {dp_bytes};
+        layers.push(model::LayerWeights {{ attn_norm: an, q_proj: qp, k_proj: kp, v_proj: vp, o_proj: op, ffn_norm: fn_, gate_proj: gp, up_proj: up, down_proj: dp }});
+    }}
+    // final_norm: f32
+    let fnorm_bytes = {hidden} * 4;
+    let fnorm: Vec<f32> = {{
+        let n = fnorm_bytes / 4;
+        let mut v = Vec::<f32>::with_capacity(n);
+        unsafe {{
+            std::ptr::copy_nonoverlapping(w[boff..boff+fnorm_bytes].as_ptr() as *const f32, v.as_mut_ptr(), n);
+            v.set_len(n);
+        }}
+        v
+    }};
+    boff += fnorm_bytes;
+    // lm_head: Q8_0 raw bytes
+    let lmh = w[boff..boff+{lmh_bytes}].to_vec();
+    let weights = model::Weights {{ embed_tokens: embed, layers, final_norm: fnorm, lm_head: lmh }};"##
+        )
+    } else {
+        format!(
+            r##"    let w = load_weights(weights_path);
+    let mut off = 0usize;
+
+    let embed = w[off..off + {vocab} * {hidden}].to_vec(); off += {vocab} * {hidden};
+    let mut layers = Vec::new();
+    for _ in 0..{num_layers} {{
+        let an = w[off..off+{hidden}].to_vec(); off += {hidden};
+        let qp = w[off..off+{qk_size}*{hidden}].to_vec(); off += {qk_size}*{hidden};
+        let kp = w[off..off+{kv_size}*{hidden}].to_vec(); off += {kv_size}*{hidden};
+        let vp = w[off..off+{kv_size}*{hidden}].to_vec(); off += {kv_size}*{hidden};
+        let op = w[off..off+{hidden}*{qk_size}].to_vec(); off += {hidden}*{qk_size};
+        let fn_ = w[off..off+{hidden}].to_vec(); off += {hidden};
+        let gp = w[off..off+{inter}*{hidden}].to_vec(); off += {inter}*{hidden};
+        let up = w[off..off+{inter}*{hidden}].to_vec(); off += {inter}*{hidden};
+        let dp = w[off..off+{hidden}*{inter}].to_vec(); off += {hidden}*{inter};
+        layers.push(model::LayerWeights {{ attn_norm: an, q_proj: qp, k_proj: kp, v_proj: vp, o_proj: op, ffn_norm: fn_, gate_proj: gp, up_proj: up, down_proj: dp }});
+    }}
+    let fnorm = w[off..off+{hidden}].to_vec(); off += {hidden};
+    let lmh = w[off..off+{vocab}*{hidden}].to_vec();
+    let weights = model::Weights {{ embed_tokens: embed, layers, final_norm: fnorm, lm_head: lmh }};"##
+        )
+    };
 
     format!(
         r##"//! AOT-compiled inference binary generated by ForgeLLM.
@@ -100,22 +239,7 @@ mod model;
 use std::env;
 use std::io::Write;
 
-fn load_weights(path: &str) -> Vec<f32> {{
-    let file = std::fs::File::open(path).expect("failed to open weights");
-    let mmap = unsafe {{ memmap2::Mmap::map(&file) }}.expect("failed to mmap weights");
-    // Fast path: direct memcpy from mmap to f32 Vec (assumes little-endian, aligned)
-    let n = mmap.len() / 4;
-    let mut out = Vec::<f32>::with_capacity(n);
-    unsafe {{
-        std::ptr::copy_nonoverlapping(
-            mmap.as_ptr() as *const f32,
-            out.as_mut_ptr(),
-            n,
-        );
-        out.set_len(n);
-    }}
-    out
-}}
+{weight_loading_code}
 
 fn save_kv_cache(path: &str, cache: &model::KVCache) {{
     let kv = {kv_size};
@@ -267,27 +391,8 @@ fn main() {{
     let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path).expect("failed to load tokenizer");
 
     eprintln!("Loading weights...");
-    let w = load_weights(weights_path);
+{weight_slice_code}
     eprintln!("Load time: {{:.2}}s", t_load.elapsed().as_secs_f64());
-    let mut off = 0usize;
-
-    let embed = w[off..off + {vocab} * {hidden}].to_vec(); off += {vocab} * {hidden};
-    let mut layers = Vec::new();
-    for _ in 0..{num_layers} {{
-        let an = w[off..off+{hidden}].to_vec(); off += {hidden};
-        let qp = w[off..off+{qk_size}*{hidden}].to_vec(); off += {qk_size}*{hidden};
-        let kp = w[off..off+{kv_size}*{hidden}].to_vec(); off += {kv_size}*{hidden};
-        let vp = w[off..off+{kv_size}*{hidden}].to_vec(); off += {kv_size}*{hidden};
-        let op = w[off..off+{hidden}*{qk_size}].to_vec(); off += {hidden}*{qk_size};
-        let fn_ = w[off..off+{hidden}].to_vec(); off += {hidden};
-        let gp = w[off..off+{inter}*{hidden}].to_vec(); off += {inter}*{hidden};
-        let up = w[off..off+{inter}*{hidden}].to_vec(); off += {inter}*{hidden};
-        let dp = w[off..off+{hidden}*{inter}].to_vec(); off += {hidden}*{inter};
-        layers.push(model::LayerWeights {{ attn_norm: an, q_proj: qp, k_proj: kp, v_proj: vp, o_proj: op, ffn_norm: fn_, gate_proj: gp, up_proj: up, down_proj: dp }});
-    }}
-    let fnorm = w[off..off+{hidden}].to_vec(); off += {hidden};
-    let lmh = w[off..off+{vocab}*{hidden}].to_vec();
-    let weights = model::Weights {{ embed_tokens: embed, layers, final_norm: fnorm, lm_head: lmh }};
     let mut cache = model::KVCache::new();
     if let Some(ref cp) = load_cache_path {{ load_kv_cache(cp, &mut cache); }}
 
@@ -387,6 +492,97 @@ fn generate_main_embedded(config: &ModelConfig) -> String {
     let num_layers = config.num_layers;
     let qk_size = num_heads * head_dim;
     let kv_size = num_kv_heads * head_dim;
+    let is_q8 = config.dtype == DType::Q8_0;
+
+    let q8_row_bytes = |numel: usize| -> usize { numel.div_ceil(32) * 34 };
+    let qp_bytes = qk_size * q8_row_bytes(hidden);
+    let kp_bytes = kv_size * q8_row_bytes(hidden);
+    let vp_bytes = kv_size * q8_row_bytes(hidden);
+    let op_bytes = hidden * q8_row_bytes(qk_size);
+    let gp_bytes = inter * q8_row_bytes(hidden);
+    let up_bytes = inter * q8_row_bytes(hidden);
+    let dp_bytes = hidden * q8_row_bytes(inter);
+    let lmh_bytes = vocab * q8_row_bytes(hidden);
+
+    let bytes_helper = if is_q8 {
+        // For Q8_0, we only need the bytes_to_f32 helper for norm/embed extraction
+        r##"fn bytes_to_f32_slice(bytes: &[u8]) -> Vec<f32> {
+    let n = bytes.len() / 4;
+    let mut out = Vec::<f32>::with_capacity(n);
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const f32, out.as_mut_ptr(), n);
+        out.set_len(n);
+    }
+    out
+}
+"##
+        .to_string()
+    } else {
+        r##"fn bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
+    let n = bytes.len() / 4;
+    let mut out = Vec::<f32>::with_capacity(n);
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const f32, out.as_mut_ptr(), n);
+        out.set_len(n);
+    }
+    out
+}
+"##
+        .to_string()
+    };
+
+    let weight_slice_code_embedded = if is_q8 {
+        format!(
+            r##"    let w: &[u8] = WEIGHTS_BYTES;
+    let mut boff = 0usize;
+
+    let embed_bytes = {vocab} * {hidden} * 4;
+    let embed = bytes_to_f32_slice(&w[boff..boff+embed_bytes]);
+    boff += embed_bytes;
+    let mut layers = Vec::new();
+    for _ in 0..{num_layers} {{
+        let an_bytes = {hidden} * 4;
+        let an = bytes_to_f32_slice(&w[boff..boff+an_bytes]); boff += an_bytes;
+        let qp = w[boff..boff+{qp_bytes}].to_vec(); boff += {qp_bytes};
+        let kp = w[boff..boff+{kp_bytes}].to_vec(); boff += {kp_bytes};
+        let vp = w[boff..boff+{vp_bytes}].to_vec(); boff += {vp_bytes};
+        let op = w[boff..boff+{op_bytes}].to_vec(); boff += {op_bytes};
+        let fn_bytes = {hidden} * 4;
+        let fn_ = bytes_to_f32_slice(&w[boff..boff+fn_bytes]); boff += fn_bytes;
+        let gp = w[boff..boff+{gp_bytes}].to_vec(); boff += {gp_bytes};
+        let up = w[boff..boff+{up_bytes}].to_vec(); boff += {up_bytes};
+        let dp = w[boff..boff+{dp_bytes}].to_vec(); boff += {dp_bytes};
+        layers.push(model::LayerWeights {{ attn_norm: an, q_proj: qp, k_proj: kp, v_proj: vp, o_proj: op, ffn_norm: fn_, gate_proj: gp, up_proj: up, down_proj: dp }});
+    }}
+    let fnorm_bytes = {hidden} * 4;
+    let fnorm = bytes_to_f32_slice(&w[boff..boff+fnorm_bytes]); boff += fnorm_bytes;
+    let lmh = w[boff..boff+{lmh_bytes}].to_vec();
+    let weights = model::Weights {{ embed_tokens: embed, layers, final_norm: fnorm, lm_head: lmh }};"##
+        )
+    } else {
+        format!(
+            r##"    let w = bytes_to_f32(WEIGHTS_BYTES);
+    let mut off = 0usize;
+
+    let embed = w[off..off + {vocab} * {hidden}].to_vec(); off += {vocab} * {hidden};
+    let mut layers = Vec::new();
+    for _ in 0..{num_layers} {{
+        let an = w[off..off+{hidden}].to_vec(); off += {hidden};
+        let qp = w[off..off+{qk_size}*{hidden}].to_vec(); off += {qk_size}*{hidden};
+        let kp = w[off..off+{kv_size}*{hidden}].to_vec(); off += {kv_size}*{hidden};
+        let vp = w[off..off+{kv_size}*{hidden}].to_vec(); off += {kv_size}*{hidden};
+        let op = w[off..off+{hidden}*{qk_size}].to_vec(); off += {hidden}*{qk_size};
+        let fn_ = w[off..off+{hidden}].to_vec(); off += {hidden};
+        let gp = w[off..off+{inter}*{hidden}].to_vec(); off += {inter}*{hidden};
+        let up = w[off..off+{inter}*{hidden}].to_vec(); off += {inter}*{hidden};
+        let dp = w[off..off+{hidden}*{inter}].to_vec(); off += {hidden}*{inter};
+        layers.push(model::LayerWeights {{ attn_norm: an, q_proj: qp, k_proj: kp, v_proj: vp, o_proj: op, ffn_norm: fn_, gate_proj: gp, up_proj: up, down_proj: dp }});
+    }}
+    let fnorm = w[off..off+{hidden}].to_vec(); off += {hidden};
+    let lmh = w[off..off+{vocab}*{hidden}].to_vec();
+    let weights = model::Weights {{ embed_tokens: embed, layers, final_norm: fnorm, lm_head: lmh }};"##
+        )
+    };
 
     format!(
         r##"//! AOT-compiled inference binary generated by ForgeLLM.
@@ -401,15 +597,7 @@ use std::io::Write;
 static WEIGHTS_BYTES: &[u8] = include_bytes!("../weights.bin");
 static TOKENIZER_BYTES: &[u8] = include_bytes!("../tokenizer.json");
 
-fn bytes_to_f32(bytes: &[u8]) -> Vec<f32> {{
-    let n = bytes.len() / 4;
-    let mut out = Vec::<f32>::with_capacity(n);
-    unsafe {{
-        std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const f32, out.as_mut_ptr(), n);
-        out.set_len(n);
-    }}
-    out
-}}
+{bytes_helper}
 
 fn save_kv_cache(path: &str, cache: &model::KVCache) {{
     let kv = {kv_size};
@@ -522,27 +710,8 @@ fn main() {{
     let tokenizer = tokenizers::Tokenizer::from_bytes(TOKENIZER_BYTES).expect("failed to load tokenizer");
 
     eprintln!("Parsing weights (embedded, {{:.1}} MB)...", WEIGHTS_BYTES.len() as f64 / 1e6);
-    let w = bytes_to_f32(WEIGHTS_BYTES);
+{weight_slice_code_embedded}
     eprintln!("Load time: {{:.2}}s", t_load.elapsed().as_secs_f64());
-    let mut off = 0usize;
-
-    let embed = w[off..off + {vocab} * {hidden}].to_vec(); off += {vocab} * {hidden};
-    let mut layers = Vec::new();
-    for _ in 0..{num_layers} {{
-        let an = w[off..off+{hidden}].to_vec(); off += {hidden};
-        let qp = w[off..off+{qk_size}*{hidden}].to_vec(); off += {qk_size}*{hidden};
-        let kp = w[off..off+{kv_size}*{hidden}].to_vec(); off += {kv_size}*{hidden};
-        let vp = w[off..off+{kv_size}*{hidden}].to_vec(); off += {kv_size}*{hidden};
-        let op = w[off..off+{hidden}*{qk_size}].to_vec(); off += {hidden}*{qk_size};
-        let fn_ = w[off..off+{hidden}].to_vec(); off += {hidden};
-        let gp = w[off..off+{inter}*{hidden}].to_vec(); off += {inter}*{hidden};
-        let up = w[off..off+{inter}*{hidden}].to_vec(); off += {inter}*{hidden};
-        let dp = w[off..off+{hidden}*{inter}].to_vec(); off += {hidden}*{inter};
-        layers.push(model::LayerWeights {{ attn_norm: an, q_proj: qp, k_proj: kp, v_proj: vp, o_proj: op, ffn_norm: fn_, gate_proj: gp, up_proj: up, down_proj: dp }});
-    }}
-    let fnorm = w[off..off+{hidden}].to_vec(); off += {hidden};
-    let lmh = w[off..off+{vocab}*{hidden}].to_vec();
-    let weights = model::Weights {{ embed_tokens: embed, layers, final_norm: fnorm, lm_head: lmh }};
     let mut cache = model::KVCache::new();
     if let Some(ref cp) = load_cache_path {{ load_kv_cache(cp, &mut cache); }}
 
