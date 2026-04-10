@@ -240,6 +240,7 @@ fn main() {{
     let top_p = parse_f32_arg(&args, "--top-p", 0.9);
     let max_tokens = parse_usize_arg(&args, "--max-tokens", 128);
     let repeat_penalty = parse_f32_arg(&args, "--repeat-penalty", 1.1);
+    let seed = args.windows(2).find(|w| w[0] == "--seed").and_then(|w| w[1].parse::<u64>().ok()).unwrap_or(0xdeadbeef12345678);
     let quiet = args.iter().any(|a| a == "--quiet" || a == "-q");
     let save_cache_path = args.windows(2).find(|w| w[0] == "--save-cache").map(|w| w[1].clone());
     let load_cache_path = args.windows(2).find(|w| w[0] == "--load-cache").map(|w| w[1].clone());
@@ -281,7 +282,7 @@ fn main() {{
 
     // Prefill
     let t0 = std::time::Instant::now();
-    let mut rng_state: u64 = 0xdeadbeef12345678;
+    let mut rng_state: u64 = seed;
     let mut next = 0u32;
     for &tok in tokens {{ let mut l = model::forward(tok, &weights, &mut cache); next = sample(&mut l, temperature, top_k, top_p, &mut rng_state); }}
     eprintln!("Prefill: {{:.1}} tok/s", tokens.len() as f64 / t0.elapsed().as_secs_f64());
@@ -492,6 +493,7 @@ fn main() {{
     let top_p = parse_f32_arg(&args, "--top-p", 0.9);
     let max_tokens = parse_usize_arg(&args, "--max-tokens", 128);
     let repeat_penalty = parse_f32_arg(&args, "--repeat-penalty", 1.1);
+    let seed = args.windows(2).find(|w| w[0] == "--seed").and_then(|w| w[1].parse::<u64>().ok()).unwrap_or(0xdeadbeef12345678);
     let quiet = args.iter().any(|a| a == "--quiet" || a == "-q");
     let save_cache_path = args.windows(2).find(|w| w[0] == "--save-cache").map(|w| w[1].clone());
     let load_cache_path = args.windows(2).find(|w| w[0] == "--load-cache").map(|w| w[1].clone());
@@ -535,7 +537,7 @@ fn main() {{
 
     // Prefill
     let t0 = std::time::Instant::now();
-    let mut rng_state: u64 = 0xdeadbeef12345678;
+    let mut rng_state: u64 = seed;
     let mut next = 0u32;
     for &tok in tokens {{ let mut l = model::forward(tok, &weights, &mut cache); next = sample(&mut l, temperature, top_k, top_p, &mut rng_state); }}
     eprintln!("Prefill: {{:.1}} tok/s", tokens.len() as f64 / t0.elapsed().as_secs_f64());
