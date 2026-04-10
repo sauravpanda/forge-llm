@@ -311,7 +311,7 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
 name = "forgellm-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -328,7 +328,7 @@ dependencies = [
 
 [[package]]
 name = "forgellm-codegen-cpu"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "forgellm-frontend",
  "forgellm-optimizer",
@@ -339,7 +339,7 @@ dependencies = [
 
 [[package]]
 name = "forgellm-codegen-gpu"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "forgellm-frontend",
  "forgellm-optimizer",
@@ -350,7 +350,7 @@ dependencies = [
 
 [[package]]
 name = "forgellm-codegen-wasm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "forgellm-frontend",
  "forgellm-optimizer",
@@ -361,7 +361,7 @@ dependencies = [
 
 [[package]]
 name = "forgellm-frontend"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "memmap2",
  "pretty_assertions",
@@ -373,7 +373,7 @@ dependencies = [
 
 [[package]]
 name = "forgellm-optimizer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "forgellm-frontend",
  "pretty_assertions",
@@ -383,7 +383,7 @@ dependencies = [
 
 [[package]]
 name = "forgellm-runtime"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "forgellm-frontend",
  "pretty_assertions",

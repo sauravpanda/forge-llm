@@ -1,0 +1,42 @@
+{
+  "version": "0.3.0-dev",
+  "date": "2026-04-09T23:30:00Z",
+  "system": {
+    "os": "Darwin",
+    "arch": "arm64",
+    "cpu": "Apple M5 Pro",
+    "cores": "18"
+  },
+  "model": {
+    "name": "SmolLM2-135M-Instruct",
+    "quant": "Q8_0",
+    "params": "135M",
+    "layers": 30,
+    "hidden_size": 576
+  },
+  "benchmarks": {
+    "interpreter": {
+      "generate_tok_s_avg": 119.7,
+      "num_tokens": 64,
+      "runs": 3
+    },
+    "aot": {
+      "generate_tok_s_avg": 105.2,
+      "generate_tok_s_best": 105.5,
+      "generate_tok_s_runs": [105.1, 105.0, 105.5],
+      "prefill_tok_s_avg": 93.3,
+      "num_tokens": 57,
+      "runs": 3,
+      "build_time_s": 32,
+      "binary_size_mb": 3.8
+    }
+  },
+  "improvements_vs_v0_2_0": {
+    "aot_speedup": "2.9x (36.2 → 105.2 tok/s)",
+    "vs_interpreter": "88% (was 30%)"
+  },
+  "changes": [
+    "Upgraded dot_f32 to 4 NEON accumulators with 16-element unrolled inner loop",
+    "Bumped Rayon parallelism threshold 1024 → 4096"
+  ]
+}

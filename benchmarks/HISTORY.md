@@ -7,6 +7,7 @@ Performance tracking across versions. All benchmarks run on SmolLM2-135M-Instruc
 | Version | Date | Interpreter (tok/s) | AOT (tok/s) | AOT Build (s) | Binary Size | System |
 |---------|------|---------------------|-------------|---------------|-------------|--------|
 | v0.2.0 | 2026-04-09 | 119.7 | 36.2 avg (best: 40.2) | 29s | 3.8 MB | Darwin arm64 18c (Apple M5 Pro) |
+| v0.3.0-dev | 2026-04-09 | 119.7 | **105.2** avg (best: 105.5) | 32s | 3.8 MB | Darwin arm64 18c (Apple M5 Pro) |
 
 ## Analysis
 
@@ -23,10 +24,16 @@ First release with AOT compilation. Key observations:
 
 ### Improvement targets for v0.3.0
 
-1. **Inline NEON intrinsics in generated matmul** — match interpreter's dot_f32 performance
-2. **Reduce Rayon overhead** — tune parallelism threshold for small models
+1. **Inline NEON intrinsics in generated matmul** — match interpreter's dot_f32 performance ✅ DONE
+2. **Reduce Rayon overhead** — tune parallelism threshold for small models ✅ DONE (1024 → 4096)
 3. **Optimize logits projection** — largest single matmul (576 x 49152)
 4. **Profile-guided optimization (PGO)** — use cargo-pgo for the AOT binary
+
+### v0.3.0-dev Results
+
+- **AOT improved 2.9x: 36.2 → 105.2 tok/s** (88% of interpreter)
+- Upgraded `dot_f32` to 4 NEON accumulators with 16-element unrolled inner loop
+- Bumped Rayon parallelism threshold from 1024 to 4096 (eliminated overhead for SmolLM matmuls)
 
 ## How to Run
 
