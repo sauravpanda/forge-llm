@@ -132,7 +132,28 @@ fn dot_f32(a: &[f32], b: &[f32], len: usize) -> f32 {
     sum
 }
 
-/// RMS normalization with NEON dot product
+/// RMS normalization with NEON dot product + NEON apply
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn rms_norm(output: &mut [f32], input: &[f32], weight: &[f32], eps: f32) {
+    use std::arch::aarch64::*;
+    let n = input.len();
+    let sum_sq = dot_f32(input, input, n);
+    let inv_rms = 1.0 / (sum_sq / n as f32 + eps).sqrt();
+    unsafe {
+        let vinv = vdupq_n_f32(inv_rms);
+        let chunks = n / 4;
+        for i in 0..chunks {
+            let base = i * 4;
+            let vi = vld1q_f32(input.as_ptr().add(base));
+            let vw = vld1q_f32(weight.as_ptr().add(base));
+            vst1q_f32(output.as_mut_ptr().add(base), vmulq_f32(vmulq_f32(vi, vinv), vw));
+        }
+    }
+    for i in (n / 4 * 4)..n { output[i] = input[i] * inv_rms * weight[i]; }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
 #[inline]
 pub fn rms_norm(output: &mut [f32], input: &[f32], weight: &[f32], eps: f32) {
     let n = input.len();
