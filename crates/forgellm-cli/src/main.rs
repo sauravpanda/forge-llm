@@ -46,6 +46,18 @@ enum Commands {
         /// Output directory for the generated project
         #[arg(long)]
         output: String,
+
+        /// Build and run the compiled binary immediately
+        #[arg(long)]
+        run: bool,
+
+        /// Prompt to use when --run is specified
+        #[arg(long, default_value = "Hello, world!")]
+        prompt: Option<String>,
+
+        /// Path to tokenizer.json (auto-detected if omitted)
+        #[arg(long)]
+        tokenizer: Option<String>,
     },
 
     /// Export model weights as a flat binary file for AOT binaries
@@ -189,7 +201,10 @@ fn main() -> Result<()> {
             model,
             target,
             output,
-        } => cmd_compile(&model, &target, &output)?,
+            run,
+            prompt,
+            tokenizer,
+        } => cmd_compile(&model, &target, &output, run, prompt.as_deref(), &tokenizer)?,
 
         Commands::ExportWeights { model, output } => cmd_export_weights(&model, &output)?,
 
@@ -437,7 +452,14 @@ fn resolve_tokenizer(tokenizer: &Option<String>, model_path: &str) -> Result<Str
     )
 }
 
-fn cmd_compile(model_path: &str, target: &str, output_path: &str) -> Result<()> {
+fn cmd_compile(
+    model_path: &str,
+    target: &str,
+    output_path: &str,
+    run: bool,
+    prompt: Option<&str>,
+    tokenizer_opt: &Option<String>,
+) -> Result<()> {
     println!("Loading model config from {model_path}...");
     let config = load_model_config(model_path)?;
 
@@ -480,11 +502,72 @@ fn cmd_compile(model_path: &str, target: &str, output_path: &str) -> Result<()> 
     println!("  src/model.rs  — kernels + forward function");
     println!("  src/main.rs   — weight loader + CLI");
     println!("  Cargo.toml    — build configuration");
+
+    if !run {
+        println!();
+        println!("Next steps:");
+        println!("  1. Export weights:  forge export-weights --model {model_path} --output {output_path}/weights.bin");
+        println!("  2. Build:           cd {output_path} && cargo build --release");
+        println!("  3. Run:             ./target/release/{model_name} weights.bin tokenizer.json \"Hello\"");
+        return Ok(());
+    }
+
+    // --run: export weights, copy tokenizer, build, and execute
     println!();
-    println!("Next steps:");
-    println!("  1. Export weights:  forge export-weights --model {model_path} --output {output_path}/weights.bin");
-    println!("  2. Build:           cd {output_path} && cargo build --release");
-    println!("  3. Run:             ./target/release/{model_name} weights.bin");
+    println!("=== --run: building and executing AOT binary ===");
+    println!();
+
+    // Step 1: Export weights
+    let weights_path = output_dir.join("weights.bin");
+    let weights_path_str = weights_path.to_string_lossy().to_string();
+    println!("[1/4] Exporting weights...");
+    cmd_export_weights(model_path, &weights_path_str)?;
+
+    // Step 2: Copy tokenizer
+    println!("[2/4] Resolving tokenizer...");
+    let tokenizer_src = resolve_tokenizer(tokenizer_opt, model_path)?;
+    let tokenizer_dst = output_dir.join("tokenizer.json");
+    fs::copy(&tokenizer_src, &tokenizer_dst)
+        .with_context(|| format!("failed to copy tokenizer from {tokenizer_src}"))?;
+    println!("  Copied tokenizer to {}", tokenizer_dst.display());
+
+    // Step 3: Build with cargo
+    println!("[3/4] Building release binary (cargo build --release)...");
+    let build_status = std::process::Command::new("cargo")
+        .arg("build")
+        .arg("--release")
+        .current_dir(output_dir)
+        .status()
+        .with_context(|| "failed to run cargo build")?;
+
+    if !build_status.success() {
+        bail!("cargo build --release failed with exit code: {}", build_status);
+    }
+    println!("  Build complete.");
+
+    // Step 4: Run the binary
+    let binary_path = output_dir.join("target").join("release").join(&model_name);
+    if !binary_path.exists() {
+        bail!(
+            "expected binary not found at {}",
+            binary_path.display()
+        );
+    }
+
+    let run_prompt = prompt.unwrap_or("Hello, world!");
+    println!("[4/4] Running: {} weights.bin tokenizer.json \"{}\"", model_name, run_prompt);
+    println!();
+
+    let run_status = std::process::Command::new(&binary_path)
+        .arg(weights_path_str)
+        .arg(tokenizer_dst.to_string_lossy().to_string())
+        .arg(run_prompt)
+        .status()
+        .with_context(|| "failed to execute AOT binary")?;
+
+    if !run_status.success() {
+        bail!("AOT binary exited with code: {}", run_status);
+    }
 
     Ok(())
 }
