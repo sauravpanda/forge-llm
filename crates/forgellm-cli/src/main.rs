@@ -214,16 +214,16 @@ fn main() -> Result<()> {
             tokenizer,
             embed_weights,
             cross_target,
-        } => cmd_compile(
-            &model,
-            &target,
-            &output,
+        } => cmd_compile(CompileArgs {
+            model_path: &model,
+            target: &target,
+            output_path: &output,
             run,
-            prompt.as_deref(),
-            &tokenizer,
+            prompt: prompt.as_deref(),
+            tokenizer_opt: &tokenizer,
             embed_weights,
-            cross_target.as_deref(),
-        )?,
+            cross_target: cross_target.as_deref(),
+        })?,
 
         Commands::ExportWeights { model, output } => cmd_export_weights(&model, &output)?,
 
@@ -471,11 +471,10 @@ fn resolve_tokenizer(tokenizer: &Option<String>, model_path: &str) -> Result<Str
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn cmd_compile(
-    model_path: &str,
-    target: &str,
-    output_path: &str,
+struct CompileArgs<'a> {
+    model_path: &'a str,
+    target: &'a str,
+    output_path: &'a str,
     run: bool,
     prompt: Option<&'a str>,
     tokenizer_opt: &'a Option<String>,
