@@ -117,7 +117,7 @@ fn emit_kernel_functions(code: &mut String) -> Result<(), CodegenError> {
     // Emit all kernels as a template string — includes NEON SIMD with scalar fallback
     code.push_str(
         r#"
-// --- NEON SIMD dot product ---
+// --- NEON SIMD dot product (4 accumulators, 16-element unrolled) ---
 #[cfg(target_arch = "aarch64")]
 #[inline]
 fn dot_f32(a: &[f32], b: &[f32], len: usize) -> f32 {
@@ -125,14 +125,21 @@ fn dot_f32(a: &[f32], b: &[f32], len: usize) -> f32 {
     unsafe {
         let mut s0 = vdupq_n_f32(0.0);
         let mut s1 = vdupq_n_f32(0.0);
-        let chunks = len / 8;
+        let mut s2 = vdupq_n_f32(0.0);
+        let mut s3 = vdupq_n_f32(0.0);
+        let chunks = len / 16;
         for i in 0..chunks {
-            let base = i * 8;
+            let base = i * 16;
             s0 = vfmaq_f32(s0, vld1q_f32(a.as_ptr().add(base)), vld1q_f32(b.as_ptr().add(base)));
             s1 = vfmaq_f32(s1, vld1q_f32(a.as_ptr().add(base+4)), vld1q_f32(b.as_ptr().add(base+4)));
+            s2 = vfmaq_f32(s2, vld1q_f32(a.as_ptr().add(base+8)), vld1q_f32(b.as_ptr().add(base+8)));
+            s3 = vfmaq_f32(s3, vld1q_f32(a.as_ptr().add(base+12)), vld1q_f32(b.as_ptr().add(base+12)));
         }
-        let mut r = vaddvq_f32(vaddq_f32(s0, s1));
-        for i in (chunks*8)..len { r += *a.get_unchecked(i) * *b.get_unchecked(i); }
+        s0 = vaddq_f32(s0, s1);
+        s2 = vaddq_f32(s2, s3);
+        s0 = vaddq_f32(s0, s2);
+        let mut r = vaddvq_f32(s0);
+        for i in (chunks*16)..len { r += *a.get_unchecked(i) * *b.get_unchecked(i); }
         r
     }
 }
@@ -443,9 +450,9 @@ fn emit_specialized_matmul_functions(
     writeln!(code, "// All dimensions baked in at compile time — no runtime size parameters.")?;
     writeln!(code)?;
 
-    // Threshold for parallelization: only parallelize if N >= 1024
-    // (otherwise Rayon overhead dominates the compute)
-    let par_threshold = 1024;
+    // Threshold for parallelization: only parallelize if N >= 4096
+    // (otherwise Rayon overhead dominates the compute for small matmuls)
+    let par_threshold = 4096;
 
     for &(k, n) in &matmul_shapes(config) {
         writeln!(code, "/// Specialized matmul: [1, {k}] x [{n}, {k}]^T -> [1, {n}]")?;
