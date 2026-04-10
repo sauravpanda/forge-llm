@@ -266,6 +266,37 @@ pub fn residual_add(a: &mut [f32], b: &[f32]) {
     for i in 0..a.len() { a[i] += b[i]; }
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub fn softmax(values: &mut [f32]) {
+    use std::arch::aarch64::*;
+    // Find max using NEON
+    let n = values.len();
+    let mut max_val = f32::NEG_INFINITY;
+    unsafe {
+        let chunks = n / 4;
+        let mut vmax = vdupq_n_f32(f32::NEG_INFINITY);
+        for i in 0..chunks { vmax = vmaxq_f32(vmax, vld1q_f32(values.as_ptr().add(i * 4))); }
+        max_val = vmaxvq_f32(vmax);
+    }
+    for i in (n / 4 * 4)..n { if values[i] > max_val { max_val = values[i]; } }
+    // Exp and sum
+    let mut sum = 0.0f32;
+    for v in values.iter_mut() { *v = (*v - max_val).exp(); sum += *v; }
+    // Normalize with NEON
+    let inv = 1.0 / sum;
+    unsafe {
+        let vinv = vdupq_n_f32(inv);
+        let chunks = n / 4;
+        for i in 0..chunks {
+            let base = i * 4;
+            vst1q_f32(values.as_mut_ptr().add(base), vmulq_f32(vld1q_f32(values.as_ptr().add(base)), vinv));
+        }
+    }
+    for i in (n / 4 * 4)..n { values[i] *= inv; }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
 #[inline]
 pub fn softmax(values: &mut [f32]) {
     let max_val = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
