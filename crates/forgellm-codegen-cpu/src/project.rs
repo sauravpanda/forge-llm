@@ -232,6 +232,9 @@ fn main() {{
             + model::HIDDEN_SIZE;
         println!("  Parameters:   {{:.1}}M", (total_params as f64) / 1e6);
         println!("  Weights:      {{:.1}} MB (f32)", (total_params as f64 * 4.0) / 1e6);
+        // Each forward pass does ~2*params multiply-add operations
+        let flops_per_token = 2 * total_params;
+        println!("  FLOPs/token:  {{:.2}} GFLOP", (flops_per_token as f64) / 1e9);
         // Compute KV cache size without allocating
         let kv_bytes = model::NUM_LAYERS * model::MAX_SEQ_LEN * model::NUM_KV_HEADS * model::HEAD_DIM * 4 * 2;
         println!("  KV cache:     {{:.1}} MB (max_seq_len={{}})", (kv_bytes as f64) / 1e6, model::MAX_SEQ_LEN);
