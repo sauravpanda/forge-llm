@@ -86,10 +86,14 @@ fn emit_header(code: &mut String, config: &ModelConfig) -> Result<(), CodegenErr
     )?;
     writeln!(code, "pub const HEAD_DIM: usize = {};", config.head_dim)?;
     writeln!(code, "pub const VOCAB_SIZE: usize = {};", config.vocab_size)?;
+    // Cap MAX_SEQ_LEN at 4096 for reasonable KV cache memory.
+    // Models like Qwen2.5 have max_seq_len=32768 which would allocate
+    // gigabytes of KV cache pre-allocated on construction.
+    let effective_seq_len = config.max_seq_len.min(4096);
     writeln!(
         code,
-        "pub const MAX_SEQ_LEN: usize = {};",
-        config.max_seq_len
+        "pub const MAX_SEQ_LEN: usize = {};  // capped from model's {}",
+        effective_seq_len, config.max_seq_len
     )?;
     writeln!(
         code,
