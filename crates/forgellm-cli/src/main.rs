@@ -214,7 +214,16 @@ fn main() -> Result<()> {
             tokenizer,
             embed_weights,
             cross_target,
-        } => cmd_compile(&model, &target, &output, run, prompt.as_deref(), &tokenizer, embed_weights, cross_target.as_deref())?,
+        } => cmd_compile(CompileArgs {
+            model_path: &model,
+            target: &target,
+            output_path: &output,
+            run,
+            prompt: prompt.as_deref(),
+            tokenizer_opt: &tokenizer,
+            embed_weights,
+            cross_target: cross_target.as_deref(),
+        })?,
 
         Commands::ExportWeights { model, output } => cmd_export_weights(&model, &output)?,
 
@@ -462,16 +471,28 @@ fn resolve_tokenizer(tokenizer: &Option<String>, model_path: &str) -> Result<Str
     )
 }
 
-fn cmd_compile(
-    model_path: &str,
-    target: &str,
-    output_path: &str,
+struct CompileArgs<'a> {
+    model_path: &'a str,
+    target: &'a str,
+    output_path: &'a str,
     run: bool,
-    prompt: Option<&str>,
-    tokenizer_opt: &Option<String>,
+    prompt: Option<&'a str>,
+    tokenizer_opt: &'a Option<String>,
     embed_weights: bool,
-    cross_target: Option<&str>,
-) -> Result<()> {
+    cross_target: Option<&'a str>,
+}
+
+fn cmd_compile(args: CompileArgs<'_>) -> Result<()> {
+    let CompileArgs {
+        model_path,
+        target,
+        output_path,
+        run,
+        prompt,
+        tokenizer_opt,
+        embed_weights,
+        cross_target,
+    } = args;
     println!("Loading model config from {model_path}...");
     let config = load_model_config(model_path)?;
 
@@ -520,8 +541,13 @@ fn cmd_compile(
         .unwrap_or_else(|| "model".to_string());
 
     match target {
-        "cpu" => forgellm_codegen_cpu::generate_project(&optimized, output_dir, &model_name, embed_weights)
-            .map_err(|e| anyhow::anyhow!("project generation failed: {e}"))?,
+        "cpu" => forgellm_codegen_cpu::generate_project(
+            &optimized,
+            output_dir,
+            &model_name,
+            embed_weights,
+        )
+        .map_err(|e| anyhow::anyhow!("project generation failed: {e}"))?,
         _ => bail!("unsupported target: {target} (supported: cpu)"),
     }
 
@@ -575,31 +601,42 @@ fn cmd_compile(
     }
 
     // Build with cargo
-    let target_info = cross_target.map(|t| format!(" --target {t}")).unwrap_or_default();
+    let target_info = cross_target
+        .map(|t| format!(" --target {t}"))
+        .unwrap_or_default();
     println!("[3/4] Building release binary (cargo build --release{target_info})...");
     let mut build_cmd = std::process::Command::new("cargo");
-    build_cmd.arg("build").arg("--release").current_dir(output_dir);
+    build_cmd
+        .arg("build")
+        .arg("--release")
+        .current_dir(output_dir);
     if let Some(ct) = cross_target {
         build_cmd.arg("--target").arg(ct);
     }
-    let build_status = build_cmd.status().with_context(|| "failed to run cargo build")?;
+    let build_status = build_cmd
+        .status()
+        .with_context(|| "failed to run cargo build")?;
 
     if !build_status.success() {
-        bail!("cargo build --release failed with exit code: {}", build_status);
+        bail!(
+            "cargo build --release failed with exit code: {}",
+            build_status
+        );
     }
     println!("  Build complete.");
 
     // Run the binary
     let binary_path = if let Some(ct) = cross_target {
-        output_dir.join("target").join(ct).join("release").join(&model_name)
+        output_dir
+            .join("target")
+            .join(ct)
+            .join("release")
+            .join(&model_name)
     } else {
         output_dir.join("target").join("release").join(&model_name)
     };
     if !binary_path.exists() {
-        bail!(
-            "expected binary not found at {}",
-            binary_path.display()
-        );
+        bail!("expected binary not found at {}", binary_path.display());
     }
 
     let run_prompt = prompt.unwrap_or("Hello, world!");
@@ -609,7 +646,12 @@ fn cmd_compile(
     let mut cmd = std::process::Command::new(&binary_path);
     if !embed_weights {
         cmd.arg(output_dir.join("weights.bin").to_string_lossy().to_string());
-        cmd.arg(output_dir.join("tokenizer.json").to_string_lossy().to_string());
+        cmd.arg(
+            output_dir
+                .join("tokenizer.json")
+                .to_string_lossy()
+                .to_string(),
+        );
     }
     cmd.arg(run_prompt);
 
