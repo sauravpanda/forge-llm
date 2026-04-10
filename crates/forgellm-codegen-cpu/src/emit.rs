@@ -160,6 +160,16 @@ pub fn silu(output: &mut [f32], input: &[f32]) {
     for (o, &x) in output.iter_mut().zip(input.iter()) { *o = x / (1.0 + (-x).exp()); }
 }
 
+/// Fused SiLU activation + elementwise multiply: output[i] = silu(gate[i]) * up[i]
+/// Eliminates one intermediate buffer and one memory pass compared to separate silu+mul.
+#[inline]
+pub fn silu_mul(output: &mut [f32], gate: &[f32], up: &[f32]) {
+    for i in 0..gate.len() {
+        let x = gate[i];
+        output[i] = (x / (1.0 + (-x).exp())) * up[i];
+    }
+}
+
 #[inline]
 pub fn elementwise_mul(output: &mut [f32], a: &[f32], b: &[f32]) {
     for i in 0..a.len() { output[i] = a[i] * b[i]; }
@@ -168,6 +178,12 @@ pub fn elementwise_mul(output: &mut [f32], a: &[f32], b: &[f32]) {
 #[inline]
 pub fn elementwise_add(output: &mut [f32], a: &[f32], b: &[f32]) {
     for i in 0..a.len() { output[i] = a[i] + b[i]; }
+}
+
+/// Fused residual add: accumulates in-place. a[i] += b[i]
+#[inline]
+pub fn residual_add(a: &mut [f32], b: &[f32]) {
+    for i in 0..a.len() { a[i] += b[i]; }
 }
 
 #[inline]
@@ -425,9 +441,7 @@ fn emit_forward_function(
     writeln!(code, "    let mut v = [0.0f32; {kv_size}];")?;
     writeln!(code, "    let mut attn_out = [0.0f32; {qk_size}];")?;
     writeln!(code, "    let mut attn_proj = [0.0f32; {hidden}];")?;
-    writeln!(code, "    let mut residual = [0.0f32; {hidden}];")?;
     writeln!(code, "    let mut gate = [0.0f32; {intermediate}];")?;
-    writeln!(code, "    let mut gate_act = [0.0f32; {intermediate}];")?;
     writeln!(code, "    let mut up = [0.0f32; {intermediate}];")?;
     writeln!(code, "    let mut ffn_hidden = [0.0f32; {intermediate}];")?;
     writeln!(code, "    let mut ffn_out = [0.0f32; {hidden}];")?;
@@ -497,7 +511,7 @@ fn emit_forward_function(
     )?;
     writeln!(code, "        );")?;
     writeln!(code)?;
-    writeln!(code, "        // Output projection + residual (shape-specialized)")?;
+    writeln!(code, "        // Output projection + fused residual add")?;
     writeln!(
         code,
         "        matmul_vec_{qk_size}x{hidden}(&mut attn_proj, &attn_out, &lw.o_proj);",
@@ -505,25 +519,24 @@ fn emit_forward_function(
     )?;
     writeln!(
         code,
-        "        elementwise_add(&mut residual, &hidden_state, &attn_proj);"
+        "        residual_add(&mut hidden_state, &attn_proj);"
     )?;
     writeln!(code)?;
     writeln!(code, "        // FFN norm")?;
     writeln!(
         code,
-        "        rms_norm(&mut normed, &residual, &lw.ffn_norm, RMS_NORM_EPS);"
+        "        rms_norm(&mut normed, &hidden_state, &lw.ffn_norm, RMS_NORM_EPS);"
     )?;
     writeln!(code)?;
     writeln!(
         code,
-        "        // FFN: gate_proj -> SiLU, up_proj, multiply, down_proj (shape-specialized)"
+        "        // FFN: fused silu_mul eliminates gate_act buffer"
     )?;
     writeln!(
         code,
         "        matmul_vec_{hidden}x{intermediate}(&mut gate, &normed, &lw.gate_proj);",
         hidden = hidden, intermediate = intermediate
     )?;
-    writeln!(code, "        silu(&mut gate_act, &gate);")?;
     writeln!(
         code,
         "        matmul_vec_{hidden}x{intermediate}(&mut up, &normed, &lw.up_proj);",
@@ -531,7 +544,7 @@ fn emit_forward_function(
     )?;
     writeln!(
         code,
-        "        elementwise_mul(&mut ffn_hidden, &gate_act, &up);"
+        "        silu_mul(&mut ffn_hidden, &gate, &up);"
     )?;
     writeln!(
         code,
@@ -539,10 +552,10 @@ fn emit_forward_function(
         intermediate = intermediate, hidden = hidden
     )?;
     writeln!(code)?;
-    writeln!(code, "        // Residual")?;
+    writeln!(code, "        // Fused residual add")?;
     writeln!(
         code,
-        "        elementwise_add(&mut hidden_state, &residual, &ffn_out);"
+        "        residual_add(&mut hidden_state, &ffn_out);"
     )?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
@@ -625,8 +638,10 @@ mod tests {
         assert!(code.contains("pub struct LayerWeights"));
         assert!(code.contains("pub struct KVCache"));
 
-        // Should have all kernel functions
+        // Should have all kernel functions including fused ops
         assert!(code.contains("pub fn silu("));
+        assert!(code.contains("pub fn silu_mul("));
+        assert!(code.contains("pub fn residual_add("));
         assert!(code.contains("pub fn softmax("));
         assert!(code.contains("pub fn rope("));
         assert!(code.contains("pub fn embedding("));
