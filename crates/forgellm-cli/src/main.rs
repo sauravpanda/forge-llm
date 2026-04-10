@@ -66,6 +66,10 @@ enum Commands {
         /// Rust target triple for cross-compilation (e.g., x86_64-unknown-linux-gnu)
         #[arg(long)]
         cross_target: Option<String>,
+
+        /// Path to a LoRA adapter file (.safetensors) to merge into the base weights at compile time
+        #[arg(long)]
+        lora: Option<String>,
     },
 
     /// Export model weights as a flat binary file for AOT binaries
@@ -245,6 +249,7 @@ fn main() -> Result<()> {
             tokenizer,
             embed_weights,
             cross_target,
+            lora,
         } => cmd_compile(CompileArgs {
             model_path: &model,
             target: &target,
@@ -254,6 +259,7 @@ fn main() -> Result<()> {
             tokenizer_opt: &tokenizer,
             embed_weights,
             cross_target: cross_target.as_deref(),
+            lora_path: lora.as_deref(),
         })?,
 
         Commands::ExportWeights { model, output } => cmd_export_weights(&model, &output)?,
@@ -529,6 +535,8 @@ struct CompileArgs<'a> {
     tokenizer_opt: &'a Option<String>,
     embed_weights: bool,
     cross_target: Option<&'a str>,
+    /// Optional path to a LoRA adapter (.safetensors) to merge at compile time.
+    lora_path: Option<&'a str>,
 }
 
 fn cmd_compile(args: CompileArgs<'_>) -> Result<()> {
@@ -541,6 +549,7 @@ fn cmd_compile(args: CompileArgs<'_>) -> Result<()> {
         tokenizer_opt,
         embed_weights,
         cross_target,
+        lora_path,
     } = args;
     println!("Loading model config from {model_path}...");
     let config = load_model_config(model_path)?;
@@ -562,7 +571,7 @@ fn cmd_compile(args: CompileArgs<'_>) -> Result<()> {
     if embed_weights {
         println!("Exporting weights for embedding...");
         let weights_path = output_dir.join("weights.bin");
-        cmd_export_weights(model_path, &weights_path.to_string_lossy())?;
+        cmd_export_weights_impl(model_path, &weights_path.to_string_lossy(), lora_path)?;
 
         println!("Copying tokenizer for embedding...");
         let tokenizer_src = resolve_tokenizer(tokenizer_opt, model_path)?;
@@ -650,7 +659,7 @@ fn cmd_compile(args: CompileArgs<'_>) -> Result<()> {
         let weights_path = output_dir.join("weights.bin");
         let weights_path_str = weights_path.to_string_lossy().to_string();
         println!("[1/4] Exporting weights...");
-        cmd_export_weights(model_path, &weights_path_str)?;
+        cmd_export_weights_impl(model_path, &weights_path_str, lora_path)?;
 
         println!("[2/4] Resolving tokenizer...");
         let tokenizer_src = resolve_tokenizer(tokenizer_opt, model_path)?;
@@ -1788,6 +1797,14 @@ fn cmd_models(dir: &str) -> Result<()> {
 }
 
 fn cmd_export_weights(model_path: &str, output_path: &str) -> Result<()> {
+    cmd_export_weights_impl(model_path, output_path, None)
+}
+
+fn cmd_export_weights_impl(
+    model_path: &str,
+    output_path: &str,
+    lora_path: Option<&str>,
+) -> Result<()> {
     use forgellm_frontend::ir::DType;
     use forgellm_frontend::weight_loader::{load_from_file_mixed, WeightData};
 
@@ -1797,6 +1814,12 @@ fn cmd_export_weights(model_path: &str, output_path: &str) -> Result<()> {
     let is_q8 = config.dtype == DType::Q8_0;
 
     if is_q8 {
+        if lora_path.is_some() {
+            eprintln!(
+                "Warning: LoRA merging is not supported for Q8_0 quantized models. \
+                 The LoRA adapter will be ignored."
+            );
+        }
         // Q8_0: keep projection weights as raw bytes, dequantize norm/embed to f32
         let (_gguf_file, weights) =
             load_from_file_mixed(model_path).with_context(|| "failed to load weights")?;
@@ -1888,8 +1911,21 @@ fn cmd_export_weights(model_path: &str, output_path: &str) -> Result<()> {
         );
     } else {
         // Non-Q8_0: dequantize everything to f32
-        let (_gguf_file, weights) =
+        let (_gguf_file, mut weights) =
             weight_loader::load_from_file(model_path).with_context(|| "failed to load weights")?;
+
+        // Merge LoRA adapter at compile time if one is provided
+        if let Some(lora) = lora_path {
+            eprintln!("Loading LoRA adapter from {lora}...");
+            let adapter = forgellm_frontend::load_lora(lora)
+                .with_context(|| format!("failed to load LoRA adapter from {lora}"))?;
+            eprintln!(
+                "Merging {} LoRA layer(s) into base weights...",
+                adapter.adapters.len()
+            );
+            forgellm_frontend::merge_lora(&mut weights, &adapter);
+            eprintln!("LoRA merge complete.");
+        }
 
         eprintln!(
             "Model: {} | {} layers | {} tensors | {:.1} MB",
