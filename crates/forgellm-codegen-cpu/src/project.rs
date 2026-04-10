@@ -382,7 +382,13 @@ static WEIGHTS_BYTES: &[u8] = include_bytes!("../weights.bin");
 static TOKENIZER_BYTES: &[u8] = include_bytes!("../tokenizer.json");
 
 fn bytes_to_f32(bytes: &[u8]) -> Vec<f32> {{
-    bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    let n = bytes.len() / 4;
+    let mut out = Vec::<f32>::with_capacity(n);
+    unsafe {{
+        std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const f32, out.as_mut_ptr(), n);
+        out.set_len(n);
+    }}
+    out
 }}
 
 fn save_kv_cache(path: &str, cache: &model::KVCache) {{
