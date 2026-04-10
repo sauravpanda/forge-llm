@@ -75,16 +75,40 @@ Optimized kernels (unrolled matmul) on Apple Silicon:
 | SmolLM2-360M Q8_0 | 360M | **17.5 tok/s** |
 | Qwen2.5-0.5B Q8_0 | 494M | **12.0 tok/s** |
 
+## AOT Compilation
+
+The flagship feature: compile a GGUF model into a standalone, optimized binary.
+
+```bash
+# One-command compile and run
+forge compile --model model.gguf --output ./my-model --run --prompt "Hello"
+
+# Single-file binary with embedded weights
+forge compile --model model.gguf --output ./my-model --embed-weights --run
+
+# Cross-compile for Linux
+forge compile --model model.gguf --output ./my-model --cross-target x86_64-unknown-linux-gnu
+```
+
+Generated binaries feature:
+- **Shape-specialized matmul** — all dimensions baked in at compile time
+- **Zero-allocation forward pass** — fixed-size stack arrays
+- **Fused operators** — `silu_mul`, `residual_add` reduce memory passes
+- **NEON SIMD + Rayon parallelism** — multi-core with ARM intrinsics
+- **Precomputed RoPE** — frequency table computed once at startup
+- **Full sampling** — temperature, top-k, top-p, repetition penalty
+- **Interactive chat** — `--interactive` flag for REPL mode
+- **EOS detection** — stops at end-of-sequence tokens
+- **Memory-mapped weights** — fast startup via memmap2
+
 ## CLI Commands
 
 ```bash
 # Run inference on a GGUF model
 forge run --model model.gguf --tokenizer tokenizer.json --prompt "Hello"
 
-# With chat template and system prompt
-forge run --model model.gguf --tokenizer tokenizer.json \
-  --chat --system "You are a helpful assistant" \
-  --prompt "What is Rust?"
+# Interactive chat
+forge chat --model model.gguf --tokenizer tokenizer.json
 
 # Start OpenAI-compatible API server
 forge serve --model model.gguf --tokenizer tokenizer.json --port 8080
@@ -95,8 +119,8 @@ forge bench --model model.gguf --tokenizer tokenizer.json --num-tokens 128 --run
 # Inspect model architecture
 forge info model.gguf
 
-# Compile to optimized Rust source (experimental)
-forge compile --model model.gguf --target cpu --output model.rs
+# AOT compile (see above for full options)
+forge compile --model model.gguf --output ./out --run
 ```
 
 ## Architecture
@@ -105,14 +129,14 @@ forge compile --model model.gguf --target cpu --output model.rs
 GGUF/SafeTensors → Frontend (parse) → IR Graph → Optimizer → Codegen/Interpreter → Text
 ```
 
-7 crates: `forgellm-frontend`, `forgellm-optimizer`, `forgellm-codegen-cpu`, `forgellm-codegen-wasm`, `forgellm-codegen-gpu`, `forgellm-runtime`, `forgellm-cli`
+7 crates (all [published on crates.io](https://crates.io/search?q=forgellm)): `forgellm-frontend`, `forgellm-optimizer`, `forgellm-codegen-cpu`, `forgellm-codegen-wasm`, `forgellm-codegen-gpu`, `forgellm-runtime`, `forgellm-cli`
 
 See the [full documentation](https://sauravpanda.github.io/forge-llm/) for architecture details.
 
 ## Contributing
 
 ```bash
-cargo test --workspace            # Run tests (89 tests)
+cargo test --workspace            # Run tests (105+ tests)
 cargo clippy --workspace -- -D warnings  # Lint
 cargo fmt --all -- --check        # Format check
 ```
