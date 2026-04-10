@@ -1,0 +1,48 @@
+{
+  "version": "0.2.0",
+  "date": "2026-04-09T23:00:00Z",
+  "system": {
+    "os": "Darwin",
+    "arch": "arm64",
+    "cpu": "Apple M5 Pro",
+    "cores": "18"
+  },
+  "model": {
+    "name": "SmolLM2-135M-Instruct",
+    "quant": "Q8_0",
+    "params": "135M",
+    "layers": 30,
+    "hidden_size": 576
+  },
+  "benchmarks": {
+    "interpreter": {
+      "generate_tok_s_avg": 119.7,
+      "generate_tok_s_runs": [121.2, 115.9, 121.8],
+      "prefill_tok_s_avg": 106.2,
+      "num_tokens": 64,
+      "runs": 3,
+      "memory_mb": 538.1
+    },
+    "aot": {
+      "generate_tok_s_avg": 36.2,
+      "generate_tok_s_best": 40.2,
+      "generate_tok_s_runs": [40.2, 36.4, 32.3],
+      "prefill_tok_s_avg": 35.8,
+      "num_tokens": 64,
+      "runs": 3,
+      "build_time_s": 29,
+      "binary_size_mb": 3.8,
+      "features": [
+        "shape-specialized-matmul",
+        "zero-alloc-forward",
+        "fused-silu-mul",
+        "fused-residual-add",
+        "neon-simd",
+        "rayon-parallel",
+        "rope-precompute",
+        "pre-alloc-kv-cache"
+      ]
+    }
+  },
+  "notes": "v0.2.0 baseline. AOT slower than interpreter — interpreter has more optimized NEON kernels. AOT has room for improvement in matmul throughput."
+}
