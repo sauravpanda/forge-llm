@@ -59,6 +59,8 @@ fn emit_header(code: &mut String, config: &ModelConfig) -> Result<(), CodegenErr
     writeln!(code)?;
     writeln!(code, "#![allow(clippy::excessive_precision)]")?;
     writeln!(code)?;
+    writeln!(code, "use rayon::prelude::*;")?;
+    writeln!(code)?;
     writeln!(code, "// Model constants")?;
     writeln!(
         code,
@@ -283,20 +285,43 @@ fn emit_specialized_matmul_functions(
     writeln!(code, "// All dimensions baked in at compile time — no runtime size parameters.")?;
     writeln!(code)?;
 
+    // Threshold for parallelization: only parallelize if N >= 1024
+    // (otherwise Rayon overhead dominates the compute)
+    let par_threshold = 1024;
+
     for &(k, n) in &matmul_shapes(config) {
         writeln!(code, "/// Specialized matmul: [1, {k}] x [{n}, {k}]^T -> [1, {n}]")?;
-        writeln!(code, "#[inline]")?;
-        writeln!(
-            code,
-            "fn matmul_vec_{k}x{n}(output: &mut [f32; {n}], input: &[f32; {k}], weight: &[f32]) {{"
-        )?;
-        writeln!(code, "    for j in 0..{n} {{")?;
-        writeln!(
-            code,
-            "        output[j] = dot_f32(&input[..], &weight[j*{k}..(j+1)*{k}], {k});"
-        )?;
-        writeln!(code, "    }}")?;
-        writeln!(code, "}}")?;
+        if n >= par_threshold {
+            writeln!(code, "/// Parallelized with Rayon ({n} output elements)")?;
+            writeln!(code, "#[inline]")?;
+            writeln!(
+                code,
+                "fn matmul_vec_{k}x{n}(output: &mut [f32; {n}], input: &[f32; {k}], weight: &[f32]) {{"
+            )?;
+            writeln!(
+                code,
+                "    output.par_iter_mut().enumerate().for_each(|(j, out)| {{"
+            )?;
+            writeln!(
+                code,
+                "        *out = dot_f32(&input[..], &weight[j*{k}..(j+1)*{k}], {k});"
+            )?;
+            writeln!(code, "    }});")?;
+            writeln!(code, "}}")?;
+        } else {
+            writeln!(code, "#[inline]")?;
+            writeln!(
+                code,
+                "fn matmul_vec_{k}x{n}(output: &mut [f32; {n}], input: &[f32; {k}], weight: &[f32]) {{"
+            )?;
+            writeln!(code, "    for j in 0..{n} {{")?;
+            writeln!(
+                code,
+                "        output[j] = dot_f32(&input[..], &weight[j*{k}..(j+1)*{k}], {k});"
+            )?;
+            writeln!(code, "    }}")?;
+            writeln!(code, "}}")?;
+        }
         writeln!(code)?;
     }
 
@@ -567,21 +592,17 @@ fn emit_forward_function(
         "    rms_norm(&mut normed, &hidden_state, &weights.final_norm, RMS_NORM_EPS);"
     )?;
     writeln!(code)?;
-    writeln!(code, "    // Logits projection (shape-specialized)")?;
+    writeln!(code, "    // Logits projection (parallelized — largest single matmul)")?;
     writeln!(code, "    let mut logits = vec![0.0f32; VOCAB_SIZE];")?;
     writeln!(
         code,
-        "    // Logits uses Vec since VOCAB_SIZE may be too large for stack"
+        "    logits.par_iter_mut().enumerate().for_each(|(j, out)| {{"
     )?;
     writeln!(
         code,
-        "    for j in 0..VOCAB_SIZE {{"
+        "        *out = dot_f32(&normed[..], &weights.lm_head[j*{hidden}..(j+1)*{hidden}], {hidden});"
     )?;
-    writeln!(
-        code,
-        "        logits[j] = dot_f32(&normed[..], &weights.lm_head[j*{hidden}..(j+1)*{hidden}], {hidden});"
-    )?;
-    writeln!(code, "    }}")?;
+    writeln!(code, "    }});")?;
     writeln!(code)?;
     writeln!(code, "    cache.len += 1;")?;
     writeln!(code, "    logits")?;
