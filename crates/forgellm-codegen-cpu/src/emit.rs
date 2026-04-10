@@ -626,6 +626,20 @@ fn emit_forward_function(
     writeln!(code, "            len: 0,")?;
     writeln!(code, "        }}")?;
     writeln!(code, "    }}")?;
+    writeln!(code)?;
+    writeln!(code, "    /// Reset cache without re-allocating")?;
+    writeln!(code, "    pub fn reset(&mut self) {{")?;
+    writeln!(code, "        self.len = 0;")?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
+    writeln!(code, "    /// Memory used by KV cache in bytes")?;
+    writeln!(code, "    pub fn memory_bytes(&self) -> usize {{")?;
+    writeln!(code, "        NUM_LAYERS * MAX_SEQ_LEN * {kv_size} * 4 * 2  // k + v, f32")?;
+    writeln!(code, "    }}")?;
+    writeln!(code, "}}")?;
+    writeln!(code)?;
+    writeln!(code, "impl Default for KVCache {{")?;
+    writeln!(code, "    fn default() -> Self {{ Self::new() }}")?;
     writeln!(code, "}}")?;
     writeln!(code)?;
 
