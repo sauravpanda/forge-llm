@@ -1,15 +1,31 @@
 # ForgeLLM Benchmark History
 
-Performance tracking across versions. All benchmarks run on SmolLM2-135M-Instruct Q8_0 (64 tokens, 3 runs).
+Performance tracking across versions. All benchmarks run with 64 tokens, 3 runs.
+System: Darwin arm64 18c (Apple M5 Pro).
 
-## Results
+## SmolLM2-135M Q8_0 (hidden=576, 30 layers)
 
-| Version | Date | Interpreter (tok/s) | AOT (tok/s) | AOT Build (s) | Binary Size | System |
-|---------|------|---------------------|-------------|---------------|-------------|--------|
-| v0.2.0 | 2026-04-09 | 119.7 | 36.2 avg (best: 40.2) | 29s | 3.8 MB | Darwin arm64 18c (Apple M5 Pro) |
-| v0.3.0-dev | 2026-04-09 | 119.7 | **105.2** avg (best: 105.5) | 32s | 3.8 MB | Darwin arm64 18c (Apple M5 Pro) |
-| v0.3.0-dev2 | 2026-04-09 | 119.7 | **116.2** avg (best: 117.8) | 26s | 3.8 MB | Darwin arm64 18c (Apple M5 Pro) |
-| v0.3.0-dev3 | 2026-04-09 | 119.7 | **119.9** avg (best: 122.1) | 26s | 3.8 MB | Darwin arm64 18c (Apple M5 Pro) |
+| Version | Date | Interpreter | AOT | AOT vs Interp |
+|---------|------|------------|-----|---------------|
+| v0.2.0 | 2026-04-09 | 119.7 | 36.2 (best 40.2) | 30% |
+| v0.3.0-dev1 | 2026-04-09 | 119.7 | 105.2 (best 105.5) | 88% |
+| v0.3.0-dev2 | 2026-04-09 | 119.7 | 116.2 (best 117.8) | 97% |
+| v0.3.0-dev3 | 2026-04-09 | 119.7 | 119.9 (best 122.1) | 100% |
+| v0.3.0-dev4 | 2026-04-09 | 119.7 | **119.5** (best 122.9) | **100%** |
+
+## SmolLM2-360M Q8_0 (hidden=960, 32 layers)
+
+| Version | Date | Interpreter | AOT | AOT vs Interp |
+|---------|------|------------|-----|---------------|
+| v0.3.0-dev3 | 2026-04-09 | 46.3 | 44.7 (best 44.9) | 96% |
+| v0.3.0-dev4 | 2026-04-09 | 46.3 | **47.3** (best 47.5) | **102%** |
+
+## Qwen2.5-0.5B Q8_0 (hidden=896, intermediate=4864, vocab=151936)
+
+| Version | Date | Interpreter | AOT | AOT vs Interp |
+|---------|------|------------|-----|---------------|
+| v0.3.0-dev3 | 2026-04-09 | 33.6 | 25.8 (best 26.0) | 77% |
+| v0.3.0-dev4 | 2026-04-09 | 33.6 | **34.5** (best 36.2) | **103%** |
 
 ## Analysis
 
@@ -30,6 +46,19 @@ First release with AOT compilation. Key observations:
 2. **Reduce Rayon overhead** — tune parallelism threshold for small models ✅ DONE (1024 → 4096)
 3. **Optimize logits projection** — largest single matmul (576 x 49152)
 4. **Profile-guided optimization (PGO)** — use cargo-pgo for the AOT binary
+
+### v0.3.0-dev4 — Scaling to Larger Models
+
+After verifying v0.3.0-dev3 on larger models, the parallel matmul path
+(used when N >= 4096) was found to be inefficient — `par_iter_mut`
+single-element granularity caused Rayon overhead to dominate.
+
+Fix: Replaced parallel path with `par_chunks_mut(256)` + 4-way row ILP per thread.
+
+Results across all 3 models:
+- **SmolLM-135M**: 119.5 tok/s (no regression vs dev3)
+- **SmolLM-360M**: 47.3 tok/s (was 44.7, now beats interpreter)
+- **Qwen2.5-0.5B**: 34.5 tok/s (was 25.8, +34%, now beats interpreter)
 
 ### v0.3.0-dev Results
 

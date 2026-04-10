@@ -1,0 +1,45 @@
+{
+  "version": "0.3.0-dev4",
+  "date": "2026-04-09T23:55:00Z",
+  "system": {
+    "os": "Darwin",
+    "arch": "arm64",
+    "cpu": "Apple M5 Pro",
+    "cores": 18
+  },
+  "models": {
+    "smollm2-135m-q8_0": {
+      "params": "135M",
+      "hidden": 576,
+      "layers": 30,
+      "vocab": 49152,
+      "intermediate": 1536,
+      "interpreter_tok_s": 119.7,
+      "aot_tok_s_avg": 119.5,
+      "aot_tok_s_best": 122.9,
+      "aot_vs_interp_pct": 100
+    },
+    "smollm2-360m-q8_0": {
+      "params": "360M",
+      "hidden": 960,
+      "layers": 32,
+      "vocab": 49152,
+      "interpreter_tok_s": 46.3,
+      "aot_tok_s_avg": 47.3,
+      "aot_tok_s_best": 47.5,
+      "aot_vs_interp_pct": 102
+    },
+    "qwen2.5-0.5b-q8_0": {
+      "params": "494M",
+      "hidden": 896,
+      "layers": 24,
+      "vocab": 151936,
+      "intermediate": 4864,
+      "interpreter_tok_s": 33.6,
+      "aot_tok_s_avg": 34.5,
+      "aot_tok_s_best": 36.2,
+      "aot_vs_interp_pct": 103
+    }
+  },
+  "key_change": "par_chunks_mut(256) + 4-way row ILP for parallel matmul path (was par_iter_mut with single-element granularity)"
+}

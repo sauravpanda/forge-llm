@@ -457,7 +457,8 @@ fn emit_specialized_matmul_functions(
     for &(k, n) in &matmul_shapes(config) {
         writeln!(code, "/// Specialized matmul: [1, {k}] x [{n}, {k}]^T -> [1, {n}]")?;
         if n >= par_threshold {
-            writeln!(code, "/// Parallelized with Rayon ({n} output elements)")?;
+            // Parallel path: par_chunks_mut(256) for cache locality + amortized Rayon overhead
+            writeln!(code, "/// Parallelized: par_chunks_mut(256) with 4-way row ILP per thread")?;
             writeln!(code, "#[inline]")?;
             writeln!(
                 code,
@@ -465,12 +466,23 @@ fn emit_specialized_matmul_functions(
             )?;
             writeln!(
                 code,
-                "    output.par_iter_mut().enumerate().for_each(|(j, out)| {{"
+                "    output.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
             )?;
-            writeln!(
-                code,
-                "        *out = dot_f32(&input[..], &weight[j*{k}..(j+1)*{k}], {k});"
-            )?;
+            writeln!(code, "        let base = chunk_idx * 256;")?;
+            writeln!(code, "        let len = out.len();")?;
+            writeln!(code, "        let chunks4 = len / 4;")?;
+            writeln!(code, "        for c in 0..chunks4 {{")?;
+            writeln!(code, "            let r = c * 4;")?;
+            writeln!(code, "            let j = base + r;")?;
+            writeln!(code, "            out[r]   = dot_f32(&input[..], &weight[j*{k}..(j+1)*{k}], {k});")?;
+            writeln!(code, "            out[r+1] = dot_f32(&input[..], &weight[(j+1)*{k}..(j+2)*{k}], {k});")?;
+            writeln!(code, "            out[r+2] = dot_f32(&input[..], &weight[(j+2)*{k}..(j+3)*{k}], {k});")?;
+            writeln!(code, "            out[r+3] = dot_f32(&input[..], &weight[(j+3)*{k}..(j+4)*{k}], {k});")?;
+            writeln!(code, "        }}")?;
+            writeln!(code, "        for r in (chunks4*4)..len {{")?;
+            writeln!(code, "            let j = base + r;")?;
+            writeln!(code, "            out[r] = dot_f32(&input[..], &weight[j*{k}..(j+1)*{k}], {k});")?;
+            writeln!(code, "        }}")?;
             writeln!(code, "    }});")?;
             writeln!(code, "}}")?;
         } else {
