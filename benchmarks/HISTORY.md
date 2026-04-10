@@ -8,6 +8,7 @@ Performance tracking across versions. All benchmarks run on SmolLM2-135M-Instruc
 |---------|------|---------------------|-------------|---------------|-------------|--------|
 | v0.2.0 | 2026-04-09 | 119.7 | 36.2 avg (best: 40.2) | 29s | 3.8 MB | Darwin arm64 18c (Apple M5 Pro) |
 | v0.3.0-dev | 2026-04-09 | 119.7 | **105.2** avg (best: 105.5) | 32s | 3.8 MB | Darwin arm64 18c (Apple M5 Pro) |
+| v0.3.0-dev2 | 2026-04-09 | 119.7 | **116.2** avg (best: 117.8) | 26s | 3.8 MB | Darwin arm64 18c (Apple M5 Pro) |
 
 ## Analysis
 
