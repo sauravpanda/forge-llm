@@ -104,6 +104,35 @@ fn load_weights(path: &str) -> Vec<f32> {{
     mmap.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
 }}
 
+fn save_kv_cache(path: &str, cache: &model::KVCache) {{
+    let kv = {kv_size};
+    let mut data: Vec<u8> = Vec::new();
+    data.extend_from_slice(&(cache.len as u64).to_le_bytes());
+    for layer in &cache.k {{
+        for &val in &layer[..cache.len * kv] {{ data.extend_from_slice(&val.to_le_bytes()); }}
+    }}
+    for layer in &cache.v {{
+        for &val in &layer[..cache.len * kv] {{ data.extend_from_slice(&val.to_le_bytes()); }}
+    }}
+    std::fs::write(path, &data).expect("failed to save cache");
+    eprintln!("KV cache saved ({{}} positions)", cache.len);
+}}
+
+fn load_kv_cache(path: &str, cache: &mut model::KVCache) {{
+    let kv = {kv_size};
+    let data = std::fs::read(path).expect("failed to read cache");
+    let len = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
+    let mut off = 8;
+    for layer in &mut cache.k {{
+        for i in 0..len * kv {{ layer[i] = f32::from_le_bytes(data[off..off+4].try_into().unwrap()); off += 4; }}
+    }}
+    for layer in &mut cache.v {{
+        for i in 0..len * kv {{ layer[i] = f32::from_le_bytes(data[off..off+4].try_into().unwrap()); off += 4; }}
+    }}
+    cache.len = len;
+    eprintln!("KV cache loaded ({{}} positions)", len);
+}}
+
 fn argmax(logits: &[f32]) -> u32 {{
     logits.iter().enumerate().max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap()).map(|(i, _)| i as u32).unwrap_or(0)
 }}
@@ -195,6 +224,8 @@ fn main() {{
     let top_p = parse_f32_arg(&args, "--top-p", 0.9);
     let max_tokens = parse_usize_arg(&args, "--max-tokens", 128);
     let repeat_penalty = parse_f32_arg(&args, "--repeat-penalty", 1.1);
+    let save_cache_path = args.windows(2).find(|w| w[0] == "--save-cache").map(|w| w[1].clone());
+    let load_cache_path = args.windows(2).find(|w| w[0] == "--load-cache").map(|w| w[1].clone());
     let prompt = args.iter().skip(3).filter(|a| !a.starts_with("--")).take_while(|a| !a.starts_with("--")).cloned().collect::<Vec<_>>().join(" ");
     let prompt = if prompt.is_empty() {{ "Hello".to_string() }} else {{ prompt }};
 
@@ -223,6 +254,7 @@ fn main() {{
     let lmh = w[off..off+{vocab}*{hidden}].to_vec();
     let weights = model::Weights {{ embed_tokens: embed, layers, final_norm: fnorm, lm_head: lmh }};
     let mut cache = model::KVCache::new();
+    if let Some(ref cp) = load_cache_path {{ load_kv_cache(cp, &mut cache); }}
 
     let enc = tokenizer.encode(prompt.as_str(), false).expect("encode failed");
     let tokens = enc.get_ids();
@@ -260,6 +292,7 @@ fn main() {{
     }}
     println!();
     eprintln!("Generate: {{}} tokens in {{:.2}}s ({{:.1}} tok/s)", gen_count, t1.elapsed().as_secs_f64(), gen_count as f64 / t1.elapsed().as_secs_f64());
+    if let Some(ref cp) = save_cache_path {{ save_kv_cache(cp, &cache); }}
 
     // Interactive chat mode
     if args.iter().any(|a| a == "--interactive" || a == "--chat") {{
@@ -334,6 +367,35 @@ fn bytes_to_f32(bytes: &[u8]) -> Vec<f32> {{
     bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
 }}
 
+fn save_kv_cache(path: &str, cache: &model::KVCache) {{
+    let kv = {kv_size};
+    let mut data: Vec<u8> = Vec::new();
+    data.extend_from_slice(&(cache.len as u64).to_le_bytes());
+    for layer in &cache.k {{
+        for &val in &layer[..cache.len * kv] {{ data.extend_from_slice(&val.to_le_bytes()); }}
+    }}
+    for layer in &cache.v {{
+        for &val in &layer[..cache.len * kv] {{ data.extend_from_slice(&val.to_le_bytes()); }}
+    }}
+    std::fs::write(path, &data).expect("failed to save cache");
+    eprintln!("KV cache saved ({{}} positions)", cache.len);
+}}
+
+fn load_kv_cache(path: &str, cache: &mut model::KVCache) {{
+    let kv = {kv_size};
+    let data = std::fs::read(path).expect("failed to read cache");
+    let len = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
+    let mut off = 8;
+    for layer in &mut cache.k {{
+        for i in 0..len * kv {{ layer[i] = f32::from_le_bytes(data[off..off+4].try_into().unwrap()); off += 4; }}
+    }}
+    for layer in &mut cache.v {{
+        for i in 0..len * kv {{ layer[i] = f32::from_le_bytes(data[off..off+4].try_into().unwrap()); off += 4; }}
+    }}
+    cache.len = len;
+    eprintln!("KV cache loaded ({{}} positions)", len);
+}}
+
 fn argmax(logits: &[f32]) -> u32 {{
     logits.iter().enumerate().max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap()).map(|(i, _)| i as u32).unwrap_or(0)
 }}
@@ -400,6 +462,8 @@ fn main() {{
     let top_p = parse_f32_arg(&args, "--top-p", 0.9);
     let max_tokens = parse_usize_arg(&args, "--max-tokens", 128);
     let repeat_penalty = parse_f32_arg(&args, "--repeat-penalty", 1.1);
+    let save_cache_path = args.windows(2).find(|w| w[0] == "--save-cache").map(|w| w[1].clone());
+    let load_cache_path = args.windows(2).find(|w| w[0] == "--load-cache").map(|w| w[1].clone());
     let prompt = args.iter().skip(1).filter(|a| !a.starts_with("--")).take_while(|a| !a.starts_with("--")).cloned().collect::<Vec<_>>().join(" ");
     let prompt = if prompt.is_empty() {{ "Hello".to_string() }} else {{ prompt }};
 
@@ -430,6 +494,7 @@ fn main() {{
     let lmh = w[off..off+{vocab}*{hidden}].to_vec();
     let weights = model::Weights {{ embed_tokens: embed, layers, final_norm: fnorm, lm_head: lmh }};
     let mut cache = model::KVCache::new();
+    if let Some(ref cp) = load_cache_path {{ load_kv_cache(cp, &mut cache); }}
 
     let enc = tokenizer.encode(prompt.as_str(), false).expect("encode failed");
     let tokens = enc.get_ids();
@@ -467,6 +532,7 @@ fn main() {{
     }}
     println!();
     eprintln!("Generate: {{}} tokens in {{:.2}}s ({{:.1}} tok/s)", gen_count, t1.elapsed().as_secs_f64(), gen_count as f64 / t1.elapsed().as_secs_f64());
+    if let Some(ref cp) = save_cache_path {{ save_kv_cache(cp, &cache); }}
 }}
 "##
     )
