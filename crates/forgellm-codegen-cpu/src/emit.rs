@@ -1337,6 +1337,7 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
     let kv_size = num_kv_heads * head_dim;
 
     let is_q8 = config.dtype == DType::Q8_0;
+    let is_q4 = config.dtype == DType::Q4_0;
 
     writeln!(code)?;
     writeln!(code, "/// Process a prompt sequence and fill the KV cache.")?;
@@ -1422,6 +1423,25 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
             hidden = hidden,
             kv_size = kv_size
         )?;
+    } else if is_q4 {
+        writeln!(
+            code,
+            "            matmul_vec_q4_0_{hidden}x{qk_size}(&mut q, &normed, &lw.q_proj);",
+            hidden = hidden,
+            qk_size = qk_size
+        )?;
+        writeln!(
+            code,
+            "            matmul_vec_q4_0_{hidden}x{kv_size}(&mut k, &normed, &lw.k_proj);",
+            hidden = hidden,
+            kv_size = kv_size
+        )?;
+        writeln!(
+            code,
+            "            matmul_vec_q4_0_{hidden}x{kv_size}(&mut v, &normed, &lw.v_proj);",
+            hidden = hidden,
+            kv_size = kv_size
+        )?;
     } else {
         writeln!(
             code,
@@ -1490,6 +1510,13 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
             qk_size = qk_size,
             hidden = hidden
         )?;
+    } else if is_q4 {
+        writeln!(
+            code,
+            "            matmul_vec_q4_0_{qk_size}x{hidden}(&mut attn_proj, &attn_out, &lw.o_proj);",
+            qk_size = qk_size,
+            hidden = hidden
+        )?;
     } else {
         writeln!(
             code,
@@ -1523,6 +1550,19 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
             hidden = hidden,
             intermediate = intermediate
         )?;
+    } else if is_q4 {
+        writeln!(
+            code,
+            "            matmul_vec_q4_0_{hidden}x{intermediate}(&mut gate, &normed, &lw.gate_proj);",
+            hidden = hidden,
+            intermediate = intermediate
+        )?;
+        writeln!(
+            code,
+            "            matmul_vec_q4_0_{hidden}x{intermediate}(&mut up, &normed, &lw.up_proj);",
+            hidden = hidden,
+            intermediate = intermediate
+        )?;
     } else {
         writeln!(
             code,
@@ -1542,6 +1582,13 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
         writeln!(
             code,
             "            matmul_vec_q8_0_{intermediate}x{hidden}(&mut ffn_out, &ffn_hidden, &lw.down_proj);",
+            intermediate = intermediate,
+            hidden = hidden
+        )?;
+    } else if is_q4 {
+        writeln!(
+            code,
+            "            matmul_vec_q4_0_{intermediate}x{hidden}(&mut ffn_out, &ffn_hidden, &lw.down_proj);",
             intermediate = intermediate,
             hidden = hidden
         )?;
@@ -1580,6 +1627,12 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
         writeln!(
             code,
             "                    out[r] = dot_q8_0(&normed[..], &weights.lm_head[j*{lm_row_bytes}..(j+1)*{lm_row_bytes}], {hidden});"
+        )?;
+    } else if is_q4 {
+        let lm_row_bytes = hidden.div_ceil(32) * 18;
+        writeln!(
+            code,
+            "                    out[r] = dot_q4_0(&normed[..], &weights.lm_head[j*{lm_row_bytes}..(j+1)*{lm_row_bytes}], {hidden});"
         )?;
     } else {
         writeln!(
