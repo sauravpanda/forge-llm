@@ -13,5 +13,9 @@ forgellm-optimizer = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
+[features]
+default = []
+
 [dev-dependencies]
 pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
