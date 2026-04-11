@@ -383,11 +383,19 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Load a ModelConfig from a GGUF file or HF config.json directory.
+/// Load a ModelConfig from a GGUF file, SafeTensors file, or HF config.json directory.
 fn load_model_config(model_path: &str) -> Result<ModelConfig> {
     let path = Path::new(model_path);
 
-    if path.extension().is_some_and(|ext| ext == "gguf") {
+    if path
+        .extension()
+        .is_some_and(|ext| ext == "safetensors" || ext == "st")
+    {
+        // SafeTensors file — load config via safetensors_loader (uses config.json if present).
+        let (config, _weights) = forgellm_frontend::load_safetensors(path)
+            .with_context(|| format!("failed to load SafeTensors model from {model_path}"))?;
+        Ok(config)
+    } else if path.extension().is_some_and(|ext| ext == "gguf") {
         // GGUF file
         let data = fs::read(path).with_context(|| format!("failed to read {model_path}"))?;
         let gguf_file =
@@ -1835,20 +1843,22 @@ fn cmd_export_weights_impl(
     let config = load_model_config(model_path)?;
 
     let is_q8 = config.dtype == DType::Q8_0;
+    let is_q4 = config.dtype == DType::Q4_0;
 
-    if is_q8 {
+    if is_q8 || is_q4 {
+        let quant_label = if is_q8 { "Q8_0" } else { "Q4_0" };
         if lora_path.is_some() {
             eprintln!(
-                "Warning: LoRA merging is not supported for Q8_0 quantized models. \
+                "Warning: LoRA merging is not supported for {quant_label} quantized models. \
                  The LoRA adapter will be ignored."
             );
         }
-        // Q8_0: keep projection weights as raw bytes, dequantize norm/embed to f32
+        // Quantized: keep projection weights as raw bytes, dequantize norm/embed to f32
         let (_gguf_file, weights) =
             load_from_file_mixed(model_path).with_context(|| "failed to load weights")?;
 
         eprintln!(
-            "Model: {} | {} layers | {} tensors | {:.1} MB (Q8_0 raw)",
+            "Model: {} | {} layers | {} tensors | {:.1} MB ({quant_label} raw)",
             config.architecture,
             config.num_layers,
             weights.len(),
@@ -1857,7 +1867,7 @@ fn cmd_export_weights_impl(
 
         let mut output_data: Vec<u8> = Vec::with_capacity(weights.memory_bytes());
 
-        // Write a tensor — for Q8_0 models: f32 tensors as f32 bytes, Q8_0 as raw bytes
+        // Write a tensor — for quantized models: f32 tensors as f32 bytes, raw quant as raw bytes
         let write_mixed = |data: &mut Vec<u8>, name: &str| {
             match weights.get(name) {
                 Some(WeightData::F32(v)) => {
@@ -1866,6 +1876,9 @@ fn cmd_export_weights_impl(
                     }
                 }
                 Some(WeightData::Q8_0Raw(b)) => {
+                    data.extend_from_slice(b);
+                }
+                Some(WeightData::Q4_0Raw(b)) => {
                     data.extend_from_slice(b);
                 }
                 None => {
@@ -1878,6 +1891,9 @@ fn cmd_export_weights_impl(
                                 }
                             }
                             Some(WeightData::Q8_0Raw(b)) => {
+                                data.extend_from_slice(b);
+                            }
+                            Some(WeightData::Q4_0Raw(b)) => {
                                 data.extend_from_slice(b);
                             }
                             None => panic!("neither lm_head nor embed_tokens found"),
@@ -1929,13 +1945,26 @@ fn cmd_export_weights_impl(
             .with_context(|| format!("failed to write {output_path}"))?;
 
         eprintln!(
-            "Exported {:.1} MB to {output_path} (Q8_0 raw bytes)",
+            "Exported {:.1} MB to {output_path} ({quant_label} raw bytes)",
             output_data.len() as f64 / 1e6,
         );
     } else {
-        // Non-Q8_0: dequantize everything to f32
-        let (_gguf_file, mut weights) =
-            weight_loader::load_from_file(model_path).with_context(|| "failed to load weights")?;
+        // Non-Q8_0: dequantize everything to f32.
+        // Detect file format and load accordingly.
+        let path_obj = Path::new(model_path);
+        let is_safetensors = path_obj
+            .extension()
+            .is_some_and(|ext| ext == "safetensors" || ext == "st");
+
+        let mut weights = if is_safetensors {
+            let (_cfg, w) = forgellm_frontend::load_safetensors(path_obj)
+                .with_context(|| "failed to load SafeTensors weights")?;
+            w
+        } else {
+            let (_gguf_file, w) = weight_loader::load_from_file(model_path)
+                .with_context(|| "failed to load weights")?;
+            w
+        };
 
         // Merge LoRA adapter at compile time if one is provided
         if let Some(lora) = lora_path {

@@ -157,23 +157,43 @@ fn generate_main(config: &ModelConfig) -> String {
     let qk_size = num_heads * head_dim;
     let kv_size = num_kv_heads * head_dim;
     let is_q8 = config.dtype == DType::Q8_0;
+    let is_q4 = config.dtype == DType::Q4_0;
 
     // Pre-compute Q8_0 row byte sizes (ceil(numel/32)*34 per row)
     let q8_row_bytes = |numel: usize| -> usize { numel.div_ceil(32) * 34 };
+    // Pre-compute Q4_0 row byte sizes (ceil(numel/32)*18 per row)
+    let q4_row_bytes = |numel: usize| -> usize { numel.div_ceil(32) * 18 };
 
-    // Byte sizes for Q8_0 weight tensors
-    let qp_bytes = qk_size * q8_row_bytes(hidden);
-    let kp_bytes = kv_size * q8_row_bytes(hidden);
-    let vp_bytes = kv_size * q8_row_bytes(hidden);
-    let op_bytes = hidden * q8_row_bytes(qk_size);
-    let gp_bytes = inter * q8_row_bytes(hidden);
-    let up_bytes = inter * q8_row_bytes(hidden);
-    let dp_bytes = hidden * q8_row_bytes(inter);
-    let lmh_bytes = vocab * q8_row_bytes(hidden);
+    // Byte sizes for quantized weight tensors (Q8_0 or Q4_0)
+    let (qp_bytes, kp_bytes, vp_bytes, op_bytes, gp_bytes, up_bytes, dp_bytes, lmh_bytes) = if is_q8
+    {
+        (
+            qk_size * q8_row_bytes(hidden),
+            kv_size * q8_row_bytes(hidden),
+            kv_size * q8_row_bytes(hidden),
+            hidden * q8_row_bytes(qk_size),
+            inter * q8_row_bytes(hidden),
+            inter * q8_row_bytes(hidden),
+            hidden * q8_row_bytes(inter),
+            vocab * q8_row_bytes(hidden),
+        )
+    } else {
+        // Q4_0 sizes (also used as placeholder for non-quantized, unused)
+        (
+            qk_size * q4_row_bytes(hidden),
+            kv_size * q4_row_bytes(hidden),
+            kv_size * q4_row_bytes(hidden),
+            hidden * q4_row_bytes(qk_size),
+            inter * q4_row_bytes(hidden),
+            inter * q4_row_bytes(hidden),
+            hidden * q4_row_bytes(inter),
+            vocab * q4_row_bytes(hidden),
+        )
+    };
 
-    let weight_loading_code = if is_q8 {
-        // Q8_0: load raw bytes; norm/embed are still f32
-        r##"fn load_weights_q8(path: &str) -> Vec<u8> {
+    let weight_loading_code = if is_q8 || is_q4 {
+        // Quantized: load raw bytes; norm/embed are still f32
+        r##"fn load_weights_raw(path: &str) -> Vec<u8> {
     let file = std::fs::File::open(path).expect("failed to open weights");
     let mmap = unsafe { memmap2::Mmap::map(&file) }.expect("failed to mmap weights");
     mmap.to_vec()
@@ -201,10 +221,11 @@ fn generate_main(config: &ModelConfig) -> String {
         .to_string()
     };
 
-    let weight_slice_code = if is_q8 {
-        // Q8_0: byte offsets for projection weights, f32 element offsets for norm/embed
+    let weight_slice_code = if is_q8 || is_q4 {
+        // Quantized: byte offsets for projection weights, f32 element offsets for norm/embed
+        let quant_label = if is_q8 { "Q8_0" } else { "Q4_0" };
         format!(
-            r##"    let w = load_weights_q8(weights_path);
+            r##"    let w = load_weights_raw(weights_path);
     let mut boff = 0usize;  // byte offset into raw buffer
 
     // embed_tokens: f32, interpreted from raw bytes
@@ -233,7 +254,7 @@ fn generate_main(config: &ModelConfig) -> String {
             v
         }};
         boff += an_bytes;
-        // Projection weights: Q8_0 raw bytes
+        // Projection weights: {quant_label} raw bytes
         let qp = w[boff..boff+{qp_bytes}].to_vec(); boff += {qp_bytes};
         let kp = w[boff..boff+{kp_bytes}].to_vec(); boff += {kp_bytes};
         let vp = w[boff..boff+{vp_bytes}].to_vec(); boff += {vp_bytes};
@@ -267,7 +288,7 @@ fn generate_main(config: &ModelConfig) -> String {
         v
     }};
     boff += fnorm_bytes;
-    // lm_head: Q8_0 raw bytes
+    // lm_head: {quant_label} raw bytes
     let lmh = w[boff..boff+{lmh_bytes}].to_vec();
     let weights = model::Weights {{ embed_tokens: embed, layers, final_norm: fnorm, lm_head: lmh }};"##
         )
@@ -463,15 +484,15 @@ fn main() {{
     if let Some(ref cp) = load_cache_path {{ load_kv_cache(cp, &mut cache); }}
 
     let enc = tokenizer.encode(prompt.as_str(), false).expect("encode failed");
-    let tokens = enc.get_ids();
-    eprintln!("Prompt: {{}} tokens | temp={{}} top_k={{}} max_tokens={{}}", tokens.len(), temperature, top_k, max_tokens);
+    let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
+    eprintln!("Prompt: {{}} tokens | temp={{}} top_k={{}} max_tokens={{}}", prompt_tokens.len(), temperature, top_k, max_tokens);
 
-    // Prefill
+    // Prefill: process entire prompt in one batched pass, filling the KV cache
     let t0 = std::time::Instant::now();
     let mut rng_state: u64 = seed;
-    let mut next = 0u32;
-    for &tok in tokens {{ let mut l = model::forward(tok, &weights, &mut cache); next = sample(&mut l, temperature, top_k, top_p, &mut rng_state); }}
-    eprintln!("Prefill: {{:.1}} tok/s", tokens.len() as f64 / t0.elapsed().as_secs_f64());
+    let mut logits = model::forward_prefill(&prompt_tokens, &weights, &mut cache);
+    let mut next = sample(&mut logits, temperature, top_k, top_p, &mut rng_state);
+    eprintln!("Prefill: {{:.1}} tok/s", prompt_tokens.len() as f64 / t0.elapsed().as_secs_f64());
 
     // Generate
     if !quiet {{ print!("{{}}", prompt); }}
@@ -483,7 +504,7 @@ fn main() {{
         tokenizer.token_to_id("<|im_end|>"),
         tokenizer.token_to_id("<|eot_id|>"),
     ].iter().filter_map(|t| *t).collect();
-    let mut recent_tokens: Vec<u32> = tokens.to_vec();
+    let mut recent_tokens: Vec<u32> = prompt_tokens.clone();
     let mut gen_count = 0usize;
     for _ in 0..max_tokens {{
         if eos_tokens.contains(&next) {{ break; }}
@@ -520,11 +541,9 @@ fn main() {{
             }}
 
             let enc2 = tokenizer.encode(input, false).expect("encode failed");
-            let toks2 = enc2.get_ids();
-            for &tok in toks2 {{
-                let mut l = model::forward(tok, &weights, &mut cache);
-                next = sample(&mut l, temperature, top_k, top_p, &mut rng_state);
-            }}
+            let toks2: Vec<u32> = enc2.get_ids().to_vec();
+            let mut l2 = model::forward_prefill(&toks2, &weights, &mut cache);
+            next = sample(&mut l2, temperature, top_k, top_p, &mut rng_state);
             let t2 = std::time::Instant::now();
             let mut gen2 = 0usize;
             for _ in 0..max_tokens {{
@@ -559,19 +578,37 @@ fn generate_main_embedded(config: &ModelConfig) -> String {
     let qk_size = num_heads * head_dim;
     let kv_size = num_kv_heads * head_dim;
     let is_q8 = config.dtype == DType::Q8_0;
+    let is_q4 = config.dtype == DType::Q4_0;
 
     let q8_row_bytes = |numel: usize| -> usize { numel.div_ceil(32) * 34 };
-    let qp_bytes = qk_size * q8_row_bytes(hidden);
-    let kp_bytes = kv_size * q8_row_bytes(hidden);
-    let vp_bytes = kv_size * q8_row_bytes(hidden);
-    let op_bytes = hidden * q8_row_bytes(qk_size);
-    let gp_bytes = inter * q8_row_bytes(hidden);
-    let up_bytes = inter * q8_row_bytes(hidden);
-    let dp_bytes = hidden * q8_row_bytes(inter);
-    let lmh_bytes = vocab * q8_row_bytes(hidden);
+    let q4_row_bytes = |numel: usize| -> usize { numel.div_ceil(32) * 18 };
+    let (qp_bytes, kp_bytes, vp_bytes, op_bytes, gp_bytes, up_bytes, dp_bytes, lmh_bytes) = if is_q8
+    {
+        (
+            qk_size * q8_row_bytes(hidden),
+            kv_size * q8_row_bytes(hidden),
+            kv_size * q8_row_bytes(hidden),
+            hidden * q8_row_bytes(qk_size),
+            inter * q8_row_bytes(hidden),
+            inter * q8_row_bytes(hidden),
+            hidden * q8_row_bytes(inter),
+            vocab * q8_row_bytes(hidden),
+        )
+    } else {
+        (
+            qk_size * q4_row_bytes(hidden),
+            kv_size * q4_row_bytes(hidden),
+            kv_size * q4_row_bytes(hidden),
+            hidden * q4_row_bytes(qk_size),
+            inter * q4_row_bytes(hidden),
+            inter * q4_row_bytes(hidden),
+            hidden * q4_row_bytes(inter),
+            vocab * q4_row_bytes(hidden),
+        )
+    };
 
-    let bytes_helper = if is_q8 {
-        // For Q8_0, we only need the bytes_to_f32 helper for norm/embed extraction
+    let bytes_helper = if is_q8 || is_q4 {
+        // For quantized models, we only need the bytes_to_f32 helper for norm/embed extraction
         r##"fn bytes_to_f32_slice(bytes: &[u8]) -> Vec<f32> {
     let n = bytes.len() / 4;
     let mut out = Vec::<f32>::with_capacity(n);
@@ -597,7 +634,9 @@ fn generate_main_embedded(config: &ModelConfig) -> String {
         .to_string()
     };
 
-    let weight_slice_code_embedded = if is_q8 {
+    let quant_label = if is_q8 { "Q8_0" } else { "Q4_0" };
+
+    let weight_slice_code_embedded = if is_q8 || is_q4 {
         format!(
             r##"    let w: &[u8] = WEIGHTS_BYTES;
     let mut boff = 0usize;
@@ -609,6 +648,7 @@ fn generate_main_embedded(config: &ModelConfig) -> String {
     for _ in 0..{num_layers} {{
         let an_bytes = {hidden} * 4;
         let an = bytes_to_f32_slice(&w[boff..boff+an_bytes]); boff += an_bytes;
+        // Projection weights: {quant_label} raw bytes
         let qp = w[boff..boff+{qp_bytes}].to_vec(); boff += {qp_bytes};
         let kp = w[boff..boff+{kp_bytes}].to_vec(); boff += {kp_bytes};
         let vp = w[boff..boff+{vp_bytes}].to_vec(); boff += {vp_bytes};
@@ -622,6 +662,7 @@ fn generate_main_embedded(config: &ModelConfig) -> String {
     }}
     let fnorm_bytes = {hidden} * 4;
     let fnorm = bytes_to_f32_slice(&w[boff..boff+fnorm_bytes]); boff += fnorm_bytes;
+    // lm_head: {quant_label} raw bytes
     let lmh = w[boff..boff+{lmh_bytes}].to_vec();
     let weights = model::Weights {{ embed_tokens: embed, layers, final_norm: fnorm, lm_head: lmh }};"##
         )
@@ -782,15 +823,15 @@ fn main() {{
     if let Some(ref cp) = load_cache_path {{ load_kv_cache(cp, &mut cache); }}
 
     let enc = tokenizer.encode(prompt.as_str(), false).expect("encode failed");
-    let tokens = enc.get_ids();
-    eprintln!("Prompt: {{}} tokens | temp={{}} top_k={{}} max_tokens={{}}", tokens.len(), temperature, top_k, max_tokens);
+    let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
+    eprintln!("Prompt: {{}} tokens | temp={{}} top_k={{}} max_tokens={{}}", prompt_tokens.len(), temperature, top_k, max_tokens);
 
-    // Prefill
+    // Prefill: process entire prompt in one batched pass, filling the KV cache
     let t0 = std::time::Instant::now();
     let mut rng_state: u64 = seed;
-    let mut next = 0u32;
-    for &tok in tokens {{ let mut l = model::forward(tok, &weights, &mut cache); next = sample(&mut l, temperature, top_k, top_p, &mut rng_state); }}
-    eprintln!("Prefill: {{:.1}} tok/s", tokens.len() as f64 / t0.elapsed().as_secs_f64());
+    let mut logits = model::forward_prefill(&prompt_tokens, &weights, &mut cache);
+    let mut next = sample(&mut logits, temperature, top_k, top_p, &mut rng_state);
+    eprintln!("Prefill: {{:.1}} tok/s", prompt_tokens.len() as f64 / t0.elapsed().as_secs_f64());
 
     // Generate
     if !quiet {{ print!("{{}}", prompt); }}
@@ -802,7 +843,7 @@ fn main() {{
         tokenizer.token_to_id("<|im_end|>"),
         tokenizer.token_to_id("<|eot_id|>"),
     ].iter().filter_map(|t| *t).collect();
-    let mut recent_tokens: Vec<u32> = tokens.to_vec();
+    let mut recent_tokens: Vec<u32> = prompt_tokens.clone();
     let mut gen_count = 0usize;
     for _ in 0..max_tokens {{
         if eos_tokens.contains(&next) {{ break; }}
@@ -1065,6 +1106,106 @@ mod tests {
         assert!(
             lib_rs.contains("pub mod model;"),
             "lib.rs should re-export model module"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn main_uses_forward_prefill_for_prompt() {
+        let config = tiny_config();
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let dir = std::env::temp_dir().join("forgellm_test_prefill_main");
+        let _ = fs::remove_dir_all(&dir);
+        generate_project(&graph, &dir, "test-prefill", false).unwrap();
+
+        let main = fs::read_to_string(dir.join("src/main.rs")).unwrap();
+        assert!(
+            main.contains("model::forward_prefill("),
+            "main.rs should call forward_prefill for prompt processing"
+        );
+        // Prefill call should appear before the generation loop
+        let prefill_pos = main
+            .find("model::forward_prefill(")
+            .expect("forward_prefill call missing");
+        let gen_loop_pos = main
+            .find("for _ in 0..max_tokens")
+            .expect("generation loop missing");
+        assert!(
+            prefill_pos < gen_loop_pos,
+            "forward_prefill should be called before the generation loop"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn main_uses_prompt_tokens_vec_for_prefill() {
+        let config = tiny_config();
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let dir = std::env::temp_dir().join("forgellm_test_prefill_vec");
+        let _ = fs::remove_dir_all(&dir);
+        generate_project(&graph, &dir, "test-prefill-vec", false).unwrap();
+
+        let main = fs::read_to_string(dir.join("src/main.rs")).unwrap();
+        // The tokens should be collected into a Vec<u32> and passed to forward_prefill
+        assert!(
+            main.contains("let prompt_tokens: Vec<u32>"),
+            "main.rs should collect prompt tokens into Vec<u32>"
+        );
+        assert!(
+            main.contains("model::forward_prefill(&prompt_tokens,"),
+            "main.rs should pass &prompt_tokens to forward_prefill"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn embedded_main_uses_forward_prefill_for_prompt() {
+        let config = tiny_config();
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let dir = std::env::temp_dir().join("forgellm_test_embedded_prefill");
+        let _ = fs::remove_dir_all(&dir);
+        generate_project(&graph, &dir, "test-embedded-prefill", true).unwrap();
+
+        let main = fs::read_to_string(dir.join("src/main.rs")).unwrap();
+        assert!(
+            main.contains("model::forward_prefill("),
+            "embedded main.rs should call forward_prefill for prompt processing"
+        );
+        // forward_prefill should be called before the generation loop
+        let prefill_pos = main
+            .find("model::forward_prefill(")
+            .expect("forward_prefill call missing in embedded main");
+        let gen_loop_pos = main
+            .find("for _ in 0..max_tokens")
+            .expect("generation loop missing");
+        assert!(
+            prefill_pos < gen_loop_pos,
+            "forward_prefill should be called before the generation loop in embedded mode"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn interactive_mode_uses_forward_prefill() {
+        let config = tiny_config();
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let dir = std::env::temp_dir().join("forgellm_test_interactive_prefill");
+        let _ = fs::remove_dir_all(&dir);
+        generate_project(&graph, &dir, "test-interactive-prefill", false).unwrap();
+
+        let main = fs::read_to_string(dir.join("src/main.rs")).unwrap();
+        // Interactive mode should also use forward_prefill for each user turn
+        let interactive_start = main
+            .find("Interactive mode")
+            .expect("interactive mode section missing");
+        let interactive_section = &main[interactive_start..];
+        assert!(
+            interactive_section.contains("forward_prefill("),
+            "interactive mode should use forward_prefill for user input"
         );
 
         let _ = fs::remove_dir_all(&dir);
