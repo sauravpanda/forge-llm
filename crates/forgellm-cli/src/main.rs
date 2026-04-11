@@ -7,6 +7,7 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
+use forgellm_codegen_gpu::generate_gpu_project;
 use forgellm_frontend::{
     config::HFConfig, gguf, graph_builder, hub, ir::ModelConfig, weight_loader,
 };
@@ -79,6 +80,17 @@ enum Commands {
         model: String,
 
         /// Output path for the weights binary
+        #[arg(long)]
+        output: String,
+    },
+
+    /// Export a model to ONNX format
+    ExportOnnx {
+        /// Path to input model (GGUF)
+        #[arg(long)]
+        model: String,
+
+        /// Output .onnx file path
         #[arg(long)]
         output: String,
     },
@@ -263,6 +275,18 @@ fn main() -> Result<()> {
         })?,
 
         Commands::ExportWeights { model, output } => cmd_export_weights(&model, &output)?,
+
+        Commands::ExportOnnx { model, output } => {
+            let config = load_model_config(&model)?;
+            let graph = forgellm_frontend::graph_builder::build_graph(&config)
+                .context("failed to build IR graph")?;
+            let (_, weights) = forgellm_frontend::weight_loader::load_from_file(&model)
+                .context("failed to load model weights")?;
+            let out_path = std::path::Path::new(&output);
+            forgellm_frontend::onnx_export::export_onnx(&graph, &weights, out_path)
+                .context("ONNX export failed")?;
+            println!("ONNX model written to {output}");
+        }
 
         Commands::Models { dir } => cmd_models(&dir)?,
 
@@ -608,7 +632,9 @@ fn cmd_compile(args: CompileArgs<'_>) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("project generation failed: {e}"))?,
         "wasm" => forgellm_codegen_wasm::generate_wasm_project(&optimized, output_dir, &model_name)
             .map_err(|e| anyhow::anyhow!("WASM project generation failed: {e}"))?,
-        _ => bail!("unsupported target: {target} (supported: cpu, wasm)"),
+        "gpu" => generate_gpu_project(&optimized, output_dir, &model_name)
+            .map_err(|e| anyhow::anyhow!("GPU project generation failed: {e}"))?,
+        _ => bail!("unsupported target: {target} (supported: cpu, wasm, gpu)"),
     }
 
     println!("Generated project at {output_path}/");
@@ -616,6 +642,10 @@ fn cmd_compile(args: CompileArgs<'_>) -> Result<()> {
         println!("  src/lib.rs    — SIMD128 kernels + WasmModel export");
         println!("  pkg/model.js  — JS glue layer for browser integration");
         println!("  Cargo.toml    — wasm32-unknown-unknown build configuration");
+    } else if target == "gpu" {
+        println!("  src/model.rs  — GpuModel with embedded WGSL shaders");
+        println!("  src/main.rs   — weight loader + tokenizer + GPU inference CLI");
+        println!("  Cargo.toml    — wgpu + pollster + tokenizers dependencies");
     } else {
         println!("  src/model.rs  — kernels + forward function");
         println!("  src/main.rs   — weight loader + CLI");
@@ -633,6 +663,13 @@ fn cmd_compile(args: CompileArgs<'_>) -> Result<()> {
             println!("  1. Install wasm-pack:  cargo install wasm-pack");
             println!("  2. Build:              cd {output_path} && wasm-pack build --target web --release");
             println!("  3. Output:             pkg/ directory with .wasm + JS bindings");
+        } else if target == "gpu" {
+            println!();
+            println!("Next steps:");
+            println!("  1. Export weights:  forge export-weights --model {model_path} --output {output_path}/weights.bin");
+            println!("  2. Copy tokenizer:  cp tokenizer.json {output_path}/");
+            println!("  3. Build:           cd {output_path} && cargo build --release");
+            println!("  4. Run:             ./target/release/{model_name} weights.bin tokenizer.json \"Hello\"");
         } else if embed_weights {
             println!();
             println!("Next steps:");
