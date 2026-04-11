@@ -1,0 +1,91 @@
+name: Perf Regression
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: Benchmark comparison
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need full history to checkout base branch
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bench
+
+      - name: Run benchmarks on PR branch
+        run: |
+          cargo bench -p forgellm-codegen-cpu 2>&1 | tee /tmp/pr-bench.txt
+          cp scripts/compare_bench.py /tmp/compare_bench.py
+
+      - name: Checkout base branch
+        run: |
+          git stash || true
+          git checkout ${{ github.base_ref }}
+
+      - name: Run benchmarks on base branch
+        run: cargo bench -p forgellm-codegen-cpu 2>&1 | tee /tmp/base-bench.txt
+
+      - name: Compare results and detect regressions
+        id: compare
+        run: python3 /tmp/compare_bench.py
+
+      - name: Read summary
+        id: summary
+        run: |
+          if [ -f /tmp/bench-summary.txt ]; then
+            echo "body<<EOF" >> "$GITHUB_OUTPUT"
+            cat /tmp/bench-summary.txt >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+          else
+            echo "body=No benchmark data." >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = `${{ steps.summary.outputs.body }}`;
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.data.find(c =>
+              c.user.login === 'github-actions[bot]' &&
+              c.body.includes('Benchmark comparison')
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Fail on regression
+        if: steps.compare.outputs.regression == 'true'
+        run: |
+          echo "Performance regression detected (>5% slowdown). See PR comment for details."
+          exit 1
