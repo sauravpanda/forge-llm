@@ -9,13 +9,15 @@ use std::path::Path;
 
 use crate::gguf::{self, GGMLType, GGUFFile, GGUFTensorInfo};
 
-/// Raw weight data — either f32 (dequantized) or Q8_0 raw bytes.
+/// Raw weight data — either f32 (dequantized), Q8_0 raw bytes, or Q4_0 raw bytes.
 #[derive(Debug, Clone)]
 pub enum WeightData {
     /// Fully dequantized f32 tensor.
     F32(Vec<f32>),
     /// Raw Q8_0 bytes: N_blocks * 34 bytes each block = [2 bytes f16 scale][32 bytes int8].
     Q8_0Raw(Vec<u8>),
+    /// Raw Q4_0 bytes: N_blocks * 18 bytes each block = [2 bytes f16 scale][16 bytes 4-bit pairs].
+    Q4_0Raw(Vec<u8>),
 }
 
 /// Model weights with mixed storage: Q8_0 kept as raw bytes, others as f32.
@@ -41,6 +43,14 @@ impl ModelWeightsRaw {
         }
     }
 
+    /// Get a Q4_0 raw byte tensor by name.
+    pub fn get_q4_raw(&self, name: &str) -> Option<&[u8]> {
+        match self.tensors.get(name) {
+            Some(WeightData::Q4_0Raw(v)) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+
     /// Number of loaded tensors.
     pub fn len(&self) -> usize {
         self.tensors.len()
@@ -58,6 +68,7 @@ impl ModelWeightsRaw {
             .map(|v| match v {
                 WeightData::F32(f) => f.len() * 4,
                 WeightData::Q8_0Raw(b) => b.len(),
+                WeightData::Q4_0Raw(b) => b.len(),
             })
             .sum()
     }
@@ -70,6 +81,7 @@ impl ModelWeightsRaw {
 
 /// Load all tensors from a GGUF file with mixed storage:
 /// - Q8_0 tensors are kept as raw bytes (`WeightData::Q8_0Raw`)
+/// - Q4_0 tensors are kept as raw bytes (`WeightData::Q4_0Raw`)
 /// - All other tensor types are dequantized to f32 (`WeightData::F32`)
 pub fn load_from_file_mixed(
     path: impl AsRef<std::path::Path>,
@@ -101,6 +113,8 @@ pub fn load_from_file_mixed(
 
         let weight_data = if tensor_info.ggml_type == crate::gguf::GGMLType::Q8_0 {
             WeightData::Q8_0Raw(raw.to_vec())
+        } else if tensor_info.ggml_type == crate::gguf::GGMLType::Q4_0 {
+            WeightData::Q4_0Raw(raw.to_vec())
         } else {
             let f32_data = dequantize(raw, tensor_info.ggml_type, numel)?;
             WeightData::F32(f32_data)
@@ -906,5 +920,45 @@ mod tests {
         assert!(raw.get_q8_raw("norm.weight").is_none());
         // Memory bytes: 64*4 + 68 = 256 + 68 = 324
         assert_eq!(raw.memory_bytes(), 64 * 4 + 68);
+    }
+
+    #[test]
+    fn model_weights_raw_q4_0_accessor() {
+        let mut tensors = HashMap::new();
+        tensors.insert("norm.weight".to_string(), WeightData::F32(vec![1.0f32; 64]));
+        // Q4_0: 2 blocks * 18 bytes each = 36 bytes (64 elements / 32 per block * 18)
+        tensors.insert(
+            "q_proj.weight".to_string(),
+            WeightData::Q4_0Raw(vec![0u8; 36]),
+        );
+        let raw = ModelWeightsRaw { tensors };
+
+        assert_eq!(raw.len(), 2);
+        assert!(raw.get_q4_raw("q_proj.weight").is_some());
+        assert_eq!(raw.get_q4_raw("q_proj.weight").unwrap().len(), 36);
+        // Cross-type accessors should return None
+        assert!(raw.get_f32("q_proj.weight").is_none());
+        assert!(raw.get_q8_raw("q_proj.weight").is_none());
+        assert!(raw.get_q4_raw("norm.weight").is_none());
+        // Memory bytes: 64*4 + 36 = 256 + 36 = 292
+        assert_eq!(raw.memory_bytes(), 64 * 4 + 36);
+    }
+
+    #[test]
+    fn weight_data_q4_0_raw_stored_correctly() {
+        // Build a minimal Q4_0 block (18 bytes)
+        let scale_f16: u16 = 0x3C00; // 1.0 in f16
+        let mut block = Vec::new();
+        block.extend_from_slice(&scale_f16.to_le_bytes()); // 2 bytes scale
+        block.extend(std::iter::repeat_n(0x88u8, 16)); // 16 bytes: all nibbles = 8 → 8-8=0
+
+        let wd = WeightData::Q4_0Raw(block.clone());
+        match &wd {
+            WeightData::Q4_0Raw(v) => {
+                assert_eq!(v.len(), 18);
+                assert_eq!(&v[..], &block[..]);
+            }
+            _ => panic!("expected Q4_0Raw variant"),
+        }
     }
 }
