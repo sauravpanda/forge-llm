@@ -1,0 +1,21 @@
+name: E2E Tests
+
+on:
+  schedule:
+    - cron: '0 3 * * *'   # nightly at 03:00 UTC
+  workflow_dispatch:        # allow manual trigger from the Actions UI
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  e2e:
+    name: End-to-end correctness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run E2E tests (ignored by default)
+        run: cargo test --test e2e_correctness -- --ignored --nocapture
+        working-directory: crates/forgellm-codegen-cpu
