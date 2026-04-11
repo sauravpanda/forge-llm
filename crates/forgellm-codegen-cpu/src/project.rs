@@ -157,23 +157,43 @@ fn generate_main(config: &ModelConfig) -> String {
     let qk_size = num_heads * head_dim;
     let kv_size = num_kv_heads * head_dim;
     let is_q8 = config.dtype == DType::Q8_0;
+    let is_q4 = config.dtype == DType::Q4_0;
 
     // Pre-compute Q8_0 row byte sizes (ceil(numel/32)*34 per row)
     let q8_row_bytes = |numel: usize| -> usize { numel.div_ceil(32) * 34 };
+    // Pre-compute Q4_0 row byte sizes (ceil(numel/32)*18 per row)
+    let q4_row_bytes = |numel: usize| -> usize { numel.div_ceil(32) * 18 };
 
-    // Byte sizes for Q8_0 weight tensors
-    let qp_bytes = qk_size * q8_row_bytes(hidden);
-    let kp_bytes = kv_size * q8_row_bytes(hidden);
-    let vp_bytes = kv_size * q8_row_bytes(hidden);
-    let op_bytes = hidden * q8_row_bytes(qk_size);
-    let gp_bytes = inter * q8_row_bytes(hidden);
-    let up_bytes = inter * q8_row_bytes(hidden);
-    let dp_bytes = hidden * q8_row_bytes(inter);
-    let lmh_bytes = vocab * q8_row_bytes(hidden);
+    // Byte sizes for quantized weight tensors (Q8_0 or Q4_0)
+    let (qp_bytes, kp_bytes, vp_bytes, op_bytes, gp_bytes, up_bytes, dp_bytes, lmh_bytes) = if is_q8
+    {
+        (
+            qk_size * q8_row_bytes(hidden),
+            kv_size * q8_row_bytes(hidden),
+            kv_size * q8_row_bytes(hidden),
+            hidden * q8_row_bytes(qk_size),
+            inter * q8_row_bytes(hidden),
+            inter * q8_row_bytes(hidden),
+            hidden * q8_row_bytes(inter),
+            vocab * q8_row_bytes(hidden),
+        )
+    } else {
+        // Q4_0 sizes (also used as placeholder for non-quantized, unused)
+        (
+            qk_size * q4_row_bytes(hidden),
+            kv_size * q4_row_bytes(hidden),
+            kv_size * q4_row_bytes(hidden),
+            hidden * q4_row_bytes(qk_size),
+            inter * q4_row_bytes(hidden),
+            inter * q4_row_bytes(hidden),
+            hidden * q4_row_bytes(inter),
+            vocab * q4_row_bytes(hidden),
+        )
+    };
 
-    let weight_loading_code = if is_q8 {
-        // Q8_0: load raw bytes; norm/embed are still f32
-        r##"fn load_weights_q8(path: &str) -> Vec<u8> {
+    let weight_loading_code = if is_q8 || is_q4 {
+        // Quantized: load raw bytes; norm/embed are still f32
+        r##"fn load_weights_raw(path: &str) -> Vec<u8> {
     let file = std::fs::File::open(path).expect("failed to open weights");
     let mmap = unsafe { memmap2::Mmap::map(&file) }.expect("failed to mmap weights");
     mmap.to_vec()
@@ -201,10 +221,11 @@ fn generate_main(config: &ModelConfig) -> String {
         .to_string()
     };
 
-    let weight_slice_code = if is_q8 {
-        // Q8_0: byte offsets for projection weights, f32 element offsets for norm/embed
+    let weight_slice_code = if is_q8 || is_q4 {
+        // Quantized: byte offsets for projection weights, f32 element offsets for norm/embed
+        let quant_label = if is_q8 { "Q8_0" } else { "Q4_0" };
         format!(
-            r##"    let w = load_weights_q8(weights_path);
+            r##"    let w = load_weights_raw(weights_path);
     let mut boff = 0usize;  // byte offset into raw buffer
 
     // embed_tokens: f32, interpreted from raw bytes
@@ -233,7 +254,7 @@ fn generate_main(config: &ModelConfig) -> String {
             v
         }};
         boff += an_bytes;
-        // Projection weights: Q8_0 raw bytes
+        // Projection weights: {quant_label} raw bytes
         let qp = w[boff..boff+{qp_bytes}].to_vec(); boff += {qp_bytes};
         let kp = w[boff..boff+{kp_bytes}].to_vec(); boff += {kp_bytes};
         let vp = w[boff..boff+{vp_bytes}].to_vec(); boff += {vp_bytes};
@@ -267,7 +288,7 @@ fn generate_main(config: &ModelConfig) -> String {
         v
     }};
     boff += fnorm_bytes;
-    // lm_head: Q8_0 raw bytes
+    // lm_head: {quant_label} raw bytes
     let lmh = w[boff..boff+{lmh_bytes}].to_vec();
     let weights = model::Weights {{ embed_tokens: embed, layers, final_norm: fnorm, lm_head: lmh }};"##
         )
@@ -559,19 +580,37 @@ fn generate_main_embedded(config: &ModelConfig) -> String {
     let qk_size = num_heads * head_dim;
     let kv_size = num_kv_heads * head_dim;
     let is_q8 = config.dtype == DType::Q8_0;
+    let is_q4 = config.dtype == DType::Q4_0;
 
     let q8_row_bytes = |numel: usize| -> usize { numel.div_ceil(32) * 34 };
-    let qp_bytes = qk_size * q8_row_bytes(hidden);
-    let kp_bytes = kv_size * q8_row_bytes(hidden);
-    let vp_bytes = kv_size * q8_row_bytes(hidden);
-    let op_bytes = hidden * q8_row_bytes(qk_size);
-    let gp_bytes = inter * q8_row_bytes(hidden);
-    let up_bytes = inter * q8_row_bytes(hidden);
-    let dp_bytes = hidden * q8_row_bytes(inter);
-    let lmh_bytes = vocab * q8_row_bytes(hidden);
+    let q4_row_bytes = |numel: usize| -> usize { numel.div_ceil(32) * 18 };
+    let (qp_bytes, kp_bytes, vp_bytes, op_bytes, gp_bytes, up_bytes, dp_bytes, lmh_bytes) = if is_q8
+    {
+        (
+            qk_size * q8_row_bytes(hidden),
+            kv_size * q8_row_bytes(hidden),
+            kv_size * q8_row_bytes(hidden),
+            hidden * q8_row_bytes(qk_size),
+            inter * q8_row_bytes(hidden),
+            inter * q8_row_bytes(hidden),
+            hidden * q8_row_bytes(inter),
+            vocab * q8_row_bytes(hidden),
+        )
+    } else {
+        (
+            qk_size * q4_row_bytes(hidden),
+            kv_size * q4_row_bytes(hidden),
+            kv_size * q4_row_bytes(hidden),
+            hidden * q4_row_bytes(qk_size),
+            inter * q4_row_bytes(hidden),
+            inter * q4_row_bytes(hidden),
+            hidden * q4_row_bytes(inter),
+            vocab * q4_row_bytes(hidden),
+        )
+    };
 
-    let bytes_helper = if is_q8 {
-        // For Q8_0, we only need the bytes_to_f32 helper for norm/embed extraction
+    let bytes_helper = if is_q8 || is_q4 {
+        // For quantized models, we only need the bytes_to_f32 helper for norm/embed extraction
         r##"fn bytes_to_f32_slice(bytes: &[u8]) -> Vec<f32> {
     let n = bytes.len() / 4;
     let mut out = Vec::<f32>::with_capacity(n);
@@ -597,7 +636,9 @@ fn generate_main_embedded(config: &ModelConfig) -> String {
         .to_string()
     };
 
-    let weight_slice_code_embedded = if is_q8 {
+    let quant_label = if is_q8 { "Q8_0" } else { "Q4_0" };
+
+    let weight_slice_code_embedded = if is_q8 || is_q4 {
         format!(
             r##"    let w: &[u8] = WEIGHTS_BYTES;
     let mut boff = 0usize;
@@ -609,6 +650,7 @@ fn generate_main_embedded(config: &ModelConfig) -> String {
     for _ in 0..{num_layers} {{
         let an_bytes = {hidden} * 4;
         let an = bytes_to_f32_slice(&w[boff..boff+an_bytes]); boff += an_bytes;
+        // Projection weights: {quant_label} raw bytes
         let qp = w[boff..boff+{qp_bytes}].to_vec(); boff += {qp_bytes};
         let kp = w[boff..boff+{kp_bytes}].to_vec(); boff += {kp_bytes};
         let vp = w[boff..boff+{vp_bytes}].to_vec(); boff += {vp_bytes};
@@ -622,6 +664,7 @@ fn generate_main_embedded(config: &ModelConfig) -> String {
     }}
     let fnorm_bytes = {hidden} * 4;
     let fnorm = bytes_to_f32_slice(&w[boff..boff+fnorm_bytes]); boff += fnorm_bytes;
+    // lm_head: {quant_label} raw bytes
     let lmh = w[boff..boff+{lmh_bytes}].to_vec();
     let weights = model::Weights {{ embed_tokens: embed, layers, final_norm: fnorm, lm_head: lmh }};"##
         )
