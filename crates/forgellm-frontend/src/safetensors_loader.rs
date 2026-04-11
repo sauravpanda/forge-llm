@@ -211,6 +211,7 @@ pub fn infer_model_config(
     // - Qwen2 uses q_proj.bias
     // - Llama-family models have gate_proj (SwiGLU FFN)
     // Default to Llama for any unrecognised Llama-family layout.
+    let qkv_bias = has_q_bias;
     let architecture = if has_q_bias {
         Architecture::Qwen2
     } else {
@@ -232,6 +233,8 @@ pub fn infer_model_config(
         rms_norm_eps: 1e-5,
         rope_theta: 10000.0,
         dtype,
+        sliding_window_size: None,
+        qkv_bias,
     })
 }
 

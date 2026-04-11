@@ -24,7 +24,7 @@ pub fn generate(graph: &Graph) -> Result<String, CodegenError> {
     let mut code = String::with_capacity(32 * 1024);
 
     emit_header(&mut code, config)?;
-    emit_kernel_functions(&mut code)?;
+    emit_kernel_functions(&mut code, config)?;
     if config.dtype == DType::Q8_0 {
         emit_q8_0_kernel(&mut code)?;
         emit_specialized_q8_matmul_functions(&mut code, config)?;
@@ -113,6 +113,13 @@ fn emit_header(code: &mut String, config: &ModelConfig) -> Result<(), CodegenErr
         config.rms_norm_eps
     )?;
     writeln!(code, "pub const ROPE_THETA: f32 = {:e};", config.rope_theta)?;
+    // Sliding window size: 0 means full attention (no windowing).
+    let swa = config.sliding_window_size.unwrap_or(0);
+    writeln!(
+        code,
+        "pub const SLIDING_WINDOW_SIZE: usize = {};  // 0 = full attention",
+        swa
+    )?;
     writeln!(code)?;
 
     // Aligned buffer type for SIMD-friendly memory access
@@ -136,7 +143,7 @@ fn emit_header(code: &mut String, config: &ModelConfig) -> Result<(), CodegenErr
     Ok(())
 }
 
-fn emit_kernel_functions(code: &mut String) -> Result<(), CodegenError> {
+fn emit_kernel_functions(code: &mut String, config: &ModelConfig) -> Result<(), CodegenError> {
     // Emit all kernels as a template string — includes NEON SIMD with scalar fallback
     code.push_str(
         r#"
@@ -433,6 +440,43 @@ pub fn embedding(output: &mut [f32], token_id: u32, weight: &[f32], embed_dim: u
 
 "#,
     );
+
+    // Only emit attention_sliding for models that use sliding window attention (Mistral).
+    if config.sliding_window_size.is_some() {
+        code.push_str(
+            r#"
+/// Sliding Window Attention: like `attention` but only attends to the last `window` tokens.
+/// Used by Mistral models (SWA). When seq_len <= window, behaves identically to `attention`.
+#[inline]
+pub fn attention_sliding(output: &mut [f32], q: &[f32], k_cache: &[f32], v_cache: &[f32],
+    seq_len: usize, window: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize) {
+    let start = if seq_len > window { seq_len - window } else { 0 };
+    let win_len = seq_len - start;
+    let gsize = num_heads / num_kv_heads;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let kv_stride = num_kv_heads * head_dim;
+    let mut scores = [0.0f32; MAX_SEQ_LEN];
+    for h in 0..num_heads {
+        let kv_h = h / gsize;
+        let qo = h * head_dim;
+        for (si, t) in (start..seq_len).enumerate() {
+            let ko = t * kv_stride + kv_h * head_dim;
+            scores[si] = dot_f32(&q[qo..qo+head_dim], &k_cache[ko..ko+head_dim], head_dim) * scale;
+        }
+        softmax(&mut scores[..win_len]);
+        for d in 0..head_dim {
+            let mut sum = 0.0f32;
+            for (si, t) in (start..seq_len).enumerate() {
+                sum += scores[si] * v_cache[t * kv_stride + kv_h * head_dim + d];
+            }
+            output[qo+d] = sum;
+        }
+    }
+}
+
+"#,
+        );
+    }
 
     Ok(())
 }
@@ -934,6 +978,21 @@ fn emit_forward_function(
         "    pub v_proj: {proj_type},              // [{} * {hidden}]",
         num_kv_heads * head_dim
     )?;
+    // Bias fields for Qwen2 (qkv_bias = true)
+    if config.qkv_bias {
+        writeln!(
+            code,
+            "    pub q_bias: Vec<f32>,                // [{qk_size}]  (Qwen2 Q projection bias)"
+        )?;
+        writeln!(
+            code,
+            "    pub k_bias: Vec<f32>,                // [{kv_size}]  (Qwen2 K projection bias)"
+        )?;
+        writeln!(
+            code,
+            "    pub v_bias: Vec<f32>,                // [{kv_size}]  (Qwen2 V projection bias)"
+        )?;
+    }
     writeln!(
         code,
         "    pub o_proj: {proj_type},              // [{hidden} * {}]",
@@ -1128,6 +1187,23 @@ fn emit_forward_function(
             kv_size = kv_size
         )?;
     }
+    // Optional QKV bias adds (Qwen2)
+    if config.qkv_bias {
+        writeln!(code)?;
+        writeln!(code, "        // QKV bias additions (Qwen2)")?;
+        writeln!(
+            code,
+            "        for i in 0..{qk_size} {{ q[i] += lw.q_bias[i]; }}"
+        )?;
+        writeln!(
+            code,
+            "        for i in 0..{kv_size} {{ k[i] += lw.k_bias[i]; }}"
+        )?;
+        writeln!(
+            code,
+            "        for i in 0..{kv_size} {{ v[i] += lw.v_bias[i]; }}"
+        )?;
+    }
     writeln!(code)?;
     writeln!(code, "        // RoPE")?;
     writeln!(
@@ -1155,17 +1231,28 @@ fn emit_forward_function(
     )?;
     writeln!(code)?;
     writeln!(code, "        // Attention (cache sliced to valid region)")?;
-    writeln!(code, "        attention(")?;
+    if config.sliding_window_size.is_some() {
+        writeln!(code, "        attention_sliding(")?;
+    } else {
+        writeln!(code, "        attention(")?;
+    }
     writeln!(code, "            &mut attn_out, &q,")?;
     writeln!(
         code,
         "            &cache.k[layer_idx][..(pos+1)*{kv_size}], &cache.v[layer_idx][..(pos+1)*{kv_size}],",
         kv_size = kv_size
     )?;
-    writeln!(
-        code,
-        "            pos + 1, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM,"
-    )?;
+    if config.sliding_window_size.is_some() {
+        writeln!(
+            code,
+            "            pos + 1, SLIDING_WINDOW_SIZE, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM,"
+        )?;
+    } else {
+        writeln!(
+            code,
+            "            pos + 1, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM,"
+        )?;
+    }
     writeln!(code, "        );")?;
     writeln!(code)?;
     writeln!(code, "        // Output projection + fused residual add")?;
@@ -1671,6 +1758,8 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             dtype: DType::F16,
+            sliding_window_size: None,
+            qkv_bias: false,
         }
     }
 
@@ -1726,6 +1815,8 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             dtype: DType::F16,
+            sliding_window_size: None,
+            qkv_bias: false,
         };
 
         let graph = graph_builder::build_graph(&config).unwrap();
@@ -1751,6 +1842,8 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             dtype: DType::BF16,
+            sliding_window_size: None,
+            qkv_bias: false,
         };
 
         let graph = graph_builder::build_graph(&config).unwrap();
@@ -1900,6 +1993,8 @@ mod tests {
             rms_norm_eps: 1e-6,
             rope_theta: 1e6,
             dtype: DType::F16,
+            sliding_window_size: None,
+            qkv_bias: false,
         };
         let graph = graph_builder::build_graph(&config).unwrap();
         let code = generate(&graph).unwrap();
@@ -1942,6 +2037,8 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             dtype: DType::F16,
+            sliding_window_size: None,
+            qkv_bias: false,
         };
         let graph = graph_builder::build_graph(&config).unwrap();
         let code = generate(&graph).unwrap();
@@ -2017,6 +2114,8 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             dtype: DType::Q8_0,
+            sliding_window_size: None,
+            qkv_bias: false,
         }
     }
 
@@ -2128,6 +2227,161 @@ mod tests {
         assert!(code.contains("pub lm_head: Vec<f32>"));
     }
 
+    #[test]
+    fn qwen2_config_emits_q_bias_field_in_layer_weights() {
+        let config = ModelConfig {
+            architecture: Architecture::Qwen2,
+            hidden_size: 64,
+            intermediate_size: 128,
+            num_layers: 1,
+            num_attention_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 16,
+            vocab_size: 256,
+            max_seq_len: 64,
+            rms_norm_eps: 1e-5,
+            rope_theta: 1_000_000.0,
+            dtype: DType::F16,
+            sliding_window_size: None,
+            qkv_bias: true,
+        };
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let code = generate(&graph).unwrap();
+
+        // LayerWeights should have bias fields
+        assert!(
+            code.contains("pub q_bias: Vec<f32>"),
+            "Qwen2 LayerWeights should have q_bias field"
+        );
+        assert!(
+            code.contains("pub k_bias: Vec<f32>"),
+            "Qwen2 LayerWeights should have k_bias field"
+        );
+        assert!(
+            code.contains("pub v_bias: Vec<f32>"),
+            "Qwen2 LayerWeights should have v_bias field"
+        );
+        // Forward should apply the biases
+        assert!(
+            code.contains("q[i] += lw.q_bias[i]"),
+            "Qwen2 forward should add q_bias"
+        );
+        assert!(
+            code.contains("k[i] += lw.k_bias[i]"),
+            "Qwen2 forward should add k_bias"
+        );
+        assert!(
+            code.contains("v[i] += lw.v_bias[i]"),
+            "Qwen2 forward should add v_bias"
+        );
+    }
+
+    #[test]
+    fn llama_config_does_not_emit_bias_fields() {
+        let config = tiny_config(); // Llama, qkv_bias = false
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let code = generate(&graph).unwrap();
+
+        // Llama should NOT have bias fields in LayerWeights
+        assert!(
+            !code.contains("pub q_bias:"),
+            "Llama should not have q_bias field"
+        );
+        assert!(
+            !code.contains("pub k_bias:"),
+            "Llama should not have k_bias field"
+        );
+        assert!(
+            !code.contains("pub v_bias:"),
+            "Llama should not have v_bias field"
+        );
+        // And should not call any bias adds in forward
+        assert!(
+            !code.contains("lw.q_bias"),
+            "Llama forward should not reference q_bias"
+        );
+    }
+
+    #[test]
+    fn mistral_config_with_swa_emits_attention_sliding() {
+        let config = ModelConfig {
+            architecture: Architecture::Mistral,
+            hidden_size: 64,
+            intermediate_size: 128,
+            num_layers: 1,
+            num_attention_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 16,
+            vocab_size: 256,
+            max_seq_len: 64,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            dtype: DType::F16,
+            sliding_window_size: Some(64),
+            qkv_bias: false,
+        };
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let code = generate(&graph).unwrap();
+
+        // Should emit attention_sliding function
+        assert!(
+            code.contains("pub fn attention_sliding("),
+            "Mistral with SWA should emit attention_sliding function"
+        );
+        // Forward should call attention_sliding instead of attention
+        assert!(
+            code.contains("attention_sliding("),
+            "Mistral forward should call attention_sliding"
+        );
+        // SLIDING_WINDOW_SIZE constant should be set
+        assert!(
+            code.contains("pub const SLIDING_WINDOW_SIZE: usize = 64;"),
+            "Mistral should emit SLIDING_WINDOW_SIZE = 64"
+        );
+        // The forward function should NOT have a bare `attention(` call (only `attention_sliding(`)
+        // We verify this by checking the forward() function body specifically.
+        // Note: the prefill function also calls attention() — that is expected and correct.
+        let forward_fn_start = code
+            .find("pub fn forward(token_id")
+            .expect("forward function must exist");
+        let forward_fn_end = code
+            .find("pub fn forward_prefill(")
+            .expect("forward_prefill must exist");
+        let forward_body = &code[forward_fn_start..forward_fn_end];
+        assert!(
+            !forward_body.contains("        attention(\n"),
+            "Mistral forward() should not call regular attention — only attention_sliding"
+        );
+    }
+
+    #[test]
+    fn llama_config_without_swa_emits_regular_attention() {
+        let config = tiny_config(); // Llama, no SWA
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let code = generate(&graph).unwrap();
+
+        // Should emit standard attention function (defined in kernel template)
+        assert!(
+            code.contains("pub fn attention("),
+            "Llama should emit standard attention function"
+        );
+        // SLIDING_WINDOW_SIZE should be 0 (full attention)
+        assert!(
+            code.contains("pub const SLIDING_WINDOW_SIZE: usize = 0;"),
+            "Llama should emit SLIDING_WINDOW_SIZE = 0"
+        );
+        // Forward should call regular attention
+        assert!(
+            code.contains("        attention("),
+            "Llama forward should call regular attention"
+        );
+        // Should NOT call attention_sliding in forward
+        assert!(
+            !code.contains("attention_sliding("),
+            "Llama should not call attention_sliding"
+        );
+    }
+
     fn tiny_q4_config() -> ModelConfig {
         ModelConfig {
             architecture: Architecture::Llama,
@@ -2142,6 +2396,8 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             dtype: DType::Q4_0,
+            sliding_window_size: None,
+            qkv_bias: false,
         }
     }
 

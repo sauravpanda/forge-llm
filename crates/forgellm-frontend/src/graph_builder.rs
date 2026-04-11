@@ -144,16 +144,38 @@ fn build_llama_layer(
         dtype,
     );
     let tid = graph.alloc_tensor_id();
-    let q = graph.add_node(
+    let q_matmul = graph.add_node(
         Op::MatMul,
         vec![normed, q_weight],
         TensorInfo {
             id: tid,
-            name: format!("{prefix}.q_proj"),
+            name: format!("{prefix}.q_proj_matmul"),
             shape: Shape::new(vec![1, 0, num_heads * head_dim]),
             dtype,
         },
     );
+
+    // Optional Q bias (Qwen2)
+    let q = if config.qkv_bias {
+        let q_bias = graph.load_weight(
+            format!("{prefix}.self_attn.q_proj.bias"),
+            Shape::new(vec![num_heads * head_dim]),
+            dtype,
+        );
+        let tid = graph.alloc_tensor_id();
+        graph.add_node(
+            Op::Add,
+            vec![q_matmul, q_bias],
+            TensorInfo {
+                id: tid,
+                name: format!("{prefix}.q_proj"),
+                shape: Shape::new(vec![1, 0, num_heads * head_dim]),
+                dtype,
+            },
+        )
+    } else {
+        q_matmul
+    };
 
     let k_weight = graph.load_weight(
         format!("{prefix}.self_attn.k_proj.weight"),
@@ -161,16 +183,38 @@ fn build_llama_layer(
         dtype,
     );
     let tid = graph.alloc_tensor_id();
-    let k = graph.add_node(
+    let k_matmul = graph.add_node(
         Op::MatMul,
         vec![normed, k_weight],
         TensorInfo {
             id: tid,
-            name: format!("{prefix}.k_proj"),
+            name: format!("{prefix}.k_proj_matmul"),
             shape: Shape::new(vec![1, 0, num_kv_heads * head_dim]),
             dtype,
         },
     );
+
+    // Optional K bias (Qwen2)
+    let k = if config.qkv_bias {
+        let k_bias = graph.load_weight(
+            format!("{prefix}.self_attn.k_proj.bias"),
+            Shape::new(vec![num_kv_heads * head_dim]),
+            dtype,
+        );
+        let tid = graph.alloc_tensor_id();
+        graph.add_node(
+            Op::Add,
+            vec![k_matmul, k_bias],
+            TensorInfo {
+                id: tid,
+                name: format!("{prefix}.k_proj"),
+                shape: Shape::new(vec![1, 0, num_kv_heads * head_dim]),
+                dtype,
+            },
+        )
+    } else {
+        k_matmul
+    };
 
     let v_weight = graph.load_weight(
         format!("{prefix}.self_attn.v_proj.weight"),
@@ -178,16 +222,38 @@ fn build_llama_layer(
         dtype,
     );
     let tid = graph.alloc_tensor_id();
-    let v = graph.add_node(
+    let v_matmul = graph.add_node(
         Op::MatMul,
         vec![normed, v_weight],
         TensorInfo {
             id: tid,
-            name: format!("{prefix}.v_proj"),
+            name: format!("{prefix}.v_proj_matmul"),
             shape: Shape::new(vec![1, 0, num_kv_heads * head_dim]),
             dtype,
         },
     );
+
+    // Optional V bias (Qwen2)
+    let v = if config.qkv_bias {
+        let v_bias = graph.load_weight(
+            format!("{prefix}.self_attn.v_proj.bias"),
+            Shape::new(vec![num_kv_heads * head_dim]),
+            dtype,
+        );
+        let tid = graph.alloc_tensor_id();
+        graph.add_node(
+            Op::Add,
+            vec![v_matmul, v_bias],
+            TensorInfo {
+                id: tid,
+                name: format!("{prefix}.v_proj"),
+                shape: Shape::new(vec![1, 0, num_kv_heads * head_dim]),
+                dtype,
+            },
+        )
+    } else {
+        v_matmul
+    };
 
     // RoPE on Q and K
     let tid = graph.alloc_tensor_id();
@@ -416,6 +482,8 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             dtype: DType::F16,
+            sliding_window_size: None,
+            qkv_bias: false,
         }
     }
 
@@ -433,6 +501,8 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             dtype: DType::BF16,
+            sliding_window_size: None,
+            qkv_bias: false,
         }
     }
 
@@ -521,6 +591,8 @@ mod tests {
             rms_norm_eps: 1e-6,
             rope_theta: 1000000.0,
             dtype: DType::BF16,
+            sliding_window_size: None,
+            qkv_bias: true,
         };
 
         let graph = build_graph(&config).unwrap();
@@ -528,6 +600,54 @@ mod tests {
         assert!(graph
             .weights
             .contains_key("model.layers.27.mlp.down_proj.weight"));
+        // Qwen2 with qkv_bias=true should register bias weights
+        assert!(graph
+            .weights
+            .contains_key("model.layers.0.self_attn.q_proj.bias"));
+        assert!(graph
+            .weights
+            .contains_key("model.layers.0.self_attn.k_proj.bias"));
+        assert!(graph
+            .weights
+            .contains_key("model.layers.0.self_attn.v_proj.bias"));
+    }
+
+    #[test]
+    fn qwen2_graph_has_bias_add_nodes() {
+        let config = ModelConfig {
+            architecture: Architecture::Qwen2,
+            hidden_size: 64,
+            intermediate_size: 128,
+            num_layers: 1,
+            num_attention_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 16,
+            vocab_size: 256,
+            max_seq_len: 64,
+            rms_norm_eps: 1e-5,
+            rope_theta: 1_000_000.0,
+            dtype: DType::F16,
+            sliding_window_size: None,
+            qkv_bias: true,
+        };
+
+        let graph = build_graph(&config).unwrap();
+        assert!(graph.validate().is_ok());
+
+        // Should have Add nodes for Q, K, V biases
+        let add_count = graph.nodes.iter().filter(|n| n.op == Op::Add).count();
+        assert_eq!(add_count, 3, "expected 3 Add nodes for Q/K/V biases");
+    }
+
+    #[test]
+    fn llama_graph_has_no_bias_nodes() {
+        let config = llama_1b_config();
+        let graph = build_graph(&config).unwrap();
+        assert!(graph.validate().is_ok());
+
+        // Llama has no bias nodes
+        let add_count = graph.nodes.iter().filter(|n| n.op == Op::Add).count();
+        assert_eq!(add_count, 0, "Llama should have no bias Add nodes");
     }
 
     #[test]
@@ -541,6 +661,7 @@ mod tests {
             Architecture::Gemma,
             Architecture::StableLM,
         ] {
+            let qkv_bias = matches!(arch, Architecture::Qwen2);
             let config = ModelConfig {
                 architecture: arch.clone(),
                 hidden_size: 64,
@@ -554,6 +675,8 @@ mod tests {
                 rms_norm_eps: 1e-5,
                 rope_theta: 10000.0,
                 dtype: DType::F16,
+                sliding_window_size: None,
+                qkv_bias,
             };
             let result = build_graph(&config);
             assert!(result.is_ok(), "failed to build graph for {arch}");

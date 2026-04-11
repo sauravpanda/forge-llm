@@ -35,6 +35,9 @@ pub struct HFConfig {
 
     /// Data type
     pub torch_dtype: Option<String>,
+
+    /// Sliding window attention size (Mistral).
+    pub sliding_window: Option<usize>,
 }
 
 impl HFConfig {
@@ -107,6 +110,12 @@ impl HFConfig {
             .map(parse_torch_dtype)
             .unwrap_or(DType::F16);
 
+        // Qwen2 uses bias on Q, K, V projections.
+        let qkv_bias = matches!(architecture, Architecture::Qwen2);
+
+        // Sliding window comes from config.json `sliding_window` field (Mistral).
+        let sliding_window_size = self.sliding_window;
+
         Some(ModelConfig {
             architecture,
             hidden_size,
@@ -120,6 +129,8 @@ impl HFConfig {
             rms_norm_eps: norm_eps as f32,
             rope_theta: self.rope_theta.unwrap_or(10000.0) as f32,
             dtype,
+            sliding_window_size,
+            qkv_bias,
         })
     }
 }
@@ -166,6 +177,8 @@ mod tests {
         assert_eq!(mc.head_dim, 64);
         assert_eq!(mc.vocab_size, 32000);
         assert_eq!(mc.dtype, DType::F16);
+        assert!(!mc.qkv_bias);
+        assert_eq!(mc.sliding_window_size, None);
     }
 
     #[test]
@@ -193,6 +206,36 @@ mod tests {
         assert_eq!(mc.num_kv_heads, 2);
         assert_eq!(mc.dtype, DType::BF16);
         assert_eq!(mc.head_dim, 128);
+        // Qwen2 always sets qkv_bias = true
+        assert!(mc.qkv_bias);
+        assert_eq!(mc.sliding_window_size, None);
+    }
+
+    #[test]
+    fn parse_mistral_config_with_sliding_window() {
+        let json = r#"{
+            "model_type": "mistral",
+            "architectures": ["MistralForCausalLM"],
+            "hidden_size": 4096,
+            "intermediate_size": 14336,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "vocab_size": 32000,
+            "max_position_embeddings": 4096,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0,
+            "sliding_window": 4096,
+            "torch_dtype": "float16"
+        }"#;
+
+        let config = HFConfig::from_json(json.as_bytes()).unwrap();
+        assert_eq!(config.detect_architecture(), Some(Architecture::Mistral));
+
+        let mc = config.to_model_config().unwrap();
+        assert_eq!(mc.architecture, Architecture::Mistral);
+        assert_eq!(mc.sliding_window_size, Some(4096));
+        assert!(!mc.qkv_bias);
     }
 
     #[test]
