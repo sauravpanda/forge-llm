@@ -27,8 +27,7 @@ jobs:
           key: bench
 
       - name: Run benchmarks on PR branch
-        run: |
-          cargo bench -p forgellm-codegen-cpu 2>&1 | tee /tmp/pr-bench.txt
+        run: cargo bench -p forgellm-codegen-cpu 2>&1 | tee /tmp/pr-bench.txt
 
       - name: Checkout base branch
         run: |
@@ -36,96 +35,11 @@ jobs:
           git checkout ${{ github.base_ref }}
 
       - name: Run benchmarks on base branch
-        run: |
-          cargo bench -p forgellm-codegen-cpu 2>&1 | tee /tmp/base-bench.txt
+        run: cargo bench -p forgellm-codegen-cpu 2>&1 | tee /tmp/base-bench.txt
 
       - name: Compare results and detect regressions
         id: compare
-        run: |
-          python3 - << 'EOF'
-          import re, sys, os
-
-          REGRESSION_THRESHOLD = 0.05  # 5%
-
-          # Convert criterion units to nanoseconds
-          UNIT_TO_NS = {
-              'ps': 1e-3, 'ns': 1.0,
-              'µs': 1e3, 'us': 1e3,
-              'ms': 1e6, 's': 1e9,
-          }
-
-          def parse_bench_txt(path):
-              """Parse criterion human-readable output.
-              Lines look like:
-                graph_build/tiny    time:   [1.234 µs  1.256 µs  1.278 µs]
-              The middle value is the point estimate.
-              """
-              results = {}
-              try:
-                  with open(path, encoding="utf-8", errors="replace") as f:
-                      for line in f:
-                          # Match: name <2+ spaces> time: <space> [lo unit <sp> mid unit <sp> hi unit]
-                          m = re.search(
-                              r'^(.+?)\s{2,}time:\s+\['
-                              r'[\d.]+ [a-zµ]+\s+'   # lower bound (skip)
-                              r'([\d.]+) ([a-zµ]+)\s+'  # point estimate
-                              r'[\d.]+ [a-zµ]+\s*\]',
-                              line,
-                          )
-                          if m:
-                              name = m.group(1).strip()
-                              val  = float(m.group(2))
-                              unit = m.group(3)
-                              ns   = val * UNIT_TO_NS.get(unit, 1.0)
-                              results[name] = ns
-              except FileNotFoundError:
-                  pass
-              return results
-
-          base = parse_bench_txt("/tmp/base-bench.txt")
-          pr   = parse_bench_txt("/tmp/pr-bench.txt")
-
-          if not base or not pr:
-              print("No benchmark data found — skipping comparison.")
-              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-                  f.write("regression=false\n")
-              with open("/tmp/bench-summary.txt", "w") as f:
-                  f.write("No benchmark data available (benches may not have run).")
-              sys.exit(0)
-
-          rows = []
-          regression_found = False
-          for name in sorted(set(base) | set(pr)):
-              b = base.get(name, 0)
-              p = pr.get(name, 0)
-              if b == 0 or p == 0:
-                  rows.append(f"| `{name}` | N/A | N/A | N/A |")
-                  continue
-              ratio = (p - b) / b
-              pct = f"{ratio * 100:+.1f}%"
-              flag = ""
-              if ratio > REGRESSION_THRESHOLD:
-                  flag = " ⚠️ REGRESSION"
-                  regression_found = True
-              elif ratio < -0.05:
-                  flag = " ✅ improvement"
-              rows.append(f"| `{name}` | {b/1e6:.3f} ms | {p/1e6:.3f} ms | {pct}{flag} |")
-
-          table = "\n".join(rows)
-          summary = f"""### Benchmark comparison (base → PR)
-
-| Benchmark | Base (ms) | PR (ms) | Change |
-|-----------|-----------|---------|--------|
-{table}
-
-> Threshold: >{REGRESSION_THRESHOLD*100:.0f}% slowdown flagged as regression.
-"""
-
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"regression={'true' if regression_found else 'false'}\n")
-          with open("/tmp/bench-summary.txt", "w") as f:
-              f.write(summary)
-          EOF
+        run: python3 scripts/compare_bench.py
 
       - name: Read summary
         id: summary
