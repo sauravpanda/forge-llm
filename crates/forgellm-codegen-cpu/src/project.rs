@@ -977,6 +977,15 @@ mod tests {
     }
 
     #[test]
+    fn generate_main_has_rayon_in_cargo() {
+        let toml = generate_cargo_toml("my-model");
+        assert!(
+            toml.contains("rayon"),
+            "generated Cargo.toml should contain rayon dependency"
+        );
+    }
+
+    #[test]
     fn chat_clear_uses_reset_not_new() {
         // The /clear command should use cache.reset() not KVCache::new()
         // (which would re-allocate the entire cache).

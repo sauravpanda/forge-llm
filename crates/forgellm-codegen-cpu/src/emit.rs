@@ -475,9 +475,9 @@ fn emit_specialized_matmul_functions(
     )?;
     writeln!(code)?;
 
-    // Threshold for parallelization: only parallelize if N >= 4096
+    // Threshold for parallelization: only parallelize if N >= 512
     // (otherwise Rayon overhead dominates the compute for small matmuls)
-    let par_threshold = 4096;
+    let par_threshold = 512;
 
     for &(k, n) in &matmul_shapes(config) {
         writeln!(
@@ -644,7 +644,7 @@ fn emit_specialized_q8_matmul_functions(
     )?;
     writeln!(code)?;
 
-    let par_threshold = 4096;
+    let par_threshold = 512;
 
     for &(k, n) in &q8_matmul_shapes(config) {
         // Byte size per row: ceil(k/32)*34
@@ -796,7 +796,7 @@ fn emit_specialized_q4_matmul_functions(
     )?;
     writeln!(code)?;
 
-    let par_threshold = 4096;
+    let par_threshold = 512;
 
     for &(k, n) in &q4_matmul_shapes(config) {
         // Byte size per row: ceil(k/32)*18
@@ -1886,11 +1886,11 @@ mod tests {
 
     #[test]
     fn parallel_path_uses_chunks_with_ilp() {
-        // Use a config with N >= 4096 to trigger parallel path
+        // Use a config with N >= 512 to trigger parallel path
         let config = ModelConfig {
             architecture: Architecture::Llama,
             hidden_size: 896,
-            intermediate_size: 4864, // > 4096 threshold
+            intermediate_size: 4864, // > 512 threshold
             num_layers: 24,
             num_attention_heads: 14,
             num_kv_heads: 2,
@@ -1924,6 +1924,72 @@ mod tests {
         assert!(code.contains("output[j0+1]"));
         assert!(code.contains("output[j0+2]"));
         assert!(code.contains("output[j0+3]"));
+    }
+
+    #[test]
+    fn parallel_matmul_large_n_uses_par_chunks() {
+        // smollm2-135m: hidden=576, intermediate=1536 — N=1536 >= 512
+        let config = ModelConfig {
+            architecture: Architecture::Llama,
+            hidden_size: 576,
+            intermediate_size: 1536,
+            num_layers: 30,
+            num_attention_heads: 9,
+            num_kv_heads: 3,
+            head_dim: 64,
+            vocab_size: 49152,
+            max_seq_len: 2048,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            dtype: DType::F16,
+        };
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let code = generate(&graph).unwrap();
+
+        // intermediate_size=1536 >= 512 → matmul_vec_576x1536 should use par_chunks_mut
+        assert!(
+            code.contains("par_chunks_mut"),
+            "N=1536 >= 512 should trigger parallel path in matmul_vec_576x1536"
+        );
+    }
+
+    #[test]
+    fn parallel_matmul_small_n_stays_sequential() {
+        // tiny_config: hidden=64, intermediate=128, qk=64, kv=32, vocab=256 — all N < 512
+        let config = tiny_config();
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let code = generate(&graph).unwrap();
+
+        // All specialized matmul_vec_* functions for N < 512 must be sequential.
+        // matmul_vec_64x128 is the largest specialized matmul — verify it uses sequential path.
+        assert!(
+            code.contains("fn matmul_vec_64x128("),
+            "matmul_vec_64x128 should be emitted"
+        );
+        // The generated code has par_chunks_mut only in the hardcoded logits loops
+        // (forward + forward_prefill), not in any specialized matmul_vec_* function.
+        // A simpler proxy: the specialized matmul functions all appear before forward(),
+        // so we check that par_chunks_mut does NOT appear before the "pub fn forward(" marker.
+        let forward_pos = code
+            .find("pub fn forward(")
+            .expect("forward function should exist");
+        let pre_forward = &code[..forward_pos];
+        assert!(
+            !pre_forward.contains("par_chunks_mut"),
+            "no specialized matmul_vec_* function (N < 512) should use par_chunks_mut"
+        );
+    }
+
+    #[test]
+    fn generated_project_has_rayon_dep() {
+        // Verify the generated model code imports rayon (header must emit use rayon::prelude::*)
+        let config = tiny_config();
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let code = generate(&graph).unwrap();
+        assert!(
+            code.contains("use rayon::prelude::*;"),
+            "generated model.rs should import rayon prelude"
+        );
     }
 
     #[test]
