@@ -2341,8 +2341,12 @@ mod tests {
         // The forward function should NOT have a bare `attention(` call (only `attention_sliding(`)
         // We verify this by checking the forward() function body specifically.
         // Note: the prefill function also calls attention() — that is expected and correct.
-        let forward_fn_start = code.find("pub fn forward(token_id").expect("forward function must exist");
-        let forward_fn_end = code.find("pub fn forward_prefill(").expect("forward_prefill must exist");
+        let forward_fn_start = code
+            .find("pub fn forward(token_id")
+            .expect("forward function must exist");
+        let forward_fn_end = code
+            .find("pub fn forward_prefill(")
+            .expect("forward_prefill must exist");
         let forward_body = &code[forward_fn_start..forward_fn_end];
         assert!(
             !forward_body.contains("        attention(\n"),
@@ -2504,5 +2508,4 @@ mod tests {
         assert!(code.contains("pub q_proj: Vec<f32>"));
         assert!(code.contains("pub lm_head: Vec<f32>"));
     }
-
 }
