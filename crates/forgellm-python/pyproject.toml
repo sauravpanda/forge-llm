@@ -1,0 +1,24 @@
+[build-system]
+requires = ["maturin>=1,<2"]
+build-backend = "maturin"
+
+[project]
+name = "forgellm"
+requires-python = ">=3.8"
+description = "Python bindings for ForgeLLM — AOT compiler for small LLMs"
+license = {text = "MIT"}
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[tool.maturin]
+# The Rust crate to build (relative to pyproject.toml)
+manifest-path = "Cargo.toml"
+# Module name matches the #[pymodule] name in src/lib.rs
+module-name = "forgellm"

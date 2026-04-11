@@ -7,6 +7,7 @@ members = [
     "crates/forgellm-codegen-gpu",
     "crates/forgellm-runtime",
     "crates/forgellm-cli",
+    "crates/forgellm-python",
 ]
 resolver = "2"
 
