@@ -25,6 +25,8 @@ fn tiny_config() -> ModelConfig {
         rms_norm_eps: 1e-5,
         rope_theta: 10000.0,
         dtype: DType::F32,
+        sliding_window_size: None,
+        qkv_bias: false,
     }
 }
 
@@ -42,6 +44,8 @@ fn small_config() -> ModelConfig {
         rms_norm_eps: 1e-5,
         rope_theta: 10000.0,
         dtype: DType::F32,
+        sliding_window_size: None,
+        qkv_bias: false,
     }
 }
 

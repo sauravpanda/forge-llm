@@ -81,6 +81,8 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             dtype: DType::F16,
+            sliding_window_size: None,
+            qkv_bias: false,
         };
 
         let graph = graph_builder::build_graph(&config).unwrap();
@@ -106,6 +108,8 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             dtype: DType::F16,
+            sliding_window_size: None,
+            qkv_bias: false,
         };
 
         let graph = graph_builder::build_graph(&config).unwrap();

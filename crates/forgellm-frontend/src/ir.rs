@@ -326,6 +326,13 @@ pub struct ModelConfig {
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
     pub dtype: DType,
+    /// Sliding window attention size. `None` means full attention (Llama).
+    /// `Some(n)` means each token only attends to the last `n` tokens (Mistral SWA).
+    #[serde(default)]
+    pub sliding_window_size: Option<usize>,
+    /// Whether Q, K, V projections have bias terms. `true` for Qwen2.
+    #[serde(default)]
+    pub qkv_bias: bool,
 }
 
 /// The computation graph — the central IR artifact.
@@ -609,6 +616,8 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             dtype: DType::F16,
+            sliding_window_size: None,
+            qkv_bias: false,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -616,6 +625,56 @@ mod tests {
         assert_eq!(deserialized.architecture, Architecture::Llama);
         assert_eq!(deserialized.hidden_size, 2048);
         assert_eq!(deserialized.num_kv_heads, 8);
+    }
+
+    #[test]
+    fn mistral_architecture_roundtrip() {
+        let config = ModelConfig {
+            architecture: Architecture::Mistral,
+            hidden_size: 4096,
+            intermediate_size: 14336,
+            num_layers: 32,
+            num_attention_heads: 32,
+            num_kv_heads: 8,
+            head_dim: 128,
+            vocab_size: 32000,
+            max_seq_len: 4096,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            dtype: DType::F16,
+            sliding_window_size: Some(4096),
+            qkv_bias: false,
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: ModelConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.architecture, Architecture::Mistral);
+        assert_eq!(deserialized.sliding_window_size, Some(4096));
+        assert!(!deserialized.qkv_bias);
+    }
+
+    #[test]
+    fn qwen2_architecture_sets_qkv_bias() {
+        let config = ModelConfig {
+            architecture: Architecture::Qwen2,
+            hidden_size: 1536,
+            intermediate_size: 8960,
+            num_layers: 28,
+            num_attention_heads: 12,
+            num_kv_heads: 2,
+            head_dim: 128,
+            vocab_size: 151936,
+            max_seq_len: 32768,
+            rms_norm_eps: 1e-6,
+            rope_theta: 1_000_000.0,
+            dtype: DType::BF16,
+            sliding_window_size: None,
+            qkv_bias: true,
+        };
+
+        assert!(config.qkv_bias);
+        assert_eq!(config.architecture, Architecture::Qwen2);
+        assert_eq!(config.sliding_window_size, None);
     }
 
     #[test]
@@ -633,6 +692,8 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             dtype: DType::F16,
+            sliding_window_size: None,
+            qkv_bias: false,
         };
 
         let graph = Graph::new("llama-1b").with_config(config);

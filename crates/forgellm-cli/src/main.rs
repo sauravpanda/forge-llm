@@ -460,6 +460,14 @@ fn load_model_config(model_path: &str) -> Result<ModelConfig> {
             _ => bail!("unsupported GGUF architecture: {arch_name}"),
         };
 
+        // Sliding window attention size — Mistral uses `llm.attention.sliding_window`.
+        let sliding_window_size = gguf_file
+            .get_u32(&format!("{prefix}.attention.sliding_window"))
+            .map(|v| v as usize);
+
+        // Qwen2 has bias terms on Q, K, V projections.
+        let qkv_bias = matches!(architecture, forgellm_frontend::ir::Architecture::Qwen2);
+
         Ok(ModelConfig {
             architecture,
             hidden_size,
@@ -473,6 +481,8 @@ fn load_model_config(model_path: &str) -> Result<ModelConfig> {
             rms_norm_eps,
             rope_theta,
             dtype: forgellm_frontend::ir::DType::F16,
+            sliding_window_size,
+            qkv_bias,
         })
     } else if path.is_dir() {
         // HuggingFace directory with config.json
