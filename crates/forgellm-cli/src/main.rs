@@ -83,6 +83,17 @@ enum Commands {
         output: String,
     },
 
+    /// Export a model to ONNX format
+    ExportOnnx {
+        /// Path to input model (GGUF)
+        #[arg(long)]
+        model: String,
+
+        /// Output .onnx file path
+        #[arg(long)]
+        output: String,
+    },
+
     /// Inspect a model file and show its architecture info
     Info {
         /// Path to GGUF model file or directory with config.json
@@ -263,6 +274,18 @@ fn main() -> Result<()> {
         })?,
 
         Commands::ExportWeights { model, output } => cmd_export_weights(&model, &output)?,
+
+        Commands::ExportOnnx { model, output } => {
+            let config = load_model_config(&model)?;
+            let graph = forgellm_frontend::graph_builder::build_graph(&config)
+                .context("failed to build IR graph")?;
+            let (_, weights) = forgellm_frontend::weight_loader::load_from_file(&model)
+                .context("failed to load model weights")?;
+            let out_path = std::path::Path::new(&output);
+            forgellm_frontend::onnx_export::export_onnx(&graph, &weights, out_path)
+                .context("ONNX export failed")?;
+            println!("ONNX model written to {output}");
+        }
 
         Commands::Models { dir } => cmd_models(&dir)?,
 
