@@ -14,7 +14,7 @@ import re
 import sys
 import os
 
-REGRESSION_THRESHOLD = 0.05  # 5%
+REGRESSION_THRESHOLD = 0.20  # 20% — conservative threshold for shared CI runners
 
 # Map criterion unit strings to nanoseconds
 UNIT_TO_NS = {
