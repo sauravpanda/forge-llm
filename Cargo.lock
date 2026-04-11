@@ -443,6 +443,7 @@ dependencies = [
  "forgellm-frontend",
  "forgellm-optimizer",
  "pretty_assertions",
+ "syn",
  "tempfile",
  "thiserror",
  "tracing",
