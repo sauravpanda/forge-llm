@@ -360,11 +360,19 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Load a ModelConfig from a GGUF file or HF config.json directory.
+/// Load a ModelConfig from a GGUF file, SafeTensors file, or HF config.json directory.
 fn load_model_config(model_path: &str) -> Result<ModelConfig> {
     let path = Path::new(model_path);
 
-    if path.extension().is_some_and(|ext| ext == "gguf") {
+    if path
+        .extension()
+        .is_some_and(|ext| ext == "safetensors" || ext == "st")
+    {
+        // SafeTensors file — load config via safetensors_loader (uses config.json if present).
+        let (config, _weights) = forgellm_frontend::load_safetensors(path)
+            .with_context(|| format!("failed to load SafeTensors model from {model_path}"))?;
+        Ok(config)
+    } else if path.extension().is_some_and(|ext| ext == "gguf") {
         // GGUF file
         let data = fs::read(path).with_context(|| format!("failed to read {model_path}"))?;
         let gguf_file =
@@ -1918,9 +1926,22 @@ fn cmd_export_weights_impl(
             output_data.len() as f64 / 1e6,
         );
     } else {
-        // Non-Q8_0: dequantize everything to f32
-        let (_gguf_file, mut weights) =
-            weight_loader::load_from_file(model_path).with_context(|| "failed to load weights")?;
+        // Non-Q8_0: dequantize everything to f32.
+        // Detect file format and load accordingly.
+        let path_obj = Path::new(model_path);
+        let is_safetensors = path_obj
+            .extension()
+            .is_some_and(|ext| ext == "safetensors" || ext == "st");
+
+        let mut weights = if is_safetensors {
+            let (_cfg, w) = forgellm_frontend::load_safetensors(path_obj)
+                .with_context(|| "failed to load SafeTensors weights")?;
+            w
+        } else {
+            let (_gguf_file, w) = weight_loader::load_from_file(model_path)
+                .with_context(|| "failed to load weights")?;
+            w
+        };
 
         // Merge LoRA adapter at compile time if one is provided
         if let Some(lora) = lora_path {

@@ -484,15 +484,15 @@ fn main() {{
     if let Some(ref cp) = load_cache_path {{ load_kv_cache(cp, &mut cache); }}
 
     let enc = tokenizer.encode(prompt.as_str(), false).expect("encode failed");
-    let tokens = enc.get_ids();
-    eprintln!("Prompt: {{}} tokens | temp={{}} top_k={{}} max_tokens={{}}", tokens.len(), temperature, top_k, max_tokens);
+    let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
+    eprintln!("Prompt: {{}} tokens | temp={{}} top_k={{}} max_tokens={{}}", prompt_tokens.len(), temperature, top_k, max_tokens);
 
-    // Prefill
+    // Prefill: process entire prompt in one batched pass, filling the KV cache
     let t0 = std::time::Instant::now();
     let mut rng_state: u64 = seed;
-    let mut next = 0u32;
-    for &tok in tokens {{ let mut l = model::forward(tok, &weights, &mut cache); next = sample(&mut l, temperature, top_k, top_p, &mut rng_state); }}
-    eprintln!("Prefill: {{:.1}} tok/s", tokens.len() as f64 / t0.elapsed().as_secs_f64());
+    let mut logits = model::forward_prefill(&prompt_tokens, &weights, &mut cache);
+    let mut next = sample(&mut logits, temperature, top_k, top_p, &mut rng_state);
+    eprintln!("Prefill: {{:.1}} tok/s", prompt_tokens.len() as f64 / t0.elapsed().as_secs_f64());
 
     // Generate
     if !quiet {{ print!("{{}}", prompt); }}
@@ -504,7 +504,7 @@ fn main() {{
         tokenizer.token_to_id("<|im_end|>"),
         tokenizer.token_to_id("<|eot_id|>"),
     ].iter().filter_map(|t| *t).collect();
-    let mut recent_tokens: Vec<u32> = tokens.to_vec();
+    let mut recent_tokens: Vec<u32> = prompt_tokens.clone();
     let mut gen_count = 0usize;
     for _ in 0..max_tokens {{
         if eos_tokens.contains(&next) {{ break; }}
@@ -541,11 +541,9 @@ fn main() {{
             }}
 
             let enc2 = tokenizer.encode(input, false).expect("encode failed");
-            let toks2 = enc2.get_ids();
-            for &tok in toks2 {{
-                let mut l = model::forward(tok, &weights, &mut cache);
-                next = sample(&mut l, temperature, top_k, top_p, &mut rng_state);
-            }}
+            let toks2: Vec<u32> = enc2.get_ids().to_vec();
+            let mut l2 = model::forward_prefill(&toks2, &weights, &mut cache);
+            next = sample(&mut l2, temperature, top_k, top_p, &mut rng_state);
             let t2 = std::time::Instant::now();
             let mut gen2 = 0usize;
             for _ in 0..max_tokens {{
@@ -825,15 +823,15 @@ fn main() {{
     if let Some(ref cp) = load_cache_path {{ load_kv_cache(cp, &mut cache); }}
 
     let enc = tokenizer.encode(prompt.as_str(), false).expect("encode failed");
-    let tokens = enc.get_ids();
-    eprintln!("Prompt: {{}} tokens | temp={{}} top_k={{}} max_tokens={{}}", tokens.len(), temperature, top_k, max_tokens);
+    let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
+    eprintln!("Prompt: {{}} tokens | temp={{}} top_k={{}} max_tokens={{}}", prompt_tokens.len(), temperature, top_k, max_tokens);
 
-    // Prefill
+    // Prefill: process entire prompt in one batched pass, filling the KV cache
     let t0 = std::time::Instant::now();
     let mut rng_state: u64 = seed;
-    let mut next = 0u32;
-    for &tok in tokens {{ let mut l = model::forward(tok, &weights, &mut cache); next = sample(&mut l, temperature, top_k, top_p, &mut rng_state); }}
-    eprintln!("Prefill: {{:.1}} tok/s", tokens.len() as f64 / t0.elapsed().as_secs_f64());
+    let mut logits = model::forward_prefill(&prompt_tokens, &weights, &mut cache);
+    let mut next = sample(&mut logits, temperature, top_k, top_p, &mut rng_state);
+    eprintln!("Prefill: {{:.1}} tok/s", prompt_tokens.len() as f64 / t0.elapsed().as_secs_f64());
 
     // Generate
     if !quiet {{ print!("{{}}", prompt); }}
@@ -845,7 +843,7 @@ fn main() {{
         tokenizer.token_to_id("<|im_end|>"),
         tokenizer.token_to_id("<|eot_id|>"),
     ].iter().filter_map(|t| *t).collect();
-    let mut recent_tokens: Vec<u32> = tokens.to_vec();
+    let mut recent_tokens: Vec<u32> = prompt_tokens.clone();
     let mut gen_count = 0usize;
     for _ in 0..max_tokens {{
         if eos_tokens.contains(&next) {{ break; }}
@@ -1108,6 +1106,106 @@ mod tests {
         assert!(
             lib_rs.contains("pub mod model;"),
             "lib.rs should re-export model module"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn main_uses_forward_prefill_for_prompt() {
+        let config = tiny_config();
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let dir = std::env::temp_dir().join("forgellm_test_prefill_main");
+        let _ = fs::remove_dir_all(&dir);
+        generate_project(&graph, &dir, "test-prefill", false).unwrap();
+
+        let main = fs::read_to_string(dir.join("src/main.rs")).unwrap();
+        assert!(
+            main.contains("model::forward_prefill("),
+            "main.rs should call forward_prefill for prompt processing"
+        );
+        // Prefill call should appear before the generation loop
+        let prefill_pos = main
+            .find("model::forward_prefill(")
+            .expect("forward_prefill call missing");
+        let gen_loop_pos = main
+            .find("for _ in 0..max_tokens")
+            .expect("generation loop missing");
+        assert!(
+            prefill_pos < gen_loop_pos,
+            "forward_prefill should be called before the generation loop"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn main_uses_prompt_tokens_vec_for_prefill() {
+        let config = tiny_config();
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let dir = std::env::temp_dir().join("forgellm_test_prefill_vec");
+        let _ = fs::remove_dir_all(&dir);
+        generate_project(&graph, &dir, "test-prefill-vec", false).unwrap();
+
+        let main = fs::read_to_string(dir.join("src/main.rs")).unwrap();
+        // The tokens should be collected into a Vec<u32> and passed to forward_prefill
+        assert!(
+            main.contains("let prompt_tokens: Vec<u32>"),
+            "main.rs should collect prompt tokens into Vec<u32>"
+        );
+        assert!(
+            main.contains("model::forward_prefill(&prompt_tokens,"),
+            "main.rs should pass &prompt_tokens to forward_prefill"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn embedded_main_uses_forward_prefill_for_prompt() {
+        let config = tiny_config();
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let dir = std::env::temp_dir().join("forgellm_test_embedded_prefill");
+        let _ = fs::remove_dir_all(&dir);
+        generate_project(&graph, &dir, "test-embedded-prefill", true).unwrap();
+
+        let main = fs::read_to_string(dir.join("src/main.rs")).unwrap();
+        assert!(
+            main.contains("model::forward_prefill("),
+            "embedded main.rs should call forward_prefill for prompt processing"
+        );
+        // forward_prefill should be called before the generation loop
+        let prefill_pos = main
+            .find("model::forward_prefill(")
+            .expect("forward_prefill call missing in embedded main");
+        let gen_loop_pos = main
+            .find("for _ in 0..max_tokens")
+            .expect("generation loop missing");
+        assert!(
+            prefill_pos < gen_loop_pos,
+            "forward_prefill should be called before the generation loop in embedded mode"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn interactive_mode_uses_forward_prefill() {
+        let config = tiny_config();
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let dir = std::env::temp_dir().join("forgellm_test_interactive_prefill");
+        let _ = fs::remove_dir_all(&dir);
+        generate_project(&graph, &dir, "test-interactive-prefill", false).unwrap();
+
+        let main = fs::read_to_string(dir.join("src/main.rs")).unwrap();
+        // Interactive mode should also use forward_prefill for each user turn
+        let interactive_start = main
+            .find("Interactive mode")
+            .expect("interactive mode section missing");
+        let interactive_section = &main[interactive_start..];
+        assert!(
+            interactive_section.contains("forward_prefill("),
+            "interactive mode should use forward_prefill for user input"
         );
 
         let _ = fs::remove_dir_all(&dir);

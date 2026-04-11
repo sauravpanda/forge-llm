@@ -35,6 +35,7 @@ pub fn generate(graph: &Graph) -> Result<String, CodegenError> {
     }
     emit_specialized_matmul_functions(&mut code, config)?;
     emit_forward_function(&mut code, graph, config)?;
+    emit_prefill_function(&mut code, config)?;
 
     Ok(code)
 }
@@ -1315,6 +1316,284 @@ fn emit_forward_function(
     writeln!(code)?;
     writeln!(code, "    cache.len += 1;")?;
     writeln!(code, "    logits")?;
+    writeln!(code, "}}")?;
+
+    Ok(())
+}
+
+/// Emit the `forward_prefill` function for batched prompt processing.
+///
+/// Processes a sequence of tokens in one pass, filling the KV cache for each
+/// token sequentially. Returns logits for the last token only — used to pick
+/// the first generated token. This avoids redundant tokenizer/function overhead
+/// compared to calling `forward()` in a loop.
+fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), CodegenError> {
+    let hidden = config.hidden_size;
+    let intermediate = config.intermediate_size;
+    let num_heads = config.num_attention_heads;
+    let num_kv_heads = config.num_kv_heads;
+    let head_dim = config.head_dim;
+    let qk_size = num_heads * head_dim;
+    let kv_size = num_kv_heads * head_dim;
+
+    let is_q8 = config.dtype == DType::Q8_0;
+
+    writeln!(code)?;
+    writeln!(code, "/// Process a prompt sequence and fill the KV cache.")?;
+    writeln!(
+        code,
+        "/// Returns logits for the last token — use these to start generation."
+    )?;
+    writeln!(
+        code,
+        "/// Avoids per-token tokenizer overhead compared to calling forward() in a loop."
+    )?;
+    writeln!(
+        code,
+        "pub fn forward_prefill(tokens: &[u32], weights: &Weights, cache: &mut KVCache) -> Vec<f32> {{"
+    )?;
+    writeln!(code, "    let seq_len = tokens.len();")?;
+    writeln!(code)?;
+    writeln!(
+        code,
+        "    // Precompute RoPE frequencies once for the entire prefill pass"
+    )?;
+    writeln!(
+        code,
+        "    let rope_freqs = rope_freqs(HEAD_DIM, ROPE_THETA);"
+    )?;
+    writeln!(code)?;
+    writeln!(
+        code,
+        "    // Fixed-size stack buffers — same as forward(), zero heap allocation"
+    )?;
+    writeln!(code, "    let mut hidden_state = [0.0f32; HIDDEN_SIZE];")?;
+    writeln!(code, "    let mut normed = [0.0f32; {hidden}];")?;
+    writeln!(code, "    let mut q = [0.0f32; {qk_size}];")?;
+    writeln!(code, "    let mut k = [0.0f32; {kv_size}];")?;
+    writeln!(code, "    let mut v = [0.0f32; {kv_size}];")?;
+    writeln!(code, "    let mut attn_out = [0.0f32; {qk_size}];")?;
+    writeln!(code, "    let mut attn_proj = [0.0f32; {hidden}];")?;
+    writeln!(code, "    let mut gate = [0.0f32; {intermediate}];")?;
+    writeln!(code, "    let mut up = [0.0f32; {intermediate}];")?;
+    writeln!(code, "    let mut ffn_hidden = [0.0f32; {intermediate}];")?;
+    writeln!(code, "    let mut ffn_out = [0.0f32; {hidden}];")?;
+    writeln!(code, "    let mut last_logits = vec![0.0f32; VOCAB_SIZE];")?;
+    writeln!(code)?;
+    writeln!(
+        code,
+        "    for (tok_pos, &token_id) in tokens.iter().enumerate() {{"
+    )?;
+    writeln!(code, "        let pos = cache.len + tok_pos;")?;
+    writeln!(code)?;
+    writeln!(code, "        // Embedding lookup")?;
+    writeln!(
+        code,
+        "        embedding(&mut hidden_state, token_id, &weights.embed_tokens, HIDDEN_SIZE);"
+    )?;
+    writeln!(code)?;
+    writeln!(code, "        // Transformer layers")?;
+    writeln!(code, "        for layer_idx in 0..NUM_LAYERS {{")?;
+    writeln!(code, "            let lw = &weights.layers[layer_idx];")?;
+    writeln!(code)?;
+    writeln!(code, "            // Attention norm")?;
+    writeln!(
+        code,
+        "            rms_norm(&mut normed, &hidden_state, &lw.attn_norm, RMS_NORM_EPS);"
+    )?;
+    writeln!(code)?;
+    writeln!(code, "            // QKV projections")?;
+    if is_q8 {
+        writeln!(
+            code,
+            "            matmul_vec_q8_0_{hidden}x{qk_size}(&mut q, &normed, &lw.q_proj);",
+            hidden = hidden,
+            qk_size = qk_size
+        )?;
+        writeln!(
+            code,
+            "            matmul_vec_q8_0_{hidden}x{kv_size}(&mut k, &normed, &lw.k_proj);",
+            hidden = hidden,
+            kv_size = kv_size
+        )?;
+        writeln!(
+            code,
+            "            matmul_vec_q8_0_{hidden}x{kv_size}(&mut v, &normed, &lw.v_proj);",
+            hidden = hidden,
+            kv_size = kv_size
+        )?;
+    } else {
+        writeln!(
+            code,
+            "            matmul_vec_{hidden}x{qk_size}(&mut q, &normed, &lw.q_proj);",
+            hidden = hidden,
+            qk_size = qk_size
+        )?;
+        writeln!(
+            code,
+            "            matmul_vec_{hidden}x{kv_size}(&mut k, &normed, &lw.k_proj);",
+            hidden = hidden,
+            kv_size = kv_size
+        )?;
+        writeln!(
+            code,
+            "            matmul_vec_{hidden}x{kv_size}(&mut v, &normed, &lw.v_proj);",
+            hidden = hidden,
+            kv_size = kv_size
+        )?;
+    }
+    writeln!(code)?;
+    writeln!(code, "            // RoPE")?;
+    writeln!(
+        code,
+        "            rope(&mut q, pos, HEAD_DIM, NUM_HEADS, &rope_freqs);"
+    )?;
+    writeln!(
+        code,
+        "            rope(&mut k, pos, HEAD_DIM, NUM_KV_HEADS, &rope_freqs);"
+    )?;
+    writeln!(code)?;
+    writeln!(code, "            // Update KV cache at current position")?;
+    writeln!(
+        code,
+        "            cache.k[layer_idx][pos*{kv_size}..(pos+1)*{kv_size}].copy_from_slice(&k);",
+        kv_size = kv_size
+    )?;
+    writeln!(
+        code,
+        "            cache.v[layer_idx][pos*{kv_size}..(pos+1)*{kv_size}].copy_from_slice(&v);",
+        kv_size = kv_size
+    )?;
+    writeln!(code)?;
+    writeln!(
+        code,
+        "            // Attention over all filled positions (causal: current token sees all previous + itself)"
+    )?;
+    writeln!(code, "            attention(")?;
+    writeln!(code, "                &mut attn_out, &q,")?;
+    writeln!(
+        code,
+        "                &cache.k[layer_idx][..(pos+1)*{kv_size}], &cache.v[layer_idx][..(pos+1)*{kv_size}],",
+        kv_size = kv_size
+    )?;
+    writeln!(
+        code,
+        "                pos + 1, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM,"
+    )?;
+    writeln!(code, "            );")?;
+    writeln!(code)?;
+    writeln!(code, "            // Output projection + residual")?;
+    if is_q8 {
+        writeln!(
+            code,
+            "            matmul_vec_q8_0_{qk_size}x{hidden}(&mut attn_proj, &attn_out, &lw.o_proj);",
+            qk_size = qk_size,
+            hidden = hidden
+        )?;
+    } else {
+        writeln!(
+            code,
+            "            matmul_vec_{qk_size}x{hidden}(&mut attn_proj, &attn_out, &lw.o_proj);",
+            qk_size = qk_size,
+            hidden = hidden
+        )?;
+    }
+    writeln!(
+        code,
+        "            residual_add(&mut hidden_state, &attn_proj);"
+    )?;
+    writeln!(code)?;
+    writeln!(code, "            // FFN norm")?;
+    writeln!(
+        code,
+        "            rms_norm(&mut normed, &hidden_state, &lw.ffn_norm, RMS_NORM_EPS);"
+    )?;
+    writeln!(code)?;
+    writeln!(code, "            // FFN: fused silu_mul")?;
+    if is_q8 {
+        writeln!(
+            code,
+            "            matmul_vec_q8_0_{hidden}x{intermediate}(&mut gate, &normed, &lw.gate_proj);",
+            hidden = hidden,
+            intermediate = intermediate
+        )?;
+        writeln!(
+            code,
+            "            matmul_vec_q8_0_{hidden}x{intermediate}(&mut up, &normed, &lw.up_proj);",
+            hidden = hidden,
+            intermediate = intermediate
+        )?;
+    } else {
+        writeln!(
+            code,
+            "            matmul_vec_{hidden}x{intermediate}(&mut gate, &normed, &lw.gate_proj);",
+            hidden = hidden,
+            intermediate = intermediate
+        )?;
+        writeln!(
+            code,
+            "            matmul_vec_{hidden}x{intermediate}(&mut up, &normed, &lw.up_proj);",
+            hidden = hidden,
+            intermediate = intermediate
+        )?;
+    }
+    writeln!(code, "            silu_mul(&mut ffn_hidden, &gate, &up);")?;
+    if is_q8 {
+        writeln!(
+            code,
+            "            matmul_vec_q8_0_{intermediate}x{hidden}(&mut ffn_out, &ffn_hidden, &lw.down_proj);",
+            intermediate = intermediate,
+            hidden = hidden
+        )?;
+    } else {
+        writeln!(
+            code,
+            "            matmul_vec_{intermediate}x{hidden}(&mut ffn_out, &ffn_hidden, &lw.down_proj);",
+            intermediate = intermediate,
+            hidden = hidden
+        )?;
+    }
+    writeln!(
+        code,
+        "            residual_add(&mut hidden_state, &ffn_out);"
+    )?;
+    writeln!(code, "        }}")?;
+    writeln!(code)?;
+    writeln!(
+        code,
+        "        // On the last token, compute logits for the first generated token"
+    )?;
+    writeln!(code, "        if tok_pos == seq_len - 1 {{")?;
+    writeln!(
+        code,
+        "            rms_norm(&mut normed, &hidden_state, &weights.final_norm, RMS_NORM_EPS);"
+    )?;
+    writeln!(
+        code,
+        "            last_logits.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
+    )?;
+    writeln!(code, "                let base = chunk_idx * 256;")?;
+    writeln!(code, "                for r in 0..out.len() {{")?;
+    writeln!(code, "                    let j = base + r;")?;
+    if is_q8 {
+        let lm_row_bytes = hidden.div_ceil(32) * 34;
+        writeln!(
+            code,
+            "                    out[r] = dot_q8_0(&normed[..], &weights.lm_head[j*{lm_row_bytes}..(j+1)*{lm_row_bytes}], {hidden});"
+        )?;
+    } else {
+        writeln!(
+            code,
+            "                    out[r] = dot_f32(&normed[..], &weights.lm_head[j*{hidden}..(j+1)*{hidden}], {hidden});"
+        )?;
+    }
+    writeln!(code, "                }}")?;
+    writeln!(code, "            }});")?;
+    writeln!(code, "        }}")?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
+    writeln!(code, "    cache.len += seq_len;")?;
+    writeln!(code, "    last_logits")?;
     writeln!(code, "}}")?;
 
     Ok(())
