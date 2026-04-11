@@ -455,6 +455,7 @@ dependencies = [
  "forgellm-frontend",
  "forgellm-optimizer",
  "pretty_assertions",
+ "tempfile",
  "thiserror",
  "tracing",
 ]
