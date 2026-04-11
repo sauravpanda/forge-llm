@@ -27,7 +27,9 @@ jobs:
           key: bench
 
       - name: Run benchmarks on PR branch
-        run: cargo bench -p forgellm-codegen-cpu 2>&1 | tee /tmp/pr-bench.txt
+        run: |
+          cargo bench -p forgellm-codegen-cpu 2>&1 | tee /tmp/pr-bench.txt
+          cp scripts/compare_bench.py /tmp/compare_bench.py
 
       - name: Checkout base branch
         run: |
@@ -39,7 +41,7 @@ jobs:
 
       - name: Compare results and detect regressions
         id: compare
-        run: python3 scripts/compare_bench.py
+        run: python3 /tmp/compare_bench.py
 
       - name: Read summary
         id: summary
