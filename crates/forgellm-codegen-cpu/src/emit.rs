@@ -763,62 +763,88 @@ fn dot_q8_0(input: &[f32], weight_row: &[u8], k: usize) -> f32 {
         use std::arch::aarch64::*;
         const BLOCK_SIZE: usize = 32;
         const TYPE_SIZE: usize = 34;
-        let num_blocks = k / BLOCK_SIZE; // k is always a multiple of 32 for projection weights
-        let mut acc_total = unsafe { vdupq_n_f32(0.0) };
-        for b in 0..num_blocks {
-            let bs = b * TYPE_SIZE;
-            let scale_bits = u16::from_le_bytes([weight_row[bs], weight_row[bs + 1]]);
-            let scale = f16_bits_to_f32(scale_bits);
-            let block_start = b * BLOCK_SIZE;
-            unsafe {
-                let sv = vdupq_n_f32(scale);
-                let w_ptr = weight_row[bs + 2..].as_ptr() as *const i8;
-                // Load 32 int8 weight values as two 16-element NEON vectors
-                let w_lo = vld1q_s8(w_ptr);        // bytes 0..16
-                let w_hi = vld1q_s8(w_ptr.add(16)); // bytes 16..32
-                // Widen int8 → int16 → int32 → f32 (two halves each)
-                let wf0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(vmovl_s8(vget_low_s8(w_lo)))));
-                let wf1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(vmovl_s8(vget_low_s8(w_lo)))));
-                let wf2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(vmovl_s8(vget_high_s8(w_lo)))));
-                let wf3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(vmovl_s8(vget_high_s8(w_lo)))));
-                let wf4 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(vmovl_s8(vget_low_s8(w_hi)))));
-                let wf5 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(vmovl_s8(vget_low_s8(w_hi)))));
-                let wf6 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(vmovl_s8(vget_high_s8(w_hi)))));
-                let wf7 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(vmovl_s8(vget_high_s8(w_hi)))));
-                // Load 32 input floats
-                let i_ptr = input[block_start..].as_ptr();
-                let i0 = vld1q_f32(i_ptr);
-                let i1 = vld1q_f32(i_ptr.add(4));
-                let i2 = vld1q_f32(i_ptr.add(8));
-                let i3 = vld1q_f32(i_ptr.add(12));
-                let i4 = vld1q_f32(i_ptr.add(16));
-                let i5 = vld1q_f32(i_ptr.add(20));
-                let i6 = vld1q_f32(i_ptr.add(24));
-                let i7 = vld1q_f32(i_ptr.add(28));
-                // Accumulate: acc += input[j] * (w[j] * scale)
-                let mut acc = vdupq_n_f32(0.0);
-                acc = vfmaq_f32(acc, i0, vmulq_f32(wf0, sv));
-                acc = vfmaq_f32(acc, i1, vmulq_f32(wf1, sv));
-                acc = vfmaq_f32(acc, i2, vmulq_f32(wf2, sv));
-                acc = vfmaq_f32(acc, i3, vmulq_f32(wf3, sv));
-                acc = vfmaq_f32(acc, i4, vmulq_f32(wf4, sv));
-                acc = vfmaq_f32(acc, i5, vmulq_f32(wf5, sv));
-                acc = vfmaq_f32(acc, i6, vmulq_f32(wf6, sv));
-                acc = vfmaq_f32(acc, i7, vmulq_f32(wf7, sv));
-                acc_total = vaddq_f32(acc_total, acc);
-            }
+        let num_blocks = k / BLOCK_SIZE;
+
+        // Four independent accumulators hide the latency of sequential vaddq_f32.
+        // We interleave 4 blocks at a time; each accumulator is a float32x4 summing
+        // products from its assigned blocks throughout the inner loop.
+        let mut a0 = unsafe { vdupq_n_f32(0.0) };
+        let mut a1 = unsafe { vdupq_n_f32(0.0) };
+        let mut a2 = unsafe { vdupq_n_f32(0.0) };
+        let mut a3 = unsafe { vdupq_n_f32(0.0) };
+
+        // Helper macro: widen a Q8_0 block and fmla into an accumulator.
+        // (Cannot be a closure because it borrows multiple vars.)
+        macro_rules! dot_block {
+            ($acc:ident, $b:expr) => {{
+                let bs = $b * TYPE_SIZE;
+                let scale = f16_bits_to_f32(
+                    u16::from_le_bytes([weight_row[bs], weight_row[bs + 1]])
+                );
+                let block_start = $b * BLOCK_SIZE;
+                unsafe {
+                    let sv = vdupq_n_f32(scale);
+                    let w_ptr = weight_row[bs + 2..].as_ptr() as *const i8;
+                    let w_lo = vld1q_s8(w_ptr);
+                    let w_hi = vld1q_s8(w_ptr.add(16));
+                    let wf0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(vmovl_s8(vget_low_s8(w_lo)))));
+                    let wf1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(vmovl_s8(vget_low_s8(w_lo)))));
+                    let wf2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(vmovl_s8(vget_high_s8(w_lo)))));
+                    let wf3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(vmovl_s8(vget_high_s8(w_lo)))));
+                    let wf4 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(vmovl_s8(vget_low_s8(w_hi)))));
+                    let wf5 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(vmovl_s8(vget_low_s8(w_hi)))));
+                    let wf6 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(vmovl_s8(vget_high_s8(w_hi)))));
+                    let wf7 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(vmovl_s8(vget_high_s8(w_hi)))));
+                    let i_ptr = input[block_start..].as_ptr();
+                    let i0 = vld1q_f32(i_ptr);
+                    let i1 = vld1q_f32(i_ptr.add(4));
+                    let i2 = vld1q_f32(i_ptr.add(8));
+                    let i3 = vld1q_f32(i_ptr.add(12));
+                    let i4 = vld1q_f32(i_ptr.add(16));
+                    let i5 = vld1q_f32(i_ptr.add(20));
+                    let i6 = vld1q_f32(i_ptr.add(24));
+                    let i7 = vld1q_f32(i_ptr.add(28));
+                    let mut tmp = vdupq_n_f32(0.0);
+                    tmp = vfmaq_f32(tmp, i0, vmulq_f32(wf0, sv));
+                    tmp = vfmaq_f32(tmp, i1, vmulq_f32(wf1, sv));
+                    tmp = vfmaq_f32(tmp, i2, vmulq_f32(wf2, sv));
+                    tmp = vfmaq_f32(tmp, i3, vmulq_f32(wf3, sv));
+                    tmp = vfmaq_f32(tmp, i4, vmulq_f32(wf4, sv));
+                    tmp = vfmaq_f32(tmp, i5, vmulq_f32(wf5, sv));
+                    tmp = vfmaq_f32(tmp, i6, vmulq_f32(wf6, sv));
+                    tmp = vfmaq_f32(tmp, i7, vmulq_f32(wf7, sv));
+                    $acc = vaddq_f32($acc, tmp);
+                }
+            }};
         }
-        // Handle tail (when k is not a multiple of 32)
-        let covered = (k / 32) * 32;
-        let mut tail_sum = unsafe { vaddvq_f32(acc_total) };
+
+        let groups = num_blocks / 4;
+        for g in 0..groups {
+            let base = g * 4;
+            dot_block!(a0, base);
+            dot_block!(a1, base + 1);
+            dot_block!(a2, base + 2);
+            dot_block!(a3, base + 3);
+        }
+        // Tail blocks (0, 1, or 2)
+        let tail_start = groups * 4;
+        if tail_start < num_blocks { dot_block!(a0, tail_start); }
+        if tail_start + 1 < num_blocks { dot_block!(a1, tail_start + 1); }
+        if tail_start + 2 < num_blocks { dot_block!(a2, tail_start + 2); }
+
+        let merged = unsafe {
+            vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3))
+        };
+        let covered = num_blocks * BLOCK_SIZE;
+        let mut result = unsafe { vaddvq_f32(merged) };
         for j in covered..k {
-            let b = j / 32;
-            let bs = b * 34;
+            let b = j / BLOCK_SIZE;
+            let bs = b * TYPE_SIZE;
             let scale = f16_bits_to_f32(u16::from_le_bytes([weight_row[bs], weight_row[bs + 1]]));
-            let q = weight_row[bs + 2 + (j % 32)] as i8;
-            tail_sum += input[j] * (q as f32 * scale);
+            let q = weight_row[bs + 2 + (j % BLOCK_SIZE)] as i8;
+            result += input[j] * (q as f32 * scale);
         }
-        return tail_sum;
+        return result;
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
