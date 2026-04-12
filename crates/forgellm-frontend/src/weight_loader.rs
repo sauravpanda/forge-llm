@@ -309,6 +309,14 @@ pub fn load_tensor_by_name<R: Read + Seek>(
     load_tensor(reader, gguf, tensor_info)
 }
 
+/// Dequantize Q8_0 raw bytes to f32 — public for use by export-weights.
+///
+/// `raw`: raw Q8_0 bytes (34 bytes/block: 2-byte f16 scale + 32 int8 values)
+/// `numel`: total number of elements
+pub fn dequantize_q8_0_to_f32(raw: &[u8], numel: usize) -> Vec<f32> {
+    dequant_q8_0(raw, numel)
+}
+
 /// Dequantize raw bytes to f32 based on GGML type.
 fn dequantize(data: &[u8], ggml_type: GGMLType, numel: usize) -> Result<Vec<f32>, WeightLoadError> {
     match ggml_type {

@@ -720,6 +720,13 @@ fn emit_specialized_matmul_functions(
 }
 
 /// Emit the Q8_0 dot-product helper and f16→f32 conversion used by Q8_0 matmul.
+///
+/// On AArch64 (Apple Silicon, Arm servers) the dot product is vectorised with
+/// NEON: int8 values are widened to f32 in three steps (s8→s16→s32→f32) and
+/// accumulated via `vfmaq_f32`.  Eight NEON float vectors cover one full 32-
+/// element block, matching the throughput of the F32 NEON kernel.
+///
+/// On all other targets the implementation falls back to a portable scalar loop.
 fn emit_q8_0_kernel(code: &mut String) -> Result<(), CodegenError> {
     code.push_str(
         r#"
@@ -748,25 +755,90 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
 
 /// Dot product of f32 input against a Q8_0 weight row without prior dequantization.
 /// `weight_row`: raw Q8_0 bytes — layout: [2 bytes f16 scale][32 bytes int8] per block.
-/// `k`: number of input/weight elements.
+/// `k`: number of input/weight elements (must be a multiple of 32 for NEON path).
 #[inline]
 fn dot_q8_0(input: &[f32], weight_row: &[u8], k: usize) -> f32 {
-    const BLOCK_SIZE: usize = 32;
-    const TYPE_SIZE: usize = 34; // 2 scale bytes + 32 data bytes
-    let num_blocks = k.div_ceil(BLOCK_SIZE);
-    let mut sum = 0.0f32;
-    for b in 0..num_blocks {
-        let bs = b * TYPE_SIZE;
-        let scale_bits = u16::from_le_bytes([weight_row[bs], weight_row[bs + 1]]);
-        let scale = f16_bits_to_f32(scale_bits);
-        let block_start = b * BLOCK_SIZE;
-        let block_end = (block_start + BLOCK_SIZE).min(k);
-        for j in 0..(block_end - block_start) {
-            let q = weight_row[bs + 2 + j] as i8;
-            sum += input[block_start + j] * (q as f32 * scale);
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::*;
+        const BLOCK_SIZE: usize = 32;
+        const TYPE_SIZE: usize = 34;
+        let num_blocks = k / BLOCK_SIZE; // k is always a multiple of 32 for projection weights
+        let mut acc_total = unsafe { vdupq_n_f32(0.0) };
+        for b in 0..num_blocks {
+            let bs = b * TYPE_SIZE;
+            let scale_bits = u16::from_le_bytes([weight_row[bs], weight_row[bs + 1]]);
+            let scale = f16_bits_to_f32(scale_bits);
+            let block_start = b * BLOCK_SIZE;
+            unsafe {
+                let sv = vdupq_n_f32(scale);
+                let w_ptr = weight_row[bs + 2..].as_ptr() as *const i8;
+                // Load 32 int8 weight values as two 16-element NEON vectors
+                let w_lo = vld1q_s8(w_ptr);        // bytes 0..16
+                let w_hi = vld1q_s8(w_ptr.add(16)); // bytes 16..32
+                // Widen int8 → int16 → int32 → f32 (two halves each)
+                let wf0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(vmovl_s8(vget_low_s8(w_lo)))));
+                let wf1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(vmovl_s8(vget_low_s8(w_lo)))));
+                let wf2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(vmovl_s8(vget_high_s8(w_lo)))));
+                let wf3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(vmovl_s8(vget_high_s8(w_lo)))));
+                let wf4 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(vmovl_s8(vget_low_s8(w_hi)))));
+                let wf5 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(vmovl_s8(vget_low_s8(w_hi)))));
+                let wf6 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(vmovl_s8(vget_high_s8(w_hi)))));
+                let wf7 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(vmovl_s8(vget_high_s8(w_hi)))));
+                // Load 32 input floats
+                let i_ptr = input[block_start..].as_ptr();
+                let i0 = vld1q_f32(i_ptr);
+                let i1 = vld1q_f32(i_ptr.add(4));
+                let i2 = vld1q_f32(i_ptr.add(8));
+                let i3 = vld1q_f32(i_ptr.add(12));
+                let i4 = vld1q_f32(i_ptr.add(16));
+                let i5 = vld1q_f32(i_ptr.add(20));
+                let i6 = vld1q_f32(i_ptr.add(24));
+                let i7 = vld1q_f32(i_ptr.add(28));
+                // Accumulate: acc += input[j] * (w[j] * scale)
+                let mut acc = vdupq_n_f32(0.0);
+                acc = vfmaq_f32(acc, i0, vmulq_f32(wf0, sv));
+                acc = vfmaq_f32(acc, i1, vmulq_f32(wf1, sv));
+                acc = vfmaq_f32(acc, i2, vmulq_f32(wf2, sv));
+                acc = vfmaq_f32(acc, i3, vmulq_f32(wf3, sv));
+                acc = vfmaq_f32(acc, i4, vmulq_f32(wf4, sv));
+                acc = vfmaq_f32(acc, i5, vmulq_f32(wf5, sv));
+                acc = vfmaq_f32(acc, i6, vmulq_f32(wf6, sv));
+                acc = vfmaq_f32(acc, i7, vmulq_f32(wf7, sv));
+                acc_total = vaddq_f32(acc_total, acc);
+            }
         }
+        // Handle tail (when k is not a multiple of 32)
+        let covered = (k / 32) * 32;
+        let mut tail_sum = unsafe { vaddvq_f32(acc_total) };
+        for j in covered..k {
+            let b = j / 32;
+            let bs = b * 34;
+            let scale = f16_bits_to_f32(u16::from_le_bytes([weight_row[bs], weight_row[bs + 1]]));
+            let q = weight_row[bs + 2 + (j % 32)] as i8;
+            tail_sum += input[j] * (q as f32 * scale);
+        }
+        return tail_sum;
     }
-    sum
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        const BLOCK_SIZE: usize = 32;
+        const TYPE_SIZE: usize = 34;
+        let num_blocks = k.div_ceil(BLOCK_SIZE);
+        let mut sum = 0.0f32;
+        for b in 0..num_blocks {
+            let bs = b * TYPE_SIZE;
+            let scale_bits = u16::from_le_bytes([weight_row[bs], weight_row[bs + 1]]);
+            let scale = f16_bits_to_f32(scale_bits);
+            let block_start = b * BLOCK_SIZE;
+            let block_end = (block_start + BLOCK_SIZE).min(k);
+            for j in 0..(block_end - block_start) {
+                let q = weight_row[bs + 2 + j] as i8;
+                sum += input[block_start + j] * (q as f32 * scale);
+            }
+        }
+        sum
+    }
 }
 
 "#,
