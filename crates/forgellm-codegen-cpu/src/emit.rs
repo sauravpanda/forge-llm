@@ -888,10 +888,11 @@ fn dot_q8_0(input: &[f32], weight_row: &[u8], k: usize) -> f32 {
 fn emit_q8_0_sdot_kernel(code: &mut String) -> Result<(), CodegenError> {
     code.push_str(
         r#"
-// --- Q8_0 × Q8_0 int8 dot product (stable NEON, vmull_s8 + vpaddlq_s16) ---
+// --- Q8_0 × Q8_0 int8 dot product via AArch64 sdot (inline asm, stable Rust) ---
 // Input is quantized to Q8_0 once per matmul call; each output row then uses
-// int8×int8 multiply-accumulate without widening to f32, giving ~4x fewer ops.
-// With target-cpu=native, LLVM may further lower vmull+vpaddl to sdot.
+// sdot (Signed DOT product, 16 int8 pairs → 4 int32 per instruction) instead
+// of the f32-widening path.  2 sdot calls cover one 32-element Q8_0 block vs.
+// the 4 vmull+4 vpaddl needed for the pure-intrinsics path.
 
 /// Quantize a f32 slice to Q8_0 blocks (block-wise, 32 elements per block).
 /// Returns raw Q8_0 bytes: [2-byte f16 scale][32 int8 values] per block.
@@ -944,13 +945,16 @@ fn f32_to_f16_bits(x: f32) -> u16 {
     else                   { sign | ((exp_f16 as u16) << 10) | mantissa }
 }
 
-/// Dot product of two Q8_0 vectors using stable NEON int8×int8 multiply.
-/// Uses `vmull_s8` + `vpaddlq_s16` — available on stable Rust — to process
-/// 32 elements per block without widening to f32.
+/// Dot product of two Q8_0 vectors using AArch64 `sdot` instruction via inline asm.
 ///
-/// Each block's int32 sum is immediately scaled by `a_scale * b_scale` and
-/// added to one of four independent f32 accumulators (for ILP) — preserving
-/// the exact Q8_0 block semantics where every block has its own scale.
+/// `sdot` (Signed DOT product) processes 16 int8 pairs and accumulates 4 int32
+/// results in a single instruction — 2 calls cover a full 32-element Q8_0 block.
+/// This is available on ARMv8.4+/FEAT_DotProd (M1 and all modern Arm chips)
+/// without requiring the unstable `stdarch_neon_dotprod` Rust feature.
+///
+/// Four independent f32 accumulators provide ILP across interleaved blocks.
+/// Each block's int32 sum is immediately scaled by `a_scale * b_scale` before
+/// being added to the f32 accumulator — no scale mixing across blocks.
 ///
 /// `a_q8`: input quantized to Q8_0 blocks by `quantize_to_q8_0_blocks`.
 /// `b_q8`: weight row raw Q8_0 bytes.
@@ -963,17 +967,15 @@ fn dot_q8_0_q8_0(a_q8: &[u8], b_q8: &[u8], k: usize) -> f32 {
     const TYPE_SIZE: usize  = 34;
     let num_blocks = k / BLOCK_SIZE;
 
-    // Four independent f32 accumulators for ILP (avoids sequential add-latency).
-    // Each block's contribution = combined_scale * int32_dot is correctly computed
-    // per block before accumulation — no scale mixing across blocks.
+    // Four independent f32 accumulators for ILP across interleaved blocks.
     let mut fa0 = 0.0f32;
     let mut fa1 = 0.0f32;
     let mut fa2 = 0.0f32;
     let mut fa3 = 0.0f32;
 
-    // Compute combined_scale * int32_dot for one Q8_0 block and return as f32.
-    // vmull_s8: i8x8 × i8x8 → i16x8; vpaddlq_s16: pairwise add i16 pairs → i32x4.
-    // Two calls cover all 32 elements of one block (16 + 16).
+    // Compute combined_scale * sdot_sum for one Q8_0 block.
+    // sdot processes 16 int8 pairs per call (2 calls = 32 elements / block).
+    // Uses inline asm to call SDOT directly on stable Rust toolchain.
     macro_rules! block_f32 {
         ($b:expr) => {{
             let bs = $b * TYPE_SIZE;
@@ -983,13 +985,22 @@ fn dot_q8_0_q8_0(a_q8: &[u8], b_q8: &[u8], k: usize) -> f32 {
             unsafe {
                 let ap = a_q8[bs + 2..].as_ptr() as *const i8;
                 let bp = b_q8[bs + 2..].as_ptr() as *const i8;
-                let a0 = vld1q_s8(ap);         let a1 = vld1q_s8(ap.add(16));
-                let b0 = vld1q_s8(bp);         let b1 = vld1q_s8(bp.add(16));
-                let mut acc = vdupq_n_s32(0);
-                acc = vaddq_s32(acc, vpaddlq_s16(vmull_s8(vget_low_s8(a0),  vget_low_s8(b0))));
-                acc = vaddq_s32(acc, vpaddlq_s16(vmull_s8(vget_high_s8(a0), vget_high_s8(b0))));
-                acc = vaddq_s32(acc, vpaddlq_s16(vmull_s8(vget_low_s8(a1),  vget_low_s8(b1))));
-                acc = vaddq_s32(acc, vpaddlq_s16(vmull_s8(vget_high_s8(a1), vget_high_s8(b1))));
+                let a0: int8x16_t = vld1q_s8(ap);
+                let a1: int8x16_t = vld1q_s8(ap.add(16));
+                let b0: int8x16_t = vld1q_s8(bp);
+                let b1: int8x16_t = vld1q_s8(bp.add(16));
+                let mut acc: int32x4_t = vdupq_n_s32(0);
+                // sdot: acc.4s += sdot(a.16b, b.16b) — 16 int8 pairs → 4 int32
+                core::arch::asm!(
+                    "sdot {acc:v}.4s, {a0:v}.16b, {b0:v}.16b",
+                    "sdot {acc:v}.4s, {a1:v}.16b, {b1:v}.16b",
+                    acc = inout(vreg) acc,
+                    a0 = in(vreg) a0,
+                    b0 = in(vreg) b0,
+                    a1 = in(vreg) a1,
+                    b1 = in(vreg) b1,
+                    options(nostack),
+                );
                 combined * vaddvq_s32(acc) as f32
             }
         }};
@@ -1055,10 +1066,10 @@ fn emit_specialized_q8_matmul_functions(
             "/// Q8_0 matmul: [1, {k}] x [{n}, {k}]^T -> [1, {n}] (weight stored as raw Q8_0 bytes)"
         )?;
 
-        // --- AArch64 int8×int8 path (stable NEON, vmull_s8 + vpaddlq_s16) ---
+        // --- AArch64 sdot path (inline asm, stable Rust) ---
         // Quantize input to Q8_0 once per call, then compute each row with
-        // stable int8 multiply-accumulate. LLVM may further lower to sdot on M1
-        // when target-cpu=native is set in .cargo/config.toml.
+        // dot_q8_0_q8_0 which uses the sdot instruction (2 sdot per 32-element
+        // block vs. 4 vmull+4 vpaddl for pure intrinsics — ~2x fewer NEON ops).
         writeln!(code, "#[cfg(target_arch = \"aarch64\")]")?;
         writeln!(code, "#[inline]")?;
         writeln!(
