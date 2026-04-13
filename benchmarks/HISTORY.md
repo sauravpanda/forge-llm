@@ -13,6 +13,7 @@ System: Darwin arm64 18c (Apple M5 Pro).
 | v0.3.0-dev3 | 2026-04-09 | 119.7 | 119.9 (best 122.1) | 100% |
 | v0.3.0-dev4 | 2026-04-09 | 119.7 | **119.5** (best 122.9) | **100%** |
 | v0.3.1-dev | 2026-04-10 | 119.7 | **117.2** (seed=42, stable) | 98% |
+| v0.4.0 | 2026-04-11 | 119.7 | — (pending) | — |
 
 ## SmolLM2-360M Q8_0 (hidden=960, 32 layers)
 
@@ -29,6 +30,22 @@ System: Darwin arm64 18c (Apple M5 Pro).
 | v0.3.0-dev4 | 2026-04-09 | 33.6 | **34.5** (best 36.2) | **103%** |
 
 ## Analysis
+
+### v0.4.0 — Flash Attention + Broader Architecture Support
+
+Key changes vs v0.3.1-dev:
+
+1. **Parallel matmul threshold 4096 → 512**: attention Q/K/V/O projections on SmolLM2-135M
+   (N=576) now run in parallel. Effect on 135M is modest (Rayon overhead at N=576 is small);
+   larger models (Qwen2.5-0.5B, N=896) gain more.
+2. **Flash Attention** (`max_seq_len > 512`, no SWA): per-head scratch is 64×f32=256 bytes
+   regardless of context length. At 64-token generation benchmarks the tiled loop closely
+   matches the standard path — measurable benefit appears at longer prompts (1K–4K tokens).
+3. **Mistral / Qwen2 support**: sliding-window attention and QKV bias are now emitted
+   correctly; benchmarking Mistral-7B models is now unblocked.
+
+*Fresh benchmark numbers pending — run `./benchmarks/run.sh` on an Apple Silicon machine
+to populate the v0.4.0 row above.*
 
 ### v0.2.0 — AOT Compilation Baseline
 
