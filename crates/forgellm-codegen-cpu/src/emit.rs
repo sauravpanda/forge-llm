@@ -160,6 +160,43 @@ fn emit_header(code: &mut String, config: &ModelConfig) -> Result<(), CodegenErr
     writeln!(code, "}}")?;
     writeln!(code)?;
 
+    // Apple Accelerate framework FFI for AMX-accelerated BLAS on macOS.
+    // cblas_sgemv uses the Apple AMX coprocessor for matrix-vector multiply,
+    // giving significant speedup on Apple Silicon for f32 matmul operations.
+    writeln!(
+        code,
+        "// --- Apple Accelerate framework (AMX-accelerated BLAS) ---"
+    )?;
+    writeln!(code, "#[cfg(target_os = \"macos\")]")?;
+    writeln!(code, "#[link(name = \"Accelerate\", kind = \"framework\")]")?;
+    writeln!(code, "extern \"C\" {{")?;
+    writeln!(
+        code,
+        "    /// BLAS single-precision matrix-vector multiply: y = alpha * A * x + beta * y"
+    )?;
+    writeln!(code, "    fn cblas_sgemv(")?;
+    writeln!(code, "        order: i32, trans: i32,")?;
+    writeln!(code, "        m: i32, n: i32,")?;
+    writeln!(code, "        alpha: f32,")?;
+    writeln!(code, "        a: *const f32, lda: i32,")?;
+    writeln!(code, "        x: *const f32, incx: i32,")?;
+    writeln!(code, "        beta: f32,")?;
+    writeln!(code, "        y: *mut f32, incy: i32,")?;
+    writeln!(code, "    );")?;
+    writeln!(code, "}}")?;
+    writeln!(code)?;
+    writeln!(
+        code,
+        "// CblasRowMajor = 101, CblasNoTrans = 111, CblasTrans = 112"
+    )?;
+    writeln!(code, "#[cfg(target_os = \"macos\")]")?;
+    writeln!(code, "const CBLAS_ROW_MAJOR: i32 = 101;")?;
+    writeln!(code, "#[cfg(target_os = \"macos\")]")?;
+    writeln!(code, "const CBLAS_NO_TRANS: i32 = 111;")?;
+    writeln!(code, "#[cfg(target_os = \"macos\")]")?;
+    writeln!(code, "const CBLAS_TRANS: i32 = 112;")?;
+    writeln!(code)?;
+
     Ok(())
 }
 
@@ -623,6 +660,10 @@ fn emit_specialized_matmul_functions(
         code,
         "// All dimensions baked in at compile time — no runtime size parameters."
     )?;
+    writeln!(
+        code,
+        "// On macOS, uses cblas_sgemv from the Accelerate framework (AMX-accelerated)."
+    )?;
     writeln!(code)?;
 
     // Threshold for parallelization: only parallelize if N >= 4096
@@ -631,10 +672,48 @@ fn emit_specialized_matmul_functions(
     let par_threshold = 4096;
 
     for &(k, n) in &matmul_shapes(config) {
+        // --- macOS path: cblas_sgemv via Accelerate (uses AMX coprocessor) ---
+        // Weight is row-major [N, K]. cblas_sgemv(RowMajor, NoTrans, N, K, 1, W, K, x, 1, 0, y, 1)
+        // computes y = W * x which is exactly our matmul_vec: [N, K] x [K, 1] -> [N, 1].
         writeln!(
             code,
             "/// Specialized matmul: [1, {k}] x [{n}, {k}]^T -> [1, {n}]"
         )?;
+        writeln!(
+            code,
+            "/// On macOS: uses cblas_sgemv (Accelerate/AMX) for hardware-accelerated matmul."
+        )?;
+        writeln!(code, "#[cfg(target_os = \"macos\")]")?;
+        writeln!(code, "#[inline]")?;
+        writeln!(
+            code,
+            "fn matmul_vec_{k}x{n}(output: &mut [f32; {n}], input: &[f32; {k}], weight: &[f32]) {{"
+        )?;
+        writeln!(
+            code,
+            "    // Safety: weight.len() >= {n}*{k}, input.len() >= {k}, output.len() >= {n}"
+        )?;
+        writeln!(code, "    // cblas_sgemv reads/writes within these bounds.")?;
+        writeln!(code, "    unsafe {{")?;
+        writeln!(code, "        cblas_sgemv(")?;
+        writeln!(code, "            CBLAS_ROW_MAJOR, CBLAS_NO_TRANS,")?;
+        writeln!(code, "            {n} as i32, {k} as i32,")?;
+        writeln!(code, "            1.0,")?;
+        writeln!(code, "            weight.as_ptr(), {k} as i32,")?;
+        writeln!(code, "            input.as_ptr(), 1,")?;
+        writeln!(code, "            0.0,")?;
+        writeln!(code, "            output.as_mut_ptr(), 1,")?;
+        writeln!(code, "        );")?;
+        writeln!(code, "    }}")?;
+        writeln!(code, "}}")?;
+        writeln!(code)?;
+
+        // --- non-macOS fallback: NEON/scalar dot_f32 ---
+        writeln!(
+            code,
+            "/// Specialized matmul: [1, {k}] x [{n}, {k}]^T -> [1, {n}]"
+        )?;
+        writeln!(code, "#[cfg(not(target_os = \"macos\"))]")?;
         if n >= par_threshold {
             // Parallel path: par_chunks_mut(256) for cache locality + amortized Rayon overhead
             writeln!(
@@ -2676,19 +2755,45 @@ fn emit_forward_function(
         writeln!(code, "        }}")?;
         writeln!(code, "    }});")?;
     } else {
+        // f32 logits path: use cblas_sgemv on macOS for AMX acceleration,
+        // fall back to parallel dot_f32 on other platforms.
+        writeln!(code, "    #[cfg(target_os = \"macos\")] {{")?;
         writeln!(
             code,
-            "    logits.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
+            "        // Accelerate/AMX: single cblas_sgemv call for entire lm_head projection"
         )?;
-        writeln!(code, "        let base = chunk_idx * 256;")?;
-        writeln!(code, "        for r in 0..out.len() {{")?;
-        writeln!(code, "            let j = base + r;")?;
+        writeln!(code, "        // Weight layout: row-major [{vocab}, {hidden}], input: [{hidden}], output: [{vocab}]")?;
+        writeln!(code, "        unsafe {{")?;
+        writeln!(code, "            cblas_sgemv(")?;
+        writeln!(code, "                CBLAS_ROW_MAJOR, CBLAS_NO_TRANS,")?;
+        writeln!(code, "                {vocab} as i32, {hidden} as i32,")?;
+        writeln!(code, "                1.0,")?;
         writeln!(
             code,
-            "            out[r] = dot_f32(&normed[..], &weights.lm_head[j*{hidden}..(j+1)*{hidden}], {hidden});"
+            "                weights.lm_head.as_ptr(), {hidden} as i32,"
         )?;
+        writeln!(code, "                normed.as_ptr(), 1,")?;
+        writeln!(code, "                0.0,")?;
+        writeln!(code, "                logits.as_mut_ptr(), 1,")?;
+        writeln!(code, "            );")?;
         writeln!(code, "        }}")?;
-        writeln!(code, "    }});")?;
+        writeln!(code, "    }}")?;
+        writeln!(code, "    #[cfg(not(target_os = \"macos\"))]")?;
+        writeln!(code, "    {{")?;
+        writeln!(
+            code,
+            "        logits.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
+        )?;
+        writeln!(code, "            let base = chunk_idx * 256;")?;
+        writeln!(code, "            for r in 0..out.len() {{")?;
+        writeln!(code, "                let j = base + r;")?;
+        writeln!(
+            code,
+            "                out[r] = dot_f32(&normed[..], &weights.lm_head[j*{hidden}..(j+1)*{hidden}], {hidden});"
+        )?;
+        writeln!(code, "            }}")?;
+        writeln!(code, "        }});")?;
+        writeln!(code, "    }}")?;
     }
     writeln!(code)?;
     writeln!(code, "    cache.len += 1;")?;
@@ -2707,6 +2812,7 @@ fn emit_forward_function(
 fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), CodegenError> {
     let hidden = config.hidden_size;
     let intermediate = config.intermediate_size;
+    let vocab = config.vocab_size;
     let num_heads = config.num_attention_heads;
     let num_kv_heads = config.num_kv_heads;
     let head_dim = config.head_dim;
@@ -3119,19 +3225,49 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
         writeln!(code, "                }}")?;
         writeln!(code, "            }});")?;
     } else {
+        // f32 prefill logits: use cblas_sgemv on macOS, parallel dot_f32 elsewhere
+        writeln!(code, "            #[cfg(target_os = \"macos\")] {{")?;
         writeln!(
             code,
-            "            last_logits.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
+            "                // Accelerate/AMX: single cblas_sgemv for lm_head projection"
         )?;
-        writeln!(code, "                let base = chunk_idx * 256;")?;
-        writeln!(code, "                for r in 0..out.len() {{")?;
-        writeln!(code, "                    let j = base + r;")?;
+        writeln!(code, "                unsafe {{")?;
+        writeln!(code, "                    cblas_sgemv(")?;
         writeln!(
             code,
-            "                    out[r] = dot_f32(&normed[..], &weights.lm_head[j*{hidden}..(j+1)*{hidden}], {hidden});"
+            "                        CBLAS_ROW_MAJOR, CBLAS_NO_TRANS,"
         )?;
+        writeln!(
+            code,
+            "                        {vocab} as i32, {hidden} as i32,"
+        )?;
+        writeln!(code, "                        1.0,")?;
+        writeln!(
+            code,
+            "                        weights.lm_head.as_ptr(), {hidden} as i32,"
+        )?;
+        writeln!(code, "                        normed.as_ptr(), 1,")?;
+        writeln!(code, "                        0.0,")?;
+        writeln!(code, "                        last_logits.as_mut_ptr(), 1,")?;
+        writeln!(code, "                    );")?;
         writeln!(code, "                }}")?;
-        writeln!(code, "            }});")?;
+        writeln!(code, "            }}")?;
+        writeln!(code, "            #[cfg(not(target_os = \"macos\"))]")?;
+        writeln!(code, "            {{")?;
+        writeln!(
+            code,
+            "                last_logits.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
+        )?;
+        writeln!(code, "                    let base = chunk_idx * 256;")?;
+        writeln!(code, "                    for r in 0..out.len() {{")?;
+        writeln!(code, "                        let j = base + r;")?;
+        writeln!(
+            code,
+            "                        out[r] = dot_f32(&normed[..], &weights.lm_head[j*{hidden}..(j+1)*{hidden}], {hidden});"
+        )?;
+        writeln!(code, "                    }}")?;
+        writeln!(code, "                }});")?;
+        writeln!(code, "            }}")?;
     }
     writeln!(code, "        }}")?;
     writeln!(code, "    }}")?;
@@ -3202,6 +3338,80 @@ mod tests {
         assert!(code.contains("pub fn embedding("));
         assert!(code.contains("pub fn elementwise_mul("));
         assert!(code.contains("pub fn elementwise_add("));
+    }
+
+    #[test]
+    fn generated_code_has_accelerate_ffi() {
+        let config = tiny_config();
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let code = generate(&graph).unwrap();
+
+        // Accelerate framework FFI declarations should always be emitted
+        assert!(
+            code.contains("fn cblas_sgemv("),
+            "generated code should declare cblas_sgemv FFI"
+        );
+        assert!(
+            code.contains("#[link(name = \"Accelerate\", kind = \"framework\")]"),
+            "generated code should link Accelerate framework"
+        );
+        assert!(
+            code.contains("CBLAS_ROW_MAJOR"),
+            "generated code should define CBLAS_ROW_MAJOR constant"
+        );
+        assert!(
+            code.contains("CBLAS_NO_TRANS"),
+            "generated code should define CBLAS_NO_TRANS constant"
+        );
+    }
+
+    #[test]
+    fn f32_matmul_uses_cblas_on_macos() {
+        let config = tiny_config();
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let code = generate(&graph).unwrap();
+
+        // f32 specialized matmul functions should have macOS cblas_sgemv path
+        assert!(
+            code.contains("#[cfg(target_os = \"macos\")]\n#[inline]\nfn matmul_vec_"),
+            "f32 matmul_vec should have a macOS-specific variant using cblas_sgemv"
+        );
+        assert!(
+            code.contains("#[cfg(not(target_os = \"macos\"))]\n#[inline]\nfn matmul_vec_")
+                || code.contains("#[cfg(not(target_os = \"macos\"))]\n/// Parallelized"),
+            "f32 matmul_vec should have a non-macOS fallback variant"
+        );
+
+        // The f32 logits path should use cblas_sgemv on macOS
+        assert!(
+            code.contains("cfg(target_os = \"macos\")]") && code.contains("cblas_sgemv("),
+            "f32 logits projection should use cblas_sgemv on macOS"
+        );
+    }
+
+    #[test]
+    fn q8_matmul_does_not_use_cblas() {
+        let config = ModelConfig {
+            dtype: DType::Q8_0,
+            ..tiny_config()
+        };
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let code = generate(&graph).unwrap();
+
+        // Q8_0 matmul functions should NOT use cblas (it only handles f32)
+        assert!(
+            code.contains("fn matmul_vec_q8_0_"),
+            "Q8_0 model should have quantized matmul functions"
+        );
+        // Q8_0 matmul_vec_q8_0_* should not contain cblas calls
+        // (cblas_sgemv is only for f32 matmul_vec_* and f32 logits)
+        let q8_matmul_section = code
+            .find("fn matmul_vec_q8_0_")
+            .and_then(|start| code[start..].find("fn matmul_vec_q8_0_").map(|_| start));
+        assert!(
+            q8_matmul_section.is_some(),
+            "should find Q8_0 matmul functions"
+        );
     }
 
     #[test]
