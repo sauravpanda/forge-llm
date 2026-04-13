@@ -1961,9 +1961,20 @@ fn cmd_export_weights_impl(
 
         let mut output_data: Vec<u8> = Vec::with_capacity(weights.memory_bytes());
 
-        // Write a tensor as its stored representation (F32 stays F32; Q8_0/Q4_0 stays raw bytes).
+        // Write a tensor as its quantized representation.
+        // Q8_0/Q4_0 raw bytes are written directly; F32 projection weights
+        // (e.g. from mixed-quant GGUF files where some tensors are Q4_1)
+        // are quantized to Q4_0 to match the generated code's expectations.
         let write_mixed = |data: &mut Vec<u8>, name: &str| {
             match weights.get(name) {
+                Some(WeightData::F32(v)) if is_q4 && v.len() > config.hidden_size => {
+                    // F32 projection weight in a Q4_0 model — quantize to Q4_0.
+                    // This happens for tensors stored as Q4_1 in the GGUF (which
+                    // get dequantized to F32 by load_from_file_mixed).
+                    // Norm weights (size == hidden_size) are kept as F32.
+                    let q4_bytes = forgellm_frontend::weight_loader::quantize_f32_to_q4_0(v);
+                    data.extend_from_slice(&q4_bytes);
+                }
                 Some(WeightData::F32(v)) => {
                     for &val in v {
                         data.extend_from_slice(&val.to_le_bytes());
@@ -1978,7 +1989,22 @@ fn cmd_export_weights_impl(
                 None => {
                     // lm_head fallback: use embed_tokens (same as lm_head in tied-weight models)
                     if name == "lm_head.weight" {
+                        let numel = config.vocab_size * config.hidden_size;
                         match weights.get("model.embed_tokens.weight") {
+                            Some(WeightData::F32(v)) if is_q4 => {
+                                let q4_bytes =
+                                    forgellm_frontend::weight_loader::quantize_f32_to_q4_0(v);
+                                data.extend_from_slice(&q4_bytes);
+                            }
+                            Some(WeightData::Q8_0Raw(b)) if is_q4 => {
+                                // Dequantize Q8_0 → f32, then quantize to Q4_0
+                                let f32s = forgellm_frontend::weight_loader::dequantize_q8_0_to_f32(
+                                    b, numel,
+                                );
+                                let q4_bytes =
+                                    forgellm_frontend::weight_loader::quantize_f32_to_q4_0(&f32s);
+                                data.extend_from_slice(&q4_bytes);
+                            }
                             Some(WeightData::F32(v)) => {
                                 for &val in v {
                                     data.extend_from_slice(&val.to_le_bytes());

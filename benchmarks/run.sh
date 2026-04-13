@@ -63,7 +63,7 @@ echo ""
 # --- Build release ---
 echo "Building forge (release)..."
 cd "$PROJECT_DIR"
-cargo build --release 2>&1 | tail -1
+cargo build --release -p forgellm-cli 2>&1 | tail -1
 FORGE="$PROJECT_DIR/target/release/forge"
 echo ""
 

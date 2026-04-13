@@ -111,3 +111,4 @@ Optimizations:
 ```
 
 Results are saved to `benchmarks/results/<version>.json` and appended to this file.
+| v0.4.0 | 2026-04-13 | 128.8 | 219.2 (best: 221.8) | 29s | 2.8 MB | Darwin arm64 18c |

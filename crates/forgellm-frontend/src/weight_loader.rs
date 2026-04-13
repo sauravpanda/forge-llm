@@ -781,6 +781,98 @@ fn f16_to_f32(bits: u16) -> f32 {
     f32::from_bits((sign << 31) | (f32_exp << 23) | (mantissa << 13))
 }
 
+/// F32 → F16 conversion (round to nearest, ties to even).
+fn f32_to_f16(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = (bits >> 31) & 1;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let mant = bits & 0x7F_FFFF;
+
+    if exp == 0xFF {
+        // Inf / NaN
+        let h_mant = (mant >> 13) & 0x3FF;
+        return ((sign << 15) | (0x1F << 10) | h_mant) as u16;
+    }
+
+    let unbiased = exp - 127;
+    if unbiased > 15 {
+        // Overflow → f16 infinity
+        return ((sign << 15) | (0x1F << 10)) as u16;
+    }
+    if unbiased < -24 {
+        // Underflow → zero
+        return (sign << 15) as u16;
+    }
+    if unbiased < -14 {
+        // Subnormal f16
+        let shift = (-14 - unbiased) as u32;
+        let h_mant = ((mant | 0x80_0000) >> (14 + shift)) as u32;
+        return ((sign << 15) | h_mant) as u16;
+    }
+
+    let h_exp = (unbiased + 15) as u32;
+    let h_mant = mant >> 13;
+    ((sign << 15) | (h_exp << 10) | h_mant) as u16
+}
+
+/// Quantize an f32 slice to Q4_0 raw bytes.
+///
+/// Q4_0 block layout (32 elements → 18 bytes):
+/// - 2 bytes: f16 scale (max absolute value / 8)
+/// - 16 bytes: packed 4-bit unsigned values (offset by 8).
+///   Byte j contains element j in low nibble and element j+16 in high nibble.
+pub fn quantize_f32_to_q4_0(data: &[f32]) -> Vec<u8> {
+    let num_blocks = data.len().div_ceil(32);
+    let mut out = vec![0u8; num_blocks * 18];
+
+    for blk in 0..num_blocks {
+        let base = blk * 32;
+        let end = (base + 32).min(data.len());
+        let block_data = &data[base..end];
+
+        // Find max absolute value
+        let mut amax = 0.0f32;
+        for &v in block_data {
+            let a = v.abs();
+            if a > amax {
+                amax = a;
+            }
+        }
+
+        // Scale: maps [-8*scale, 7*scale] to the value range
+        let scale = amax / 8.0;
+        let inv_scale = if scale != 0.0 { 1.0 / scale } else { 0.0 };
+
+        let ob = blk * 18;
+        let scale_bits = f32_to_f16(scale);
+        out[ob] = scale_bits as u8;
+        out[ob + 1] = (scale_bits >> 8) as u8;
+
+        // Quantize: value → round(value / scale) + 8, clamp to [0, 15]
+        for j in 0..16 {
+            let lo_idx = j;
+            let hi_idx = j + 16;
+            let lo_val = if base + lo_idx < data.len() {
+                data[base + lo_idx]
+            } else {
+                0.0
+            };
+            let hi_val = if base + hi_idx < data.len() {
+                data[base + hi_idx]
+            } else {
+                0.0
+            };
+
+            let lo_q = ((lo_val * inv_scale).round() as i32 + 8).clamp(0, 15) as u8;
+            let hi_q = ((hi_val * inv_scale).round() as i32 + 8).clamp(0, 15) as u8;
+
+            out[ob + 2 + j] = lo_q | (hi_q << 4);
+        }
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -967,6 +1059,47 @@ mod tests {
                 assert_eq!(&v[..], &block[..]);
             }
             _ => panic!("expected Q4_0Raw variant"),
+        }
+    }
+
+    #[test]
+    fn quantize_q4_0_roundtrip() {
+        // Generate 64 f32 values (2 Q4_0 blocks)
+        let input: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) * 0.1).collect();
+        let q4_bytes = quantize_f32_to_q4_0(&input);
+        assert_eq!(q4_bytes.len(), 2 * 18); // 2 blocks × 18 bytes
+
+        // Dequantize and check approximate roundtrip
+        let output = dequant_q4_0(&q4_bytes, 64);
+        assert_eq!(output.len(), 64);
+
+        // Q4_0 has only 4-bit precision (16 levels), so quantization error
+        // can be up to ~1 step = scale/1. Check that the max error is bounded.
+        let max_abs = input.iter().copied().fold(0.0f32, |a, v| a.max(v.abs()));
+        let step = max_abs / 8.0; // Q4_0 scale
+        for (i, (&orig, &decoded)) in input.iter().zip(output.iter()).enumerate() {
+            let diff = (orig - decoded).abs();
+            assert!(
+                diff <= step + 0.01,
+                "element {i}: orig={orig}, decoded={decoded}, diff={diff}, step={step}"
+            );
+        }
+    }
+
+    #[test]
+    fn quantize_q4_0_zeros() {
+        let input = vec![0.0f32; 32];
+        let q4_bytes = quantize_f32_to_q4_0(&input);
+        assert_eq!(q4_bytes.len(), 18);
+
+        // Scale should be 0
+        let scale_bits = u16::from_le_bytes([q4_bytes[0], q4_bytes[1]]);
+        assert_eq!(scale_bits, 0, "zero input should produce zero scale");
+
+        // Dequantized values should all be 0
+        let output = dequant_q4_0(&q4_bytes, 32);
+        for &v in &output {
+            assert_eq!(v, 0.0);
         }
     }
 }
