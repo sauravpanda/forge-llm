@@ -384,6 +384,58 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Detect the dominant weight quantization type from a parsed GGUF file.
+///
+/// Inspects all tensors whose names look like projection weights (contain ".weight"
+/// but are not embedding or normalization layers) and returns the most common
+/// `DType`. Falls back to `DType::F16` when the type is unsupported by the AOT
+/// codegen (e.g. K-quants).
+fn detect_gguf_dtype(gguf_file: &gguf::GGUFFile) -> forgellm_frontend::ir::DType {
+    use forgellm_frontend::gguf::GGMLType;
+    use forgellm_frontend::ir::DType;
+
+    let mut q8_count = 0usize;
+    let mut q4_count = 0usize;
+    let mut f16_count = 0usize;
+    let mut f32_count = 0usize;
+
+    for tensor in &gguf_file.tensors {
+        let name = &tensor.name;
+        // Only count projection / FFN weight tensors; skip embeddings and norms
+        // (those stay F32/F16 even in Q8_0 models and would skew the count).
+        let is_projection = name.contains(".weight")
+            && !name.contains("token_embd")
+            && !name.contains("output.weight")
+            && !name.contains("_norm");
+        if !is_projection {
+            continue;
+        }
+        match tensor.ggml_type {
+            GGMLType::Q8_0 => q8_count += 1,
+            GGMLType::Q4_0 => q4_count += 1,
+            GGMLType::F16 | GGMLType::BF16 => f16_count += 1,
+            GGMLType::F32 => f32_count += 1,
+            _ => {} // K-quants and others fall through to F16 fallback
+        }
+    }
+
+    let total = q8_count + q4_count + f16_count + f32_count;
+    if total == 0 {
+        return DType::F16;
+    }
+
+    // Pick the type that accounts for the majority of projection weights.
+    if q8_count > total / 2 {
+        DType::Q8_0
+    } else if q4_count > total / 2 {
+        DType::Q4_0
+    } else if f32_count > total / 2 {
+        DType::F32
+    } else {
+        DType::F16
+    }
+}
+
 /// Load a ModelConfig from a GGUF file, SafeTensors file, or HF config.json directory.
 fn load_model_config(model_path: &str) -> Result<ModelConfig> {
     let path = Path::new(model_path);
@@ -468,6 +520,8 @@ fn load_model_config(model_path: &str) -> Result<ModelConfig> {
         // Qwen2 has bias terms on Q, K, V projections.
         let qkv_bias = matches!(architecture, forgellm_frontend::ir::Architecture::Qwen2);
 
+        let dtype = detect_gguf_dtype(&gguf_file);
+
         Ok(ModelConfig {
             architecture,
             hidden_size,
@@ -480,7 +534,7 @@ fn load_model_config(model_path: &str) -> Result<ModelConfig> {
             max_seq_len,
             rms_norm_eps,
             rope_theta,
-            dtype: forgellm_frontend::ir::DType::F16,
+            dtype,
             sliding_window_size,
             qkv_bias,
         })
@@ -1891,7 +1945,7 @@ fn cmd_export_weights_impl(
 
         let mut output_data: Vec<u8> = Vec::with_capacity(weights.memory_bytes());
 
-        // Write a tensor — for quantized models: f32 tensors as f32 bytes, raw quant as raw bytes
+        // Write a tensor as its stored representation (F32 stays F32; Q8_0/Q4_0 stays raw bytes).
         let write_mixed = |data: &mut Vec<u8>, name: &str| {
             match weights.get(name) {
                 Some(WeightData::F32(v)) => {
@@ -1906,7 +1960,7 @@ fn cmd_export_weights_impl(
                     data.extend_from_slice(b);
                 }
                 None => {
-                    // lm_head fallback: use embed_tokens
+                    // lm_head fallback: use embed_tokens (same as lm_head in tied-weight models)
                     if name == "lm_head.weight" {
                         match weights.get("model.embed_tokens.weight") {
                             Some(WeightData::F32(v)) => {
@@ -1929,7 +1983,31 @@ fn cmd_export_weights_impl(
             }
         };
 
-        write_mixed(&mut output_data, "model.embed_tokens.weight");
+        // Write embed_tokens always as F32 — the generated main.rs reads it as a flat f32 slice
+        // for token lookup (not a bulk matmul), so there is no benefit to keeping it quantized.
+        // Norms are also always F32 (they come from the GGUF as F32 in all quantized models).
+        let write_embed_as_f32 = |data: &mut Vec<u8>, name: &str| {
+            let numel = config.vocab_size * config.hidden_size;
+            match weights.get(name) {
+                Some(WeightData::F32(v)) => {
+                    for &val in v {
+                        data.extend_from_slice(&val.to_le_bytes());
+                    }
+                }
+                Some(WeightData::Q8_0Raw(b)) => {
+                    let f32s = forgellm_frontend::weight_loader::dequantize_q8_0_to_f32(b, numel);
+                    for val in f32s {
+                        data.extend_from_slice(&val.to_le_bytes());
+                    }
+                }
+                Some(WeightData::Q4_0Raw(_)) => {
+                    panic!("Q4_0 embed_tokens: dequantization not yet implemented for export");
+                }
+                None => panic!("embed_tokens weight not found: {name}"),
+            }
+        };
+
+        write_embed_as_f32(&mut output_data, "model.embed_tokens.weight");
 
         for layer_idx in 0..config.num_layers {
             let prefix = format!("model.layers.{layer_idx}");
@@ -2093,4 +2171,83 @@ fn cmd_export_weights_impl(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forgellm_frontend::gguf::{GGMLType, GGUFFile, GGUFTensorInfo};
+    use forgellm_frontend::ir::DType;
+    use std::collections::HashMap;
+
+    fn make_gguf_with_types(types: &[(&str, GGMLType)]) -> GGUFFile {
+        GGUFFile {
+            version: 3,
+            metadata: HashMap::new(),
+            tensors: types
+                .iter()
+                .map(|(name, t)| GGUFTensorInfo {
+                    name: name.to_string(),
+                    dimensions: vec![64, 64],
+                    ggml_type: *t,
+                    offset: 0,
+                })
+                .collect(),
+            tensor_data_offset: 0,
+            alignment: 32,
+        }
+    }
+
+    #[test]
+    fn detect_dtype_q8_0_majority() {
+        let gguf = make_gguf_with_types(&[
+            ("blk.0.attn_q.weight", GGMLType::Q8_0),
+            ("blk.0.attn_k.weight", GGMLType::Q8_0),
+            ("blk.0.attn_v.weight", GGMLType::Q8_0),
+            ("blk.0.ffn_gate.weight", GGMLType::Q8_0),
+            // norm/embed layers — excluded from count
+            ("blk.0.attn_norm.weight", GGMLType::F32),
+            ("token_embd.weight", GGMLType::F32),
+        ]);
+        assert_eq!(detect_gguf_dtype(&gguf), DType::Q8_0);
+    }
+
+    #[test]
+    fn detect_dtype_q4_0_majority() {
+        let gguf = make_gguf_with_types(&[
+            ("blk.0.attn_q.weight", GGMLType::Q4_0),
+            ("blk.0.attn_k.weight", GGMLType::Q4_0),
+            ("blk.0.attn_v.weight", GGMLType::Q4_0),
+            ("blk.0.ffn_gate.weight", GGMLType::Q4_0),
+            ("blk.0.attn_norm.weight", GGMLType::F32),
+        ]);
+        assert_eq!(detect_gguf_dtype(&gguf), DType::Q4_0);
+    }
+
+    #[test]
+    fn detect_dtype_falls_back_to_f16_for_k_quants() {
+        // K-quants are not yet handled by codegen — fall back to F16.
+        let gguf = make_gguf_with_types(&[
+            ("blk.0.attn_q.weight", GGMLType::Q4K),
+            ("blk.0.attn_k.weight", GGMLType::Q4K),
+            ("blk.0.attn_v.weight", GGMLType::Q4K),
+        ]);
+        assert_eq!(detect_gguf_dtype(&gguf), DType::F16);
+    }
+
+    #[test]
+    fn detect_dtype_f16_model() {
+        let gguf = make_gguf_with_types(&[
+            ("blk.0.attn_q.weight", GGMLType::F16),
+            ("blk.0.attn_k.weight", GGMLType::F16),
+            ("blk.0.ffn_gate.weight", GGMLType::F16),
+        ]);
+        assert_eq!(detect_gguf_dtype(&gguf), DType::F16);
+    }
+
+    #[test]
+    fn detect_dtype_empty_returns_f16() {
+        let gguf = make_gguf_with_types(&[]);
+        assert_eq!(detect_gguf_dtype(&gguf), DType::F16);
+    }
 }

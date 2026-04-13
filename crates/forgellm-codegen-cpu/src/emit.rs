@@ -27,6 +27,7 @@ pub fn generate(graph: &Graph) -> Result<String, CodegenError> {
     emit_kernel_functions(&mut code, config)?;
     if config.dtype == DType::Q8_0 {
         emit_q8_0_kernel(&mut code)?;
+        emit_q8_0_sdot_kernel(&mut code)?;
         emit_specialized_q8_matmul_functions(&mut code, config)?;
     }
     if config.dtype == DType::Q4_0 {
@@ -623,9 +624,10 @@ fn emit_specialized_matmul_functions(
     )?;
     writeln!(code)?;
 
-    // Threshold for parallelization: only parallelize if N >= 512
-    // (otherwise Rayon overhead dominates the compute for small matmuls)
-    let par_threshold = 512;
+    // Threshold for parallelization: only parallelize if N >= 4096
+    // (otherwise Rayon task-spawn overhead dominates; e.g. N=576 yields only 3 chunks
+    //  which gives poor utilization and more overhead than benefit)
+    let par_threshold = 4096;
 
     for &(k, n) in &matmul_shapes(config) {
         writeln!(
@@ -720,6 +722,13 @@ fn emit_specialized_matmul_functions(
 }
 
 /// Emit the Q8_0 dot-product helper and f16→f32 conversion used by Q8_0 matmul.
+///
+/// On AArch64 (Apple Silicon, Arm servers) the dot product is vectorised with
+/// NEON: int8 values are widened to f32 in three steps (s8→s16→s32→f32) and
+/// accumulated via `vfmaq_f32`.  Eight NEON float vectors cover one full 32-
+/// element block, matching the throughput of the F32 NEON kernel.
+///
+/// On all other targets the implementation falls back to a portable scalar loop.
 fn emit_q8_0_kernel(code: &mut String) -> Result<(), CodegenError> {
     code.push_str(
         r#"
@@ -748,25 +757,542 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
 
 /// Dot product of f32 input against a Q8_0 weight row without prior dequantization.
 /// `weight_row`: raw Q8_0 bytes — layout: [2 bytes f16 scale][32 bytes int8] per block.
-/// `k`: number of input/weight elements.
+/// `k`: number of input/weight elements (must be a multiple of 32 for NEON path).
 #[inline]
 fn dot_q8_0(input: &[f32], weight_row: &[u8], k: usize) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::*;
+        const BLOCK_SIZE: usize = 32;
+        const TYPE_SIZE: usize = 34;
+        let num_blocks = k / BLOCK_SIZE;
+
+        // Four independent accumulators hide the latency of sequential vaddq_f32.
+        // We interleave 4 blocks at a time; each accumulator is a float32x4 summing
+        // products from its assigned blocks throughout the inner loop.
+        let mut a0 = unsafe { vdupq_n_f32(0.0) };
+        let mut a1 = unsafe { vdupq_n_f32(0.0) };
+        let mut a2 = unsafe { vdupq_n_f32(0.0) };
+        let mut a3 = unsafe { vdupq_n_f32(0.0) };
+
+        // Helper macro: widen a Q8_0 block and fmla into an accumulator.
+        // (Cannot be a closure because it borrows multiple vars.)
+        macro_rules! dot_block {
+            ($acc:ident, $b:expr) => {{
+                let bs = $b * TYPE_SIZE;
+                let scale = f16_bits_to_f32(
+                    u16::from_le_bytes([weight_row[bs], weight_row[bs + 1]])
+                );
+                let block_start = $b * BLOCK_SIZE;
+                unsafe {
+                    let sv = vdupq_n_f32(scale);
+                    let w_ptr = weight_row[bs + 2..].as_ptr() as *const i8;
+                    let w_lo = vld1q_s8(w_ptr);
+                    let w_hi = vld1q_s8(w_ptr.add(16));
+                    let wf0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(vmovl_s8(vget_low_s8(w_lo)))));
+                    let wf1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(vmovl_s8(vget_low_s8(w_lo)))));
+                    let wf2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(vmovl_s8(vget_high_s8(w_lo)))));
+                    let wf3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(vmovl_s8(vget_high_s8(w_lo)))));
+                    let wf4 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(vmovl_s8(vget_low_s8(w_hi)))));
+                    let wf5 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(vmovl_s8(vget_low_s8(w_hi)))));
+                    let wf6 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(vmovl_s8(vget_high_s8(w_hi)))));
+                    let wf7 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(vmovl_s8(vget_high_s8(w_hi)))));
+                    let i_ptr = input[block_start..].as_ptr();
+                    let i0 = vld1q_f32(i_ptr);
+                    let i1 = vld1q_f32(i_ptr.add(4));
+                    let i2 = vld1q_f32(i_ptr.add(8));
+                    let i3 = vld1q_f32(i_ptr.add(12));
+                    let i4 = vld1q_f32(i_ptr.add(16));
+                    let i5 = vld1q_f32(i_ptr.add(20));
+                    let i6 = vld1q_f32(i_ptr.add(24));
+                    let i7 = vld1q_f32(i_ptr.add(28));
+                    let mut tmp = vdupq_n_f32(0.0);
+                    tmp = vfmaq_f32(tmp, i0, vmulq_f32(wf0, sv));
+                    tmp = vfmaq_f32(tmp, i1, vmulq_f32(wf1, sv));
+                    tmp = vfmaq_f32(tmp, i2, vmulq_f32(wf2, sv));
+                    tmp = vfmaq_f32(tmp, i3, vmulq_f32(wf3, sv));
+                    tmp = vfmaq_f32(tmp, i4, vmulq_f32(wf4, sv));
+                    tmp = vfmaq_f32(tmp, i5, vmulq_f32(wf5, sv));
+                    tmp = vfmaq_f32(tmp, i6, vmulq_f32(wf6, sv));
+                    tmp = vfmaq_f32(tmp, i7, vmulq_f32(wf7, sv));
+                    $acc = vaddq_f32($acc, tmp);
+                }
+            }};
+        }
+
+        let groups = num_blocks / 4;
+        for g in 0..groups {
+            let base = g * 4;
+            dot_block!(a0, base);
+            dot_block!(a1, base + 1);
+            dot_block!(a2, base + 2);
+            dot_block!(a3, base + 3);
+        }
+        // Tail blocks (0, 1, or 2)
+        let tail_start = groups * 4;
+        if tail_start < num_blocks { dot_block!(a0, tail_start); }
+        if tail_start + 1 < num_blocks { dot_block!(a1, tail_start + 1); }
+        if tail_start + 2 < num_blocks { dot_block!(a2, tail_start + 2); }
+
+        let merged = unsafe {
+            vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3))
+        };
+        let covered = num_blocks * BLOCK_SIZE;
+        let mut result = unsafe { vaddvq_f32(merged) };
+        for j in covered..k {
+            let b = j / BLOCK_SIZE;
+            let bs = b * TYPE_SIZE;
+            let scale = f16_bits_to_f32(u16::from_le_bytes([weight_row[bs], weight_row[bs + 1]]));
+            let q = weight_row[bs + 2 + (j % BLOCK_SIZE)] as i8;
+            result += input[j] * (q as f32 * scale);
+        }
+        return result;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        const BLOCK_SIZE: usize = 32;
+        const TYPE_SIZE: usize = 34;
+        let num_blocks = k.div_ceil(BLOCK_SIZE);
+        let mut sum = 0.0f32;
+        for b in 0..num_blocks {
+            let bs = b * TYPE_SIZE;
+            let scale_bits = u16::from_le_bytes([weight_row[bs], weight_row[bs + 1]]);
+            let scale = f16_bits_to_f32(scale_bits);
+            let block_start = b * BLOCK_SIZE;
+            let block_end = (block_start + BLOCK_SIZE).min(k);
+            for j in 0..(block_end - block_start) {
+                let q = weight_row[bs + 2 + j] as i8;
+                sum += input[block_start + j] * (q as f32 * scale);
+            }
+        }
+        sum
+    }
+}
+
+"#,
+    );
+    Ok(())
+}
+
+/// Emit the int8×int8 kernel and input-quantization helper.
+///
+/// We quantize the input activation to Q8_0 blocks once per matmul call,
+/// then compute each output row with `vmull_s8` + `vpaddlq_s16` — stable
+/// NEON intrinsics that process 32 int8 pairs in ~8 ops instead of the
+/// 48+ ops needed for the f32-widening path.  This typically gives 3–4×
+/// better throughput on the inner dot product; the quantization overhead
+/// is amortised over all N output rows of the same matmul.
+///
+/// Note: `target-cpu=native` (written to `.cargo/config.toml`) lets LLVM
+/// also emit `sdot` from these patterns on M1+ where dotprod is available,
+/// closing the gap further without requiring unstable feature flags.
+fn emit_q8_0_sdot_kernel(code: &mut String) -> Result<(), CodegenError> {
+    code.push_str(
+        r#"
+// --- Q8_0 × Q8_0 int8 dot product via AArch64 sdot (inline asm, stable Rust) ---
+// Input is quantized to Q8_0 once per matmul call; each output row then uses
+// sdot (Signed DOT product, 16 int8 pairs → 4 int32 per instruction) instead
+// of the f32-widening path.  2 sdot calls cover one 32-element Q8_0 block vs.
+// the 4 vmull+4 vpaddl needed for the pure-intrinsics path.
+
+/// Quantize a f32 slice to Q8_0 blocks in-place (block-wise, 32 elements per block).
+/// `out` must be pre-allocated with `ceil(input.len()/32)*34` bytes.
+/// Format: [2-byte f16 scale][32 int8 values] per block.
+/// The scale is computed per-block as absmax/127 so no element saturates.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn quantize_to_q8_0_blocks_into(input: &[f32], out: &mut [u8]) {
     const BLOCK_SIZE: usize = 32;
-    const TYPE_SIZE: usize = 34; // 2 scale bytes + 32 data bytes
+    const TYPE_SIZE: usize = 34;
+    let k = input.len();
     let num_blocks = k.div_ceil(BLOCK_SIZE);
-    let mut sum = 0.0f32;
     for b in 0..num_blocks {
-        let bs = b * TYPE_SIZE;
-        let scale_bits = u16::from_le_bytes([weight_row[bs], weight_row[bs + 1]]);
-        let scale = f16_bits_to_f32(scale_bits);
         let block_start = b * BLOCK_SIZE;
         let block_end = (block_start + BLOCK_SIZE).min(k);
-        for j in 0..(block_end - block_start) {
-            let q = weight_row[bs + 2 + j] as i8;
-            sum += input[block_start + j] * (q as f32 * scale);
+        let block = &input[block_start..block_end];
+        let absmax = block.iter().map(|&x| x.abs()).fold(0.0f32, f32::max);
+        let (scale, inv_scale) = if absmax == 0.0 {
+            (1.0f32, 0.0f32)
+        } else {
+            let s = absmax / 127.0;
+            (s, 1.0 / s)
+        };
+        let scale_bits = f32_to_f16_bits(scale);
+        let bs = b * TYPE_SIZE;
+        out[bs]     = (scale_bits & 0xFF) as u8;
+        out[bs + 1] = (scale_bits >> 8)  as u8;
+        for (j, &x) in block.iter().enumerate() {
+            out[bs + 2 + j] = (x * inv_scale).round().clamp(-127.0, 127.0) as i8 as u8;
+        }
+        for j in block.len()..BLOCK_SIZE {
+            out[bs + 2 + j] = 0u8;
         }
     }
-    sum
+    let _ = num_blocks;
+}
+
+/// Quantize a f32 slice to Q8_0 blocks, returning a Vec<u8>.
+/// Use `quantize_to_q8_0_blocks_into` with a stack buffer when the size is
+/// statically known (avoids heap allocation in hot paths).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn quantize_to_q8_0_blocks(input: &[f32]) -> Vec<u8> {
+    const BLOCK_SIZE: usize = 32;
+    const TYPE_SIZE: usize = 34;
+    let num_blocks = input.len().div_ceil(BLOCK_SIZE);
+    let mut out = vec![0u8; num_blocks * TYPE_SIZE];
+    quantize_to_q8_0_blocks_into(input, &mut out);
+    out
+}
+
+/// f32 → IEEE 754 f16 bit pattern (for quantization scale storage).
+#[inline]
+fn f32_to_f16_bits(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign    = ((bits >> 16) & 0x8000) as u16;
+    let exp_f32 = ((bits >> 23) & 0xFF) as i32;
+    let exp_f16 = exp_f32 - 127 + 15;
+    let mantissa = ((bits >> 13) & 0x3FF) as u16;
+    if exp_f16 <= 0        { sign }
+    else if exp_f16 >= 31  { sign | 0x7C00 }
+    else                   { sign | ((exp_f16 as u16) << 10) | mantissa }
+}
+
+/// Dot product of two Q8_0 vectors using AArch64 `sdot` instruction via inline asm.
+///
+/// `sdot` (Signed DOT product) processes 16 int8 pairs and accumulates 4 int32
+/// results in a single instruction — 2 calls cover a full 32-element Q8_0 block.
+/// This is available on ARMv8.4+/FEAT_DotProd (M1 and all modern Arm chips)
+/// without requiring the unstable `stdarch_neon_dotprod` Rust feature.
+///
+/// Four independent f32 accumulators provide ILP across interleaved blocks.
+/// Each block's int32 sum is immediately scaled by `a_scale * b_scale` before
+/// being added to the f32 accumulator — no scale mixing across blocks.
+///
+/// `a_q8`: input quantized to Q8_0 blocks by `quantize_to_q8_0_blocks`.
+/// `b_q8`: weight row raw Q8_0 bytes.
+/// `k`: element count.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn dot_q8_0_q8_0(a_q8: &[u8], b_q8: &[u8], k: usize) -> f32 {
+    use std::arch::aarch64::*;
+    const BLOCK_SIZE: usize = 32;
+    const TYPE_SIZE: usize  = 34;
+    let num_blocks = k / BLOCK_SIZE;
+
+    // Four independent f32 accumulators for ILP across interleaved blocks.
+    let mut fa0 = 0.0f32;
+    let mut fa1 = 0.0f32;
+    let mut fa2 = 0.0f32;
+    let mut fa3 = 0.0f32;
+
+    // Compute combined_scale * sdot_sum for one Q8_0 block.
+    // sdot processes 16 int8 pairs per call (2 calls = 32 elements / block).
+    // Uses inline asm to call SDOT directly on stable Rust toolchain.
+    macro_rules! block_f32 {
+        ($b:expr) => {{
+            let bs = $b * TYPE_SIZE;
+            let a_scale = f16_bits_to_f32(u16::from_le_bytes([a_q8[bs], a_q8[bs + 1]]));
+            let b_scale = f16_bits_to_f32(u16::from_le_bytes([b_q8[bs], b_q8[bs + 1]]));
+            let combined = a_scale * b_scale;
+            unsafe {
+                let ap = a_q8[bs + 2..].as_ptr() as *const i8;
+                let bp = b_q8[bs + 2..].as_ptr() as *const i8;
+                let a0: int8x16_t = vld1q_s8(ap);
+                let a1: int8x16_t = vld1q_s8(ap.add(16));
+                let b0: int8x16_t = vld1q_s8(bp);
+                let b1: int8x16_t = vld1q_s8(bp.add(16));
+                let mut acc: int32x4_t = vdupq_n_s32(0);
+                // sdot: acc.4s += sdot(a.16b, b.16b) — 16 int8 pairs → 4 int32
+                core::arch::asm!(
+                    "sdot {acc:v}.4s, {a0:v}.16b, {b0:v}.16b",
+                    "sdot {acc:v}.4s, {a1:v}.16b, {b1:v}.16b",
+                    acc = inout(vreg) acc,
+                    a0 = in(vreg) a0,
+                    b0 = in(vreg) b0,
+                    a1 = in(vreg) a1,
+                    b1 = in(vreg) b1,
+                    options(nostack),
+                );
+                combined * vaddvq_s32(acc) as f32
+            }
+        }};
+    }
+
+    let groups = num_blocks / 4;
+    for g in 0..groups {
+        let base = g * 4;
+        fa0 += block_f32!(base);
+        fa1 += block_f32!(base + 1);
+        fa2 += block_f32!(base + 2);
+        fa3 += block_f32!(base + 3);
+    }
+    let tail = groups * 4;
+    if tail     < num_blocks { fa0 += block_f32!(tail);     }
+    if tail + 1 < num_blocks { fa1 += block_f32!(tail + 1); }
+    if tail + 2 < num_blocks { fa2 += block_f32!(tail + 2); }
+
+    let mut result = fa0 + fa1 + fa2 + fa3;
+    // Scalar tail for any k not a multiple of 32
+    for j in (num_blocks * BLOCK_SIZE)..k {
+        let b  = j / BLOCK_SIZE;
+        let bs = b * TYPE_SIZE;
+        let as_ = f16_bits_to_f32(u16::from_le_bytes([a_q8[bs], a_q8[bs + 1]]));
+        let bs_ = f16_bits_to_f32(u16::from_le_bytes([b_q8[bs], b_q8[bs + 1]]));
+        let aq = a_q8[bs + 2 + (j % BLOCK_SIZE)] as i8;
+        let bq = b_q8[bs + 2 + (j % BLOCK_SIZE)] as i8;
+        result += as_ * bs_ * (aq as f32) * (bq as f32);
+    }
+    result
+}
+
+/// Compute 4 Q8_0 dot products simultaneously, sharing the quantized input block.
+///
+/// Processes `(input_q8, w0_q8)`, `(input_q8, w1_q8)`, `(input_q8, w2_q8)`,
+/// `(input_q8, w3_q8)` in a single pass over the input.
+///
+/// For each 32-element Q8_0 block we load the input data (`ai0`, `ai1`) once
+/// and issue 8 independent sdot instructions (2 per weight row) — giving
+/// 4-way ILP across rows with full register pressure coverage.
+/// This eliminates 3/4 of the redundant input-block loads that sequential
+/// calls would cause, and maximises the M1's OOO instruction window.
+///
+/// Returns `(dot0, dot1, dot2, dot3)`.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn dot4_q8_0_q8_0(
+    a_q8: &[u8],
+    b0_q8: &[u8],
+    b1_q8: &[u8],
+    b2_q8: &[u8],
+    b3_q8: &[u8],
+    k: usize,
+) -> (f32, f32, f32, f32) {
+    use std::arch::aarch64::*;
+    const BLOCK_SIZE: usize = 32;
+    const TYPE_SIZE: usize = 34;
+    let num_blocks = k / BLOCK_SIZE;
+
+    let mut r0 = 0.0f32;
+    let mut r1 = 0.0f32;
+    let mut r2 = 0.0f32;
+    let mut r3 = 0.0f32;
+
+    for b in 0..num_blocks {
+        let abs = b * TYPE_SIZE;
+        let a_scale = f16_bits_to_f32(u16::from_le_bytes([a_q8[abs], a_q8[abs + 1]]));
+        let s0 = a_scale * f16_bits_to_f32(u16::from_le_bytes([b0_q8[abs], b0_q8[abs + 1]]));
+        let s1 = a_scale * f16_bits_to_f32(u16::from_le_bytes([b1_q8[abs], b1_q8[abs + 1]]));
+        let s2 = a_scale * f16_bits_to_f32(u16::from_le_bytes([b2_q8[abs], b2_q8[abs + 1]]));
+        let s3 = a_scale * f16_bits_to_f32(u16::from_le_bytes([b3_q8[abs], b3_q8[abs + 1]]));
+        unsafe {
+            // Load input block ONCE; reuse for all 4 weight rows.
+            let ap = a_q8[abs + 2..].as_ptr() as *const i8;
+            let ai0: int8x16_t = vld1q_s8(ap);
+            let ai1: int8x16_t = vld1q_s8(ap.add(16));
+            // Load 4 weight blocks (2 halves each).
+            let bp0 = b0_q8[abs + 2..].as_ptr() as *const i8;
+            let bp1 = b1_q8[abs + 2..].as_ptr() as *const i8;
+            let bp2 = b2_q8[abs + 2..].as_ptr() as *const i8;
+            let bp3 = b3_q8[abs + 2..].as_ptr() as *const i8;
+            let w00: int8x16_t = vld1q_s8(bp0);       let w01: int8x16_t = vld1q_s8(bp0.add(16));
+            let w10: int8x16_t = vld1q_s8(bp1);       let w11: int8x16_t = vld1q_s8(bp1.add(16));
+            let w20: int8x16_t = vld1q_s8(bp2);       let w21: int8x16_t = vld1q_s8(bp2.add(16));
+            let w30: int8x16_t = vld1q_s8(bp3);       let w31: int8x16_t = vld1q_s8(bp3.add(16));
+            // 8 independent sdot calls — 4-way ILP across the 4 accumulators.
+            let mut acc0: int32x4_t = vdupq_n_s32(0);
+            let mut acc1: int32x4_t = vdupq_n_s32(0);
+            let mut acc2: int32x4_t = vdupq_n_s32(0);
+            let mut acc3: int32x4_t = vdupq_n_s32(0);
+            core::arch::asm!(
+                "sdot {a0:v}.4s, {i0:v}.16b, {b00:v}.16b",
+                "sdot {a1:v}.4s, {i0:v}.16b, {b10:v}.16b",
+                "sdot {a2:v}.4s, {i0:v}.16b, {b20:v}.16b",
+                "sdot {a3:v}.4s, {i0:v}.16b, {b30:v}.16b",
+                "sdot {a0:v}.4s, {i1:v}.16b, {b01:v}.16b",
+                "sdot {a1:v}.4s, {i1:v}.16b, {b11:v}.16b",
+                "sdot {a2:v}.4s, {i1:v}.16b, {b21:v}.16b",
+                "sdot {a3:v}.4s, {i1:v}.16b, {b31:v}.16b",
+                a0 = inout(vreg) acc0, a1 = inout(vreg) acc1,
+                a2 = inout(vreg) acc2, a3 = inout(vreg) acc3,
+                i0 = in(vreg) ai0,    i1 = in(vreg) ai1,
+                b00 = in(vreg) w00,   b01 = in(vreg) w01,
+                b10 = in(vreg) w10,   b11 = in(vreg) w11,
+                b20 = in(vreg) w20,   b21 = in(vreg) w21,
+                b30 = in(vreg) w30,   b31 = in(vreg) w31,
+                options(nostack),
+            );
+            r0 += s0 * vaddvq_s32(acc0) as f32;
+            r1 += s1 * vaddvq_s32(acc1) as f32;
+            r2 += s2 * vaddvq_s32(acc2) as f32;
+            r3 += s3 * vaddvq_s32(acc3) as f32;
+        }
+    }
+    // Scalar tail for k not divisible by 32
+    for j in (num_blocks * BLOCK_SIZE)..k {
+        let b  = j / BLOCK_SIZE;
+        let bs = b * TYPE_SIZE;
+        let as_ = f16_bits_to_f32(u16::from_le_bytes([a_q8[bs], a_q8[bs + 1]]));
+        let aq = a_q8[bs + 2 + (j % BLOCK_SIZE)] as i8;
+        let bq0 = b0_q8[bs + 2 + (j % BLOCK_SIZE)] as i8;
+        let bq1 = b1_q8[bs + 2 + (j % BLOCK_SIZE)] as i8;
+        let bq2 = b2_q8[bs + 2 + (j % BLOCK_SIZE)] as i8;
+        let bq3 = b3_q8[bs + 2 + (j % BLOCK_SIZE)] as i8;
+        let bs0 = f16_bits_to_f32(u16::from_le_bytes([b0_q8[bs], b0_q8[bs + 1]]));
+        let bs1 = f16_bits_to_f32(u16::from_le_bytes([b1_q8[bs], b1_q8[bs + 1]]));
+        let bs2 = f16_bits_to_f32(u16::from_le_bytes([b2_q8[bs], b2_q8[bs + 1]]));
+        let bs3 = f16_bits_to_f32(u16::from_le_bytes([b3_q8[bs], b3_q8[bs + 1]]));
+        r0 += as_ * bs0 * (aq as f32) * (bq0 as f32);
+        r1 += as_ * bs1 * (aq as f32) * (bq1 as f32);
+        r2 += as_ * bs2 * (aq as f32) * (bq2 as f32);
+        r3 += as_ * bs3 * (aq as f32) * (bq3 as f32);
+    }
+    (r0, r1, r2, r3)
+}
+
+/// 8-row simultaneous Q8_0 × Q8_0 dot product via AArch64 `sdot` inline asm.
+///
+/// Loads the input Q8_0 block ONCE and issues 16 independent `sdot` instructions
+/// (2 per weight row × 8 rows) per block — providing 8-way ILP across rows.
+/// The 8 independent first-half `sdot` instructions fully cover the 4-cycle
+/// sdot RAW latency before each row's second-half `sdot`, eliminating stalls.
+/// Also halves function-call overhead vs. `dot4_q8_0_q8_0` for the same N.
+///
+/// Returns `(r0, r1, r2, r3, r4, r5, r6, r7)`.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn dot8_q8_0_q8_0(
+    a_q8: &[u8],
+    b0_q8: &[u8], b1_q8: &[u8], b2_q8: &[u8], b3_q8: &[u8],
+    b4_q8: &[u8], b5_q8: &[u8], b6_q8: &[u8], b7_q8: &[u8],
+    k: usize,
+) -> (f32, f32, f32, f32, f32, f32, f32, f32) {
+    use std::arch::aarch64::*;
+    const BLOCK_SIZE: usize = 32;
+    const TYPE_SIZE: usize  = 34;
+    let num_blocks = k / BLOCK_SIZE;
+
+    let mut r0 = 0.0f32; let mut r1 = 0.0f32;
+    let mut r2 = 0.0f32; let mut r3 = 0.0f32;
+    let mut r4 = 0.0f32; let mut r5 = 0.0f32;
+    let mut r6 = 0.0f32; let mut r7 = 0.0f32;
+
+    for b in 0..num_blocks {
+        let abs = b * TYPE_SIZE;
+        let a_scale = f16_bits_to_f32(u16::from_le_bytes([a_q8[abs], a_q8[abs + 1]]));
+        let s0 = a_scale * f16_bits_to_f32(u16::from_le_bytes([b0_q8[abs], b0_q8[abs + 1]]));
+        let s1 = a_scale * f16_bits_to_f32(u16::from_le_bytes([b1_q8[abs], b1_q8[abs + 1]]));
+        let s2 = a_scale * f16_bits_to_f32(u16::from_le_bytes([b2_q8[abs], b2_q8[abs + 1]]));
+        let s3 = a_scale * f16_bits_to_f32(u16::from_le_bytes([b3_q8[abs], b3_q8[abs + 1]]));
+        let s4 = a_scale * f16_bits_to_f32(u16::from_le_bytes([b4_q8[abs], b4_q8[abs + 1]]));
+        let s5 = a_scale * f16_bits_to_f32(u16::from_le_bytes([b5_q8[abs], b5_q8[abs + 1]]));
+        let s6 = a_scale * f16_bits_to_f32(u16::from_le_bytes([b6_q8[abs], b6_q8[abs + 1]]));
+        let s7 = a_scale * f16_bits_to_f32(u16::from_le_bytes([b7_q8[abs], b7_q8[abs + 1]]));
+        unsafe {
+            let ap  = a_q8[abs + 2..].as_ptr() as *const i8;
+            let ai0: int8x16_t = vld1q_s8(ap);
+            let ai1: int8x16_t = vld1q_s8(ap.add(16));
+            let bp0 = b0_q8[abs + 2..].as_ptr() as *const i8;
+            let bp1 = b1_q8[abs + 2..].as_ptr() as *const i8;
+            let bp2 = b2_q8[abs + 2..].as_ptr() as *const i8;
+            let bp3 = b3_q8[abs + 2..].as_ptr() as *const i8;
+            let bp4 = b4_q8[abs + 2..].as_ptr() as *const i8;
+            let bp5 = b5_q8[abs + 2..].as_ptr() as *const i8;
+            let bp6 = b6_q8[abs + 2..].as_ptr() as *const i8;
+            let bp7 = b7_q8[abs + 2..].as_ptr() as *const i8;
+            let w00: int8x16_t = vld1q_s8(bp0);       let w01: int8x16_t = vld1q_s8(bp0.add(16));
+            let w10: int8x16_t = vld1q_s8(bp1);       let w11: int8x16_t = vld1q_s8(bp1.add(16));
+            let w20: int8x16_t = vld1q_s8(bp2);       let w21: int8x16_t = vld1q_s8(bp2.add(16));
+            let w30: int8x16_t = vld1q_s8(bp3);       let w31: int8x16_t = vld1q_s8(bp3.add(16));
+            let w40: int8x16_t = vld1q_s8(bp4);       let w41: int8x16_t = vld1q_s8(bp4.add(16));
+            let w50: int8x16_t = vld1q_s8(bp5);       let w51: int8x16_t = vld1q_s8(bp5.add(16));
+            let w60: int8x16_t = vld1q_s8(bp6);       let w61: int8x16_t = vld1q_s8(bp6.add(16));
+            let w70: int8x16_t = vld1q_s8(bp7);       let w71: int8x16_t = vld1q_s8(bp7.add(16));
+            let mut acc0: int32x4_t = vdupq_n_s32(0);
+            let mut acc1: int32x4_t = vdupq_n_s32(0);
+            let mut acc2: int32x4_t = vdupq_n_s32(0);
+            let mut acc3: int32x4_t = vdupq_n_s32(0);
+            let mut acc4: int32x4_t = vdupq_n_s32(0);
+            let mut acc5: int32x4_t = vdupq_n_s32(0);
+            let mut acc6: int32x4_t = vdupq_n_s32(0);
+            let mut acc7: int32x4_t = vdupq_n_s32(0);
+            // 16 independent sdot — 8 for first halves, 8 for second halves.
+            // Between acc0's first and second sdot there are 7 independent sdot,
+            // fully covering the 4-cycle RAW latency on M1.
+            core::arch::asm!(
+                "sdot {a0:v}.4s, {i0:v}.16b, {b00:v}.16b",
+                "sdot {a1:v}.4s, {i0:v}.16b, {b10:v}.16b",
+                "sdot {a2:v}.4s, {i0:v}.16b, {b20:v}.16b",
+                "sdot {a3:v}.4s, {i0:v}.16b, {b30:v}.16b",
+                "sdot {a4:v}.4s, {i0:v}.16b, {b40:v}.16b",
+                "sdot {a5:v}.4s, {i0:v}.16b, {b50:v}.16b",
+                "sdot {a6:v}.4s, {i0:v}.16b, {b60:v}.16b",
+                "sdot {a7:v}.4s, {i0:v}.16b, {b70:v}.16b",
+                "sdot {a0:v}.4s, {i1:v}.16b, {b01:v}.16b",
+                "sdot {a1:v}.4s, {i1:v}.16b, {b11:v}.16b",
+                "sdot {a2:v}.4s, {i1:v}.16b, {b21:v}.16b",
+                "sdot {a3:v}.4s, {i1:v}.16b, {b31:v}.16b",
+                "sdot {a4:v}.4s, {i1:v}.16b, {b41:v}.16b",
+                "sdot {a5:v}.4s, {i1:v}.16b, {b51:v}.16b",
+                "sdot {a6:v}.4s, {i1:v}.16b, {b61:v}.16b",
+                "sdot {a7:v}.4s, {i1:v}.16b, {b71:v}.16b",
+                a0 = inout(vreg) acc0, a1 = inout(vreg) acc1,
+                a2 = inout(vreg) acc2, a3 = inout(vreg) acc3,
+                a4 = inout(vreg) acc4, a5 = inout(vreg) acc5,
+                a6 = inout(vreg) acc6, a7 = inout(vreg) acc7,
+                i0 = in(vreg) ai0,    i1 = in(vreg) ai1,
+                b00 = in(vreg) w00,   b01 = in(vreg) w01,
+                b10 = in(vreg) w10,   b11 = in(vreg) w11,
+                b20 = in(vreg) w20,   b21 = in(vreg) w21,
+                b30 = in(vreg) w30,   b31 = in(vreg) w31,
+                b40 = in(vreg) w40,   b41 = in(vreg) w41,
+                b50 = in(vreg) w50,   b51 = in(vreg) w51,
+                b60 = in(vreg) w60,   b61 = in(vreg) w61,
+                b70 = in(vreg) w70,   b71 = in(vreg) w71,
+                options(nostack),
+            );
+            r0 += s0 * vaddvq_s32(acc0) as f32;
+            r1 += s1 * vaddvq_s32(acc1) as f32;
+            r2 += s2 * vaddvq_s32(acc2) as f32;
+            r3 += s3 * vaddvq_s32(acc3) as f32;
+            r4 += s4 * vaddvq_s32(acc4) as f32;
+            r5 += s5 * vaddvq_s32(acc5) as f32;
+            r6 += s6 * vaddvq_s32(acc6) as f32;
+            r7 += s7 * vaddvq_s32(acc7) as f32;
+        }
+    }
+    // Scalar tail (k not divisible by 32)
+    for j in (num_blocks * BLOCK_SIZE)..k {
+        let b  = j / BLOCK_SIZE;
+        let bs = b * TYPE_SIZE;
+        let as_ = f16_bits_to_f32(u16::from_le_bytes([a_q8[bs], a_q8[bs + 1]]));
+        let aq = a_q8[bs + 2 + (j % BLOCK_SIZE)] as i8;
+        let bq0 = b0_q8[bs + 2 + (j % BLOCK_SIZE)] as i8;
+        let bq1 = b1_q8[bs + 2 + (j % BLOCK_SIZE)] as i8;
+        let bq2 = b2_q8[bs + 2 + (j % BLOCK_SIZE)] as i8;
+        let bq3 = b3_q8[bs + 2 + (j % BLOCK_SIZE)] as i8;
+        let bq4 = b4_q8[bs + 2 + (j % BLOCK_SIZE)] as i8;
+        let bq5 = b5_q8[bs + 2 + (j % BLOCK_SIZE)] as i8;
+        let bq6 = b6_q8[bs + 2 + (j % BLOCK_SIZE)] as i8;
+        let bq7 = b7_q8[bs + 2 + (j % BLOCK_SIZE)] as i8;
+        let bs0 = f16_bits_to_f32(u16::from_le_bytes([b0_q8[bs], b0_q8[bs + 1]]));
+        let bs1 = f16_bits_to_f32(u16::from_le_bytes([b1_q8[bs], b1_q8[bs + 1]]));
+        let bs2 = f16_bits_to_f32(u16::from_le_bytes([b2_q8[bs], b2_q8[bs + 1]]));
+        let bs3 = f16_bits_to_f32(u16::from_le_bytes([b3_q8[bs], b3_q8[bs + 1]]));
+        let bs4 = f16_bits_to_f32(u16::from_le_bytes([b4_q8[bs], b4_q8[bs + 1]]));
+        let bs5 = f16_bits_to_f32(u16::from_le_bytes([b5_q8[bs], b5_q8[bs + 1]]));
+        let bs6 = f16_bits_to_f32(u16::from_le_bytes([b6_q8[bs], b6_q8[bs + 1]]));
+        let bs7 = f16_bits_to_f32(u16::from_le_bytes([b7_q8[bs], b7_q8[bs + 1]]));
+        r0 += as_ * bs0 * (aq as f32) * (bq0 as f32);
+        r1 += as_ * bs1 * (aq as f32) * (bq1 as f32);
+        r2 += as_ * bs2 * (aq as f32) * (bq2 as f32);
+        r3 += as_ * bs3 * (aq as f32) * (bq3 as f32);
+        r4 += as_ * bs4 * (aq as f32) * (bq4 as f32);
+        r5 += as_ * bs5 * (aq as f32) * (bq5 as f32);
+        r6 += as_ * bs6 * (aq as f32) * (bq6 as f32);
+        r7 += as_ * bs7 * (aq as f32) * (bq7 as f32);
+    }
+    (r0, r1, r2, r3, r4, r5, r6, r7)
 }
 
 "#,
@@ -792,7 +1318,9 @@ fn emit_specialized_q8_matmul_functions(
     )?;
     writeln!(code)?;
 
-    let par_threshold = 512;
+    // Rayon overhead dominates for small N — only parallelize when N >= 4096
+    // (N=576 → 3 chunks, N=1536 → 6 chunks: too few for effective utilization)
+    let par_threshold = 4096;
 
     for &(k, n) in &q8_matmul_shapes(config) {
         // Byte size per row: ceil(k/32)*34
@@ -801,12 +1329,112 @@ fn emit_specialized_q8_matmul_functions(
             code,
             "/// Q8_0 matmul: [1, {k}] x [{n}, {k}]^T -> [1, {n}] (weight stored as raw Q8_0 bytes)"
         )?;
+
+        // --- AArch64 sdot path (inline asm, stable Rust) ---
+        // Quantize input to Q8_0 once per call, then compute each row with
+        // dot_q8_0_q8_0 which uses the sdot instruction (2 sdot per 32-element
+        // block vs. 4 vmull+4 vpaddl for pure intrinsics — ~2x fewer NEON ops).
+        writeln!(code, "#[cfg(target_arch = \"aarch64\")]")?;
+        writeln!(code, "#[inline]")?;
+        writeln!(
+            code,
+            "fn matmul_vec_q8_0_{k}x{n}(output: &mut [f32; {n}], input: &[f32; {k}], weight: &[u8]) {{"
+        )?;
+        // Stack-allocated Q8_0 buffer: avoids heap allocation on every matmul call.
+        // Size is statically known: ceil(k/32)*34 bytes.
+        let q8_bytes = row_bytes; // row_bytes = k.div_ceil(32)*34, already computed
+        writeln!(code, "    let mut input_q8 = [0u8; {q8_bytes}];")?;
+        writeln!(
+            code,
+            "    quantize_to_q8_0_blocks_into(&input[..], &mut input_q8);"
+        )?;
+        // Use dot8 for groups of 8 rows (better ILP — 16 sdot/block covers 4-cycle latency),
+        // fall back to dot4 for 4-row remainder, then scalar for final <4 rows.
+        let n_chunks8 = n / 8;
+        let n_rem8 = n % 8;
+        let n_chunks4_tail = n_rem8 / 4;
+        let n_rem4 = n_rem8 % 4;
         if n >= par_threshold {
-            writeln!(code, "#[inline]")?;
             writeln!(
                 code,
-                "fn matmul_vec_q8_0_{k}x{n}(output: &mut [f32; {n}], input: &[f32; {k}], weight: &[u8]) {{"
+                "    output.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
             )?;
+            writeln!(code, "        let base = chunk_idx * 256;")?;
+            writeln!(code, "        let len = out.len();")?;
+            writeln!(code, "        let chunks8 = len / 8;")?;
+            writeln!(code, "        for c in 0..chunks8 {{")?;
+            writeln!(code, "            let r = base + c * 8;")?;
+            writeln!(
+                code,
+                "            let (d0,d1,d2,d3,d4,d5,d6,d7) = dot8_q8_0_q8_0(&input_q8, &weight[r*{row_bytes}..(r+1)*{row_bytes}], &weight[(r+1)*{row_bytes}..(r+2)*{row_bytes}], &weight[(r+2)*{row_bytes}..(r+3)*{row_bytes}], &weight[(r+3)*{row_bytes}..(r+4)*{row_bytes}], &weight[(r+4)*{row_bytes}..(r+5)*{row_bytes}], &weight[(r+5)*{row_bytes}..(r+6)*{row_bytes}], &weight[(r+6)*{row_bytes}..(r+7)*{row_bytes}], &weight[(r+7)*{row_bytes}..(r+8)*{row_bytes}], {k});"
+            )?;
+            writeln!(code, "            out[c*8] = d0; out[c*8+1] = d1; out[c*8+2] = d2; out[c*8+3] = d3; out[c*8+4] = d4; out[c*8+5] = d5; out[c*8+6] = d6; out[c*8+7] = d7;")?;
+            writeln!(code, "        }}")?;
+            writeln!(code, "        let tail8 = chunks8 * 8;")?;
+            writeln!(code, "        let chunks4t = (len - tail8) / 4;")?;
+            writeln!(code, "        for c in 0..chunks4t {{")?;
+            writeln!(code, "            let r = base + tail8 + c * 4;")?;
+            writeln!(
+                code,
+                "            let (d0,d1,d2,d3) = dot4_q8_0_q8_0(&input_q8, &weight[r*{row_bytes}..(r+1)*{row_bytes}], &weight[(r+1)*{row_bytes}..(r+2)*{row_bytes}], &weight[(r+2)*{row_bytes}..(r+3)*{row_bytes}], &weight[(r+3)*{row_bytes}..(r+4)*{row_bytes}], {k});"
+            )?;
+            writeln!(code, "            out[tail8+c*4] = d0; out[tail8+c*4+1] = d1; out[tail8+c*4+2] = d2; out[tail8+c*4+3] = d3;")?;
+            writeln!(code, "        }}")?;
+            writeln!(code, "        for i in (tail8 + chunks4t*4)..len {{")?;
+            writeln!(code, "            let j = base + i;")?;
+            writeln!(
+                code,
+                "            out[i] = dot_q8_0_q8_0(&input_q8, &weight[j*{row_bytes}..(j+1)*{row_bytes}], {k});"
+            )?;
+            writeln!(code, "        }}")?;
+            writeln!(code, "    }});")?;
+        } else {
+            if n_chunks8 > 0 {
+                writeln!(code, "    for chunk in 0..{n_chunks8} {{")?;
+                writeln!(code, "        let j0 = chunk * 8;")?;
+                writeln!(
+                    code,
+                    "        let (d0,d1,d2,d3,d4,d5,d6,d7) = dot8_q8_0_q8_0(&input_q8, &weight[j0*{row_bytes}..(j0+1)*{row_bytes}], &weight[(j0+1)*{row_bytes}..(j0+2)*{row_bytes}], &weight[(j0+2)*{row_bytes}..(j0+3)*{row_bytes}], &weight[(j0+3)*{row_bytes}..(j0+4)*{row_bytes}], &weight[(j0+4)*{row_bytes}..(j0+5)*{row_bytes}], &weight[(j0+5)*{row_bytes}..(j0+6)*{row_bytes}], &weight[(j0+6)*{row_bytes}..(j0+7)*{row_bytes}], &weight[(j0+7)*{row_bytes}..(j0+8)*{row_bytes}], {k});"
+                )?;
+                writeln!(
+                    code,
+                    "        output[j0] = d0; output[j0+1] = d1; output[j0+2] = d2; output[j0+3] = d3; output[j0+4] = d4; output[j0+5] = d5; output[j0+6] = d6; output[j0+7] = d7;"
+                )?;
+                writeln!(code, "    }}")?;
+            }
+            if n_chunks4_tail > 0 {
+                let base8 = n_chunks8 * 8;
+                writeln!(code, "    let base8 = {base8};")?;
+                writeln!(code, "    for chunk4 in 0..{n_chunks4_tail} {{")?;
+                writeln!(code, "        let j0 = base8 + chunk4 * 4;")?;
+                writeln!(
+                    code,
+                    "        let (d0,d1,d2,d3) = dot4_q8_0_q8_0(&input_q8, &weight[j0*{row_bytes}..(j0+1)*{row_bytes}], &weight[(j0+1)*{row_bytes}..(j0+2)*{row_bytes}], &weight[(j0+2)*{row_bytes}..(j0+3)*{row_bytes}], &weight[(j0+3)*{row_bytes}..(j0+4)*{row_bytes}], {k});"
+                )?;
+                writeln!(
+                    code,
+                    "        output[j0] = d0; output[j0+1] = d1; output[j0+2] = d2; output[j0+3] = d3;"
+                )?;
+                writeln!(code, "    }}")?;
+            }
+            if n_rem4 > 0 {
+                let base_rem = n_chunks8 * 8 + n_chunks4_tail * 4;
+                for r in 0..n_rem4 {
+                    writeln!(code, "    output[{base_rem}+{r}] = dot_q8_0_q8_0(&input_q8, &weight[({base_rem}+{r})*{row_bytes}..({base_rem}+{r}+1)*{row_bytes}], {k});")?;
+                }
+            }
+        }
+        writeln!(code, "}}")?;
+        writeln!(code)?;
+
+        // --- Non-AArch64 fallback: f32 input × Q8_0 weight, 4-accumulator NEON widening ---
+        writeln!(code, "#[cfg(not(target_arch = \"aarch64\"))]")?;
+        writeln!(code, "#[inline]")?;
+        writeln!(
+            code,
+            "fn matmul_vec_q8_0_{k}x{n}(output: &mut [f32; {n}], input: &[f32; {k}], weight: &[u8]) {{"
+        )?;
+        if n >= par_threshold {
             writeln!(
                 code,
                 "    output.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
@@ -820,34 +1448,16 @@ fn emit_specialized_q8_matmul_functions(
             )?;
             writeln!(code, "        }}")?;
             writeln!(code, "    }});")?;
-            writeln!(code, "}}")?;
         } else {
-            writeln!(code, "#[inline]")?;
-            writeln!(
-                code,
-                "fn matmul_vec_q8_0_{k}x{n}(output: &mut [f32; {n}], input: &[f32; {k}], weight: &[u8]) {{"
-            )?;
             let n_chunks = n / 4;
             let n_remainder = n % 4;
             if n_chunks > 0 {
                 writeln!(code, "    for chunk in 0..{n_chunks} {{")?;
                 writeln!(code, "        let j0 = chunk * 4;")?;
-                writeln!(
-                    code,
-                    "        output[j0]   = dot_q8_0(&input[..], &weight[j0*{row_bytes}..(j0+1)*{row_bytes}], {k});"
-                )?;
-                writeln!(
-                    code,
-                    "        output[j0+1] = dot_q8_0(&input[..], &weight[(j0+1)*{row_bytes}..(j0+2)*{row_bytes}], {k});"
-                )?;
-                writeln!(
-                    code,
-                    "        output[j0+2] = dot_q8_0(&input[..], &weight[(j0+2)*{row_bytes}..(j0+3)*{row_bytes}], {k});"
-                )?;
-                writeln!(
-                    code,
-                    "        output[j0+3] = dot_q8_0(&input[..], &weight[(j0+3)*{row_bytes}..(j0+4)*{row_bytes}], {k});"
-                )?;
+                writeln!(code, "        output[j0]   = dot_q8_0(&input[..], &weight[j0*{row_bytes}..(j0+1)*{row_bytes}], {k});")?;
+                writeln!(code, "        output[j0+1] = dot_q8_0(&input[..], &weight[(j0+1)*{row_bytes}..(j0+2)*{row_bytes}], {k});")?;
+                writeln!(code, "        output[j0+2] = dot_q8_0(&input[..], &weight[(j0+2)*{row_bytes}..(j0+3)*{row_bytes}], {k});")?;
+                writeln!(code, "        output[j0+3] = dot_q8_0(&input[..], &weight[(j0+3)*{row_bytes}..(j0+4)*{row_bytes}], {k});")?;
                 writeln!(code, "    }}")?;
             }
             if n_remainder > 0 {
@@ -859,8 +1469,8 @@ fn emit_specialized_q8_matmul_functions(
                     )?;
                 }
             }
-            writeln!(code, "}}")?;
         }
+        writeln!(code, "}}")?;
         writeln!(code)?;
     }
 
@@ -944,7 +1554,8 @@ fn emit_specialized_q4_matmul_functions(
     )?;
     writeln!(code)?;
 
-    let par_threshold = 512;
+    // Same threshold as Q8_0: N < 4096 → sequential, N >= 4096 → parallel
+    let par_threshold = 4096;
 
     for &(k, n) in &q4_matmul_shapes(config) {
         // Byte size per row: ceil(k/32)*18
@@ -1492,33 +2103,88 @@ fn emit_forward_function(
         "    // Uses larger chunks (256) to amortize Rayon overhead"
     )?;
     writeln!(code, "    let mut logits = vec![0.0f32; VOCAB_SIZE];")?;
-    writeln!(
-        code,
-        "    logits.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
-    )?;
-    writeln!(code, "        let base = chunk_idx * 256;")?;
-    writeln!(code, "        for r in 0..out.len() {{")?;
-    writeln!(code, "            let j = base + r;")?;
     if is_q8 {
         let lm_row_bytes = hidden.div_ceil(32) * 34;
+        writeln!(code, "    #[cfg(target_arch = \"aarch64\")]")?;
+        writeln!(
+            code,
+            "    let normed_q8 = quantize_to_q8_0_blocks(&normed[..]);"
+        )?;
+        writeln!(
+            code,
+            "    logits.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
+        )?;
+        writeln!(code, "        let base = chunk_idx * 256;")?;
+        writeln!(code, "        #[cfg(target_arch = \"aarch64\")] {{")?;
+        writeln!(code, "            let chunks8 = out.len() / 8;")?;
+        writeln!(code, "            for c in 0..chunks8 {{")?;
+        writeln!(code, "                let r = base + c * 8;")?;
+        writeln!(
+            code,
+            "                let (d0,d1,d2,d3,d4,d5,d6,d7) = dot8_q8_0_q8_0(&normed_q8, &weights.lm_head[r*{lm_row_bytes}..(r+1)*{lm_row_bytes}], &weights.lm_head[(r+1)*{lm_row_bytes}..(r+2)*{lm_row_bytes}], &weights.lm_head[(r+2)*{lm_row_bytes}..(r+3)*{lm_row_bytes}], &weights.lm_head[(r+3)*{lm_row_bytes}..(r+4)*{lm_row_bytes}], &weights.lm_head[(r+4)*{lm_row_bytes}..(r+5)*{lm_row_bytes}], &weights.lm_head[(r+5)*{lm_row_bytes}..(r+6)*{lm_row_bytes}], &weights.lm_head[(r+6)*{lm_row_bytes}..(r+7)*{lm_row_bytes}], &weights.lm_head[(r+7)*{lm_row_bytes}..(r+8)*{lm_row_bytes}], {hidden});"
+        )?;
+        writeln!(code, "                out[c*8] = d0; out[c*8+1] = d1; out[c*8+2] = d2; out[c*8+3] = d3; out[c*8+4] = d4; out[c*8+5] = d5; out[c*8+6] = d6; out[c*8+7] = d7;")?;
+        writeln!(code, "            }}")?;
+        writeln!(code, "            let tail8 = chunks8 * 8;")?;
+        writeln!(code, "            let chunks4t = (out.len() - tail8) / 4;")?;
+        writeln!(code, "            for c in 0..chunks4t {{")?;
+        writeln!(code, "                let r = base + tail8 + c * 4;")?;
+        writeln!(
+            code,
+            "                let (d0,d1,d2,d3) = dot4_q8_0_q8_0(&normed_q8, &weights.lm_head[r*{lm_row_bytes}..(r+1)*{lm_row_bytes}], &weights.lm_head[(r+1)*{lm_row_bytes}..(r+2)*{lm_row_bytes}], &weights.lm_head[(r+2)*{lm_row_bytes}..(r+3)*{lm_row_bytes}], &weights.lm_head[(r+3)*{lm_row_bytes}..(r+4)*{lm_row_bytes}], {hidden});"
+        )?;
+        writeln!(code, "                out[tail8+c*4] = d0; out[tail8+c*4+1] = d1; out[tail8+c*4+2] = d2; out[tail8+c*4+3] = d3;")?;
+        writeln!(code, "            }}")?;
+        writeln!(
+            code,
+            "            for i in (tail8 + chunks4t*4)..out.len() {{"
+        )?;
+        writeln!(code, "                let j = base + i;")?;
+        writeln!(
+            code,
+            "                out[i] = dot_q8_0_q8_0(&normed_q8, &weights.lm_head[j*{lm_row_bytes}..(j+1)*{lm_row_bytes}], {hidden});"
+        )?;
+        writeln!(code, "            }}")?;
+        writeln!(code, "        }}")?;
+        writeln!(code, "        #[cfg(not(target_arch = \"aarch64\"))]")?;
+        writeln!(code, "        for r in 0..out.len() {{")?;
+        writeln!(code, "            let j = base + r;")?;
         writeln!(
             code,
             "            out[r] = dot_q8_0(&normed[..], &weights.lm_head[j*{lm_row_bytes}..(j+1)*{lm_row_bytes}], {hidden});"
         )?;
+        writeln!(code, "        }}")?;
+        writeln!(code, "    }});")?;
     } else if is_q4 {
         let lm_row_bytes = hidden.div_ceil(32) * 18;
         writeln!(
             code,
+            "    logits.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
+        )?;
+        writeln!(code, "        let base = chunk_idx * 256;")?;
+        writeln!(code, "        for r in 0..out.len() {{")?;
+        writeln!(code, "            let j = base + r;")?;
+        writeln!(
+            code,
             "            out[r] = dot_q4_0(&normed[..], &weights.lm_head[j*{lm_row_bytes}..(j+1)*{lm_row_bytes}], {hidden});"
         )?;
+        writeln!(code, "        }}")?;
+        writeln!(code, "    }});")?;
     } else {
+        writeln!(
+            code,
+            "    logits.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
+        )?;
+        writeln!(code, "        let base = chunk_idx * 256;")?;
+        writeln!(code, "        for r in 0..out.len() {{")?;
+        writeln!(code, "            let j = base + r;")?;
         writeln!(
             code,
             "            out[r] = dot_f32(&normed[..], &weights.lm_head[j*{hidden}..(j+1)*{hidden}], {hidden});"
         )?;
+        writeln!(code, "        }}")?;
+        writeln!(code, "    }});")?;
     }
-    writeln!(code, "        }}")?;
-    writeln!(code, "    }});")?;
     writeln!(code)?;
     writeln!(code, "    cache.len += 1;")?;
     writeln!(code, "    logits")?;
@@ -1825,33 +2491,97 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "            rms_norm(&mut normed, &hidden_state, &weights.final_norm, RMS_NORM_EPS);"
     )?;
-    writeln!(
-        code,
-        "            last_logits.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
-    )?;
-    writeln!(code, "                let base = chunk_idx * 256;")?;
-    writeln!(code, "                for r in 0..out.len() {{")?;
-    writeln!(code, "                    let j = base + r;")?;
     if is_q8 {
         let lm_row_bytes = hidden.div_ceil(32) * 34;
+        writeln!(code, "            #[cfg(target_arch = \"aarch64\")]")?;
+        writeln!(
+            code,
+            "            let normed_q8 = quantize_to_q8_0_blocks(&normed[..]);"
+        )?;
+        writeln!(
+            code,
+            "            last_logits.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
+        )?;
+        writeln!(code, "                let base = chunk_idx * 256;")?;
+        writeln!(code, "                #[cfg(target_arch = \"aarch64\")] {{")?;
+        writeln!(code, "                    let chunks8 = out.len() / 8;")?;
+        writeln!(code, "                    for c in 0..chunks8 {{")?;
+        writeln!(code, "                        let r = base + c * 8;")?;
+        writeln!(
+            code,
+            "                        let (d0,d1,d2,d3,d4,d5,d6,d7) = dot8_q8_0_q8_0(&normed_q8, &weights.lm_head[r*{lm_row_bytes}..(r+1)*{lm_row_bytes}], &weights.lm_head[(r+1)*{lm_row_bytes}..(r+2)*{lm_row_bytes}], &weights.lm_head[(r+2)*{lm_row_bytes}..(r+3)*{lm_row_bytes}], &weights.lm_head[(r+3)*{lm_row_bytes}..(r+4)*{lm_row_bytes}], &weights.lm_head[(r+4)*{lm_row_bytes}..(r+5)*{lm_row_bytes}], &weights.lm_head[(r+5)*{lm_row_bytes}..(r+6)*{lm_row_bytes}], &weights.lm_head[(r+6)*{lm_row_bytes}..(r+7)*{lm_row_bytes}], &weights.lm_head[(r+7)*{lm_row_bytes}..(r+8)*{lm_row_bytes}], {hidden});"
+        )?;
+        writeln!(code, "                        out[c*8] = d0; out[c*8+1] = d1; out[c*8+2] = d2; out[c*8+3] = d3; out[c*8+4] = d4; out[c*8+5] = d5; out[c*8+6] = d6; out[c*8+7] = d7;")?;
+        writeln!(code, "                    }}")?;
+        writeln!(code, "                    let tail8 = chunks8 * 8;")?;
+        writeln!(
+            code,
+            "                    let chunks4t = (out.len() - tail8) / 4;"
+        )?;
+        writeln!(code, "                    for c in 0..chunks4t {{")?;
+        writeln!(
+            code,
+            "                        let r = base + tail8 + c * 4;"
+        )?;
+        writeln!(
+            code,
+            "                        let (d0,d1,d2,d3) = dot4_q8_0_q8_0(&normed_q8, &weights.lm_head[r*{lm_row_bytes}..(r+1)*{lm_row_bytes}], &weights.lm_head[(r+1)*{lm_row_bytes}..(r+2)*{lm_row_bytes}], &weights.lm_head[(r+2)*{lm_row_bytes}..(r+3)*{lm_row_bytes}], &weights.lm_head[(r+3)*{lm_row_bytes}..(r+4)*{lm_row_bytes}], {hidden});"
+        )?;
+        writeln!(code, "                        out[tail8+c*4] = d0; out[tail8+c*4+1] = d1; out[tail8+c*4+2] = d2; out[tail8+c*4+3] = d3;")?;
+        writeln!(code, "                    }}")?;
+        writeln!(
+            code,
+            "                    for i in (tail8 + chunks4t*4)..out.len() {{"
+        )?;
+        writeln!(code, "                        let j = base + i;")?;
+        writeln!(
+            code,
+            "                        out[i] = dot_q8_0_q8_0(&normed_q8, &weights.lm_head[j*{lm_row_bytes}..(j+1)*{lm_row_bytes}], {hidden});"
+        )?;
+        writeln!(code, "                    }}")?;
+        writeln!(code, "                }}")?;
+        writeln!(
+            code,
+            "                #[cfg(not(target_arch = \"aarch64\"))]"
+        )?;
+        writeln!(code, "                for r in 0..out.len() {{")?;
+        writeln!(code, "                    let j = base + r;")?;
         writeln!(
             code,
             "                    out[r] = dot_q8_0(&normed[..], &weights.lm_head[j*{lm_row_bytes}..(j+1)*{lm_row_bytes}], {hidden});"
         )?;
+        writeln!(code, "                }}")?;
+        writeln!(code, "            }});")?;
     } else if is_q4 {
         let lm_row_bytes = hidden.div_ceil(32) * 18;
         writeln!(
             code,
+            "            last_logits.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
+        )?;
+        writeln!(code, "                let base = chunk_idx * 256;")?;
+        writeln!(code, "                for r in 0..out.len() {{")?;
+        writeln!(code, "                    let j = base + r;")?;
+        writeln!(
+            code,
             "                    out[r] = dot_q4_0(&normed[..], &weights.lm_head[j*{lm_row_bytes}..(j+1)*{lm_row_bytes}], {hidden});"
         )?;
+        writeln!(code, "                }}")?;
+        writeln!(code, "            }});")?;
     } else {
+        writeln!(
+            code,
+            "            last_logits.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
+        )?;
+        writeln!(code, "                let base = chunk_idx * 256;")?;
+        writeln!(code, "                for r in 0..out.len() {{")?;
+        writeln!(code, "                    let j = base + r;")?;
         writeln!(
             code,
             "                    out[r] = dot_f32(&normed[..], &weights.lm_head[j*{hidden}..(j+1)*{hidden}], {hidden});"
         )?;
+        writeln!(code, "                }}")?;
+        writeln!(code, "            }});")?;
     }
-    writeln!(code, "                }}")?;
-    writeln!(code, "            }});")?;
     writeln!(code, "        }}")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
