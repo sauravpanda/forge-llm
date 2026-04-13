@@ -1,0 +1,21 @@
+[package]
+name = "forgellm-python"
+description = "Python bindings for ForgeLLM — AOT compiler for small LLMs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lib]
+name = "forgellm"
+# cdylib = Python extension (.so / .pyd); rlib for optional Rust consumers.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+forgellm-frontend  = { workspace = true }
+forgellm-optimizer = { workspace = true }
+forgellm-codegen-cpu = { workspace = true }
+forgellm-runtime   = { workspace = true }
+pyo3 = { version = "0.21", features = ["extension-module"] }
+anyhow = { workspace = true }
