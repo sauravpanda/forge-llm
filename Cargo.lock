@@ -426,6 +426,7 @@ dependencies = [
  "clap",
  "forgellm-codegen-cpu",
  "forgellm-codegen-gpu",
+ "forgellm-codegen-metal",
  "forgellm-codegen-wasm",
  "forgellm-frontend",
  "forgellm-optimizer",
@@ -455,6 +456,18 @@ version = "0.4.0"
 dependencies = [
  "forgellm-frontend",
  "forgellm-optimizer",
+ "pretty_assertions",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "forgellm-codegen-metal"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "forgellm-frontend",
  "pretty_assertions",
  "tempfile",
  "thiserror",

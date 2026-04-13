@@ -1,0 +1,21 @@
+[package]
+name = "forgellm-codegen-metal"
+description = "Metal GPU code generation for Apple Silicon inference in ForgeLLM"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+forgellm-frontend = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+default = []
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
