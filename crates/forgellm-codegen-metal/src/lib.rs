@@ -139,7 +139,7 @@ kernel void matmul_vec(
     uint simd_id [[simdgroup_index_in_threadgroup]])
 {
     // Cooperatively load vector into threadgroup shared memory
-    threadgroup float vec_tile[16384];  // supports up to 16384 cols
+    threadgroup float vec_tile[4096];  // max 4096 cols (16 KB, fits in 32 KB TG mem)
     for (uint i = tid; i < cols; i += 256) {
         vec_tile[i] = vector[i];
     }
