@@ -521,10 +521,21 @@ fn emit_metal_model_struct(
     writeln!(code)?;
     writeln!(
         code,
-        "    // ── Working buffers (re-used every forward pass) ──"
+        "    // ── Working buffers (pre-allocated, reused every forward pass) ──"
     )?;
     writeln!(code, "    hidden_buf: Buffer,")?;
     writeln!(code, "    residual_buf: Buffer,")?;
+    writeln!(code, "    normed_buf: Buffer,")?;
+    writeln!(code, "    q_buf: Buffer,")?;
+    writeln!(code, "    k_buf: Buffer,")?;
+    writeln!(code, "    v_buf: Buffer,")?;
+    writeln!(code, "    attn_out_buf: Buffer,")?;
+    writeln!(code, "    attn_proj_buf: Buffer,")?;
+    writeln!(code, "    gate_buf: Buffer,")?;
+    writeln!(code, "    up_buf: Buffer,")?;
+    writeln!(code, "    ffn_hidden_buf: Buffer,")?;
+    writeln!(code, "    ffn_out_buf: Buffer,")?;
+    writeln!(code, "    add_tmp_buf: Buffer,")?;
     writeln!(code, "    logits_buf: Buffer,")?;
     writeln!(code)?;
     writeln!(code, "    // ── KV cache buffers (per-layer) ──")?;
@@ -882,6 +893,8 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
 
     // Working buffers
     let hidden_bytes = hidden * 4;
+    let kv_dim_bytes = kv_dim * 4;
+    let intermediate_bytes = intermediate * 4;
     let vocab_bytes = vocab * 4;
     let kv_cache_bytes = effective_seq_len * num_kv_heads * head_dim * 4;
 
@@ -900,6 +913,50 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(
         code,
         "        let residual_buf = device.new_buffer({hidden_bytes} as u64, opts);"
+    )?;
+    writeln!(
+        code,
+        "        let normed_buf = device.new_buffer({hidden_bytes} as u64, opts);"
+    )?;
+    writeln!(
+        code,
+        "        let q_buf = device.new_buffer({hidden_bytes} as u64, opts);"
+    )?;
+    writeln!(
+        code,
+        "        let k_buf = device.new_buffer({kv_dim_bytes} as u64, opts);"
+    )?;
+    writeln!(
+        code,
+        "        let v_buf = device.new_buffer({kv_dim_bytes} as u64, opts);"
+    )?;
+    writeln!(
+        code,
+        "        let attn_out_buf = device.new_buffer({hidden_bytes} as u64, opts);"
+    )?;
+    writeln!(
+        code,
+        "        let attn_proj_buf = device.new_buffer({hidden_bytes} as u64, opts);"
+    )?;
+    writeln!(
+        code,
+        "        let gate_buf = device.new_buffer({intermediate_bytes} as u64, opts);"
+    )?;
+    writeln!(
+        code,
+        "        let up_buf = device.new_buffer({intermediate_bytes} as u64, opts);"
+    )?;
+    writeln!(
+        code,
+        "        let ffn_hidden_buf = device.new_buffer({intermediate_bytes} as u64, opts);"
+    )?;
+    writeln!(
+        code,
+        "        let ffn_out_buf = device.new_buffer({hidden_bytes} as u64, opts);"
+    )?;
+    writeln!(
+        code,
+        "        let add_tmp_buf = device.new_buffer({hidden_bytes} as u64, opts);"
     )?;
     writeln!(
         code,
@@ -945,6 +1002,17 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            lm_head_buf,")?;
     writeln!(code, "            hidden_buf,")?;
     writeln!(code, "            residual_buf,")?;
+    writeln!(code, "            normed_buf,")?;
+    writeln!(code, "            q_buf,")?;
+    writeln!(code, "            k_buf,")?;
+    writeln!(code, "            v_buf,")?;
+    writeln!(code, "            attn_out_buf,")?;
+    writeln!(code, "            attn_proj_buf,")?;
+    writeln!(code, "            gate_buf,")?;
+    writeln!(code, "            up_buf,")?;
+    writeln!(code, "            ffn_hidden_buf,")?;
+    writeln!(code, "            ffn_out_buf,")?;
+    writeln!(code, "            add_tmp_buf,")?;
     writeln!(code, "            logits_buf,")?;
     writeln!(code, "            k_cache,")?;
     writeln!(code, "            v_cache,")?;
@@ -963,11 +1031,21 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "    /// Returns logits over the vocabulary as a `Vec<f32>`."
     )?;
+    writeln!(code, "    ///")?;
+    writeln!(
+        code,
+        "    /// All GPU operations are encoded into a single command buffer and"
+    )?;
+    writeln!(
+        code,
+        "    /// committed once at the end, avoiding per-operation synchronization."
+    )?;
     writeln!(
         code,
         "    pub fn forward(&mut self, token_id: u32) -> Vec<f32> {{"
     )?;
     writeln!(code, "        let pos = self.pos;")?;
+    writeln!(code, "        let cmd = self.queue.new_command_buffer();")?;
     writeln!(code)?;
 
     // 1. Embedding lookup
@@ -983,11 +1061,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            let byte_len = HIDDEN_SIZE * 4;")?;
     writeln!(
         code,
-        "            let blit_cmd = self.queue.new_command_buffer();"
-    )?;
-    writeln!(
-        code,
-        "            let blit_enc = blit_cmd.new_blit_command_encoder();"
+        "            let blit_enc = cmd.new_blit_command_encoder();"
     )?;
     writeln!(code, "            blit_enc.copy_from_buffer(")?;
     writeln!(code, "                &self.embed_buf, src_offset as u64,")?;
@@ -1000,8 +1074,6 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "                byte_len as u64,")?;
     writeln!(code, "            );")?;
     writeln!(code, "            blit_enc.end_encoding();")?;
-    writeln!(code, "            blit_cmd.commit();")?;
-    writeln!(code, "            blit_cmd.wait_until_completed();")?;
     writeln!(code, "        }}")?;
     writeln!(code)?;
 
@@ -1014,7 +1086,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            // 2a. RMS norm (attention)")?;
     writeln!(
         code,
-        "            self.dispatch_rms_norm(&self.layers[layer].attn_norm);"
+        "            self.encode_rms_norm(&cmd, &self.layers[layer].attn_norm);"
     )?;
     writeln!(code)?;
 
@@ -1022,17 +1094,15 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            // 2b. Q, K, V projections")?;
     writeln!(
         code,
-        "            let q_buf = self.dispatch_matmul(&self.layers[layer].q_weight, {hidden}, {hidden});"
+        "            self.encode_matmul(&cmd, &self.hidden_buf, &self.layers[layer].q_weight, &self.q_buf, {hidden}, {hidden});"
     )?;
     writeln!(
         code,
-        "            let k_buf = self.dispatch_matmul(&self.layers[layer].k_weight, {}, {hidden});",
-        num_kv_heads * head_dim
+        "            self.encode_matmul(&cmd, &self.hidden_buf, &self.layers[layer].k_weight, &self.k_buf, {kv_dim}, {hidden});"
     )?;
     writeln!(
         code,
-        "            let v_buf = self.dispatch_matmul(&self.layers[layer].v_weight, {}, {hidden});",
-        num_kv_heads * head_dim
+        "            self.encode_matmul(&cmd, &self.hidden_buf, &self.layers[layer].v_weight, &self.v_buf, {kv_dim}, {hidden});"
     )?;
     writeln!(code)?;
 
@@ -1040,11 +1110,11 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            // 2c. RoPE on Q and K")?;
     writeln!(
         code,
-        "            self.dispatch_rope(&q_buf, {num_heads}, {head_dim}, pos);"
+        "            self.encode_rope(&cmd, &self.q_buf, {num_heads}, {head_dim}, pos);"
     )?;
     writeln!(
         code,
-        "            self.dispatch_rope(&k_buf, {num_kv_heads}, {head_dim}, pos);"
+        "            self.encode_rope(&cmd, &self.k_buf, {num_kv_heads}, {head_dim}, pos);"
     )?;
     writeln!(code)?;
 
@@ -1065,23 +1135,17 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     )?;
     writeln!(
         code,
-        "                let cmd = self.queue.new_command_buffer();"
-    )?;
-    writeln!(
-        code,
         "                let enc = cmd.new_blit_command_encoder();"
     )?;
     writeln!(
         code,
-        "                enc.copy_from_buffer(&k_buf, 0, &self.k_cache[layer], offset as u64, byte_len);"
+        "                enc.copy_from_buffer(&self.k_buf, 0, &self.k_cache[layer], offset as u64, byte_len);"
     )?;
     writeln!(
         code,
-        "                enc.copy_from_buffer(&v_buf, 0, &self.v_cache[layer], offset as u64, byte_len);"
+        "                enc.copy_from_buffer(&self.v_buf, 0, &self.v_cache[layer], offset as u64, byte_len);"
     )?;
     writeln!(code, "                enc.end_encoding();")?;
-    writeln!(code, "                cmd.commit();")?;
-    writeln!(code, "                cmd.wait_until_completed();")?;
     writeln!(code, "            }}")?;
     writeln!(code)?;
 
@@ -1092,7 +1156,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     )?;
     writeln!(
         code,
-        "            let attn_out = self.dispatch_attention(&q_buf, &self.k_cache[layer], &self.v_cache[layer], pos + 1);"
+        "            self.encode_attention(&cmd, &self.q_buf, &self.k_cache[layer], &self.v_cache[layer], &self.attn_out_buf, pos + 1);"
     )?;
     writeln!(code)?;
 
@@ -1100,11 +1164,11 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            // 2f. Output projection + residual")?;
     writeln!(
         code,
-        "            let o_proj = self.dispatch_matmul_with_input(&attn_out, &self.layers[layer].o_weight, {hidden}, {hidden});"
+        "            self.encode_matmul(&cmd, &self.attn_out_buf, &self.layers[layer].o_weight, &self.attn_proj_buf, {hidden}, {hidden});"
     )?;
     writeln!(
         code,
-        "            self.dispatch_add(&self.residual_buf, &o_proj, {hidden});"
+        "            self.encode_add(&cmd, &self.residual_buf, &self.attn_proj_buf, {hidden});"
     )?;
     writeln!(code)?;
 
@@ -1112,7 +1176,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            // 2g. RMS norm (FFN)")?;
     writeln!(
         code,
-        "            self.dispatch_rms_norm(&self.layers[layer].ffn_norm);"
+        "            self.encode_rms_norm(&cmd, &self.layers[layer].ffn_norm);"
     )?;
     writeln!(code)?;
 
@@ -1123,89 +1187,49 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     )?;
     writeln!(
         code,
-        "            let gate_buf = self.dispatch_matmul(&self.layers[layer].gate_weight, {intermediate}, {hidden});"
+        "            self.encode_matmul(&cmd, &self.hidden_buf, &self.layers[layer].gate_weight, &self.gate_buf, {intermediate}, {hidden});"
     )?;
     writeln!(
         code,
-        "            let up_buf = self.dispatch_matmul(&self.layers[layer].up_weight, {intermediate}, {hidden});"
+        "            self.encode_matmul(&cmd, &self.hidden_buf, &self.layers[layer].up_weight, &self.up_buf, {intermediate}, {hidden});"
     )?;
     writeln!(
         code,
-        "            let ffn_mid = self.dispatch_silu_mul(&gate_buf, &up_buf, {intermediate});"
+        "            self.encode_silu_mul(&cmd, &self.gate_buf, &self.up_buf, &self.ffn_hidden_buf, {intermediate});"
     )?;
     writeln!(
         code,
-        "            let down_out = self.dispatch_matmul_with_input(&ffn_mid, &self.layers[layer].down_weight, {hidden}, {intermediate});"
+        "            self.encode_matmul(&cmd, &self.ffn_hidden_buf, &self.layers[layer].down_weight, &self.ffn_out_buf, {hidden}, {intermediate});"
     )?;
     writeln!(
         code,
-        "            self.dispatch_add(&self.residual_buf, &down_out, {hidden});"
+        "            self.encode_add(&cmd, &self.residual_buf, &self.ffn_out_buf, {hidden});"
     )?;
     writeln!(code, "        }}")?;
     writeln!(code)?;
 
     // 3. Final RMS norm
     writeln!(code, "        // 3. Final RMS norm")?;
-    writeln!(code, "        self.dispatch_rms_norm(&self.norm_buf);")?;
+    writeln!(code, "        self.encode_rms_norm(&cmd, &self.norm_buf);")?;
     writeln!(code)?;
 
     // 4. Logits projection
+    writeln!(code, "        // 4. Logits projection (hidden -> vocab)")?;
     writeln!(
         code,
-        "        // 4. Logits projection (hidden -> vocab via tied embeddings)"
+        "        self.encode_matmul(&cmd, &self.hidden_buf, &self.lm_head_buf, &self.logits_buf, {vocab}, {hidden});"
     )?;
-    writeln!(code, "        {{")?;
-    writeln!(code, "            let rows: u32 = VOCAB_SIZE as u32;")?;
-    writeln!(code, "            let cols: u32 = HIDDEN_SIZE as u32;")?;
-    writeln!(
-        code,
-        "            let cmd = self.queue.new_command_buffer();"
-    )?;
-    writeln!(
-        code,
-        "            let enc = cmd.new_compute_command_encoder();"
-    )?;
-    writeln!(
-        code,
-        "            enc.set_compute_pipeline_state(&self.matmul_pipeline);"
-    )?;
-    writeln!(
-        code,
-        "            enc.set_buffer(0, Some(&self.lm_head_buf), 0);"
-    )?;
-    writeln!(
-        code,
-        "            enc.set_buffer(1, Some(&self.hidden_buf), 0);"
-    )?;
-    writeln!(
-        code,
-        "            enc.set_buffer(2, Some(&self.logits_buf), 0);"
-    )?;
-    writeln!(
-        code,
-        "            enc.set_bytes(3, mem::size_of::<u32>() as u64, &rows as *const u32 as *const _);"
-    )?;
-    writeln!(
-        code,
-        "            enc.set_bytes(4, mem::size_of::<u32>() as u64, &cols as *const u32 as *const _);"
-    )?;
-    writeln!(code, "            let tg_size = MTLSize::new(256, 1, 1);")?;
-    writeln!(
-        code,
-        "            let grid_size = MTLSize::new(((VOCAB_SIZE + 255) / 256) as u64, 1, 1);"
-    )?;
-    writeln!(
-        code,
-        "            enc.dispatch_thread_groups(grid_size, tg_size);"
-    )?;
-    writeln!(code, "            enc.end_encoding();")?;
-    writeln!(code, "            cmd.commit();")?;
-    writeln!(code, "            cmd.wait_until_completed();")?;
-    writeln!(code, "        }}")?;
     writeln!(code)?;
 
-    // 5. Read back logits
-    writeln!(code, "        // 5. Read back logits from GPU")?;
+    // 5. Single commit + wait, then read back logits
+    writeln!(
+        code,
+        "        // 5. Commit all GPU work and wait for completion"
+    )?;
+    writeln!(code, "        cmd.commit();")?;
+    writeln!(code, "        cmd.wait_until_completed();")?;
+    writeln!(code)?;
+    writeln!(code, "        // 6. Read back logits from GPU")?;
     writeln!(code, "        let logits = unsafe {{")?;
     writeln!(
         code,
@@ -1222,26 +1246,24 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
-    // ── Private dispatch helpers ──
+    // ── Private encode helpers (all take a shared command buffer) ──
     writeln!(
         code,
-        "    // ── Private dispatch helpers ───────────────────────"
+        "    // ── Encode helpers (append to a shared command buffer) ──"
     )?;
     writeln!(code)?;
 
-    // dispatch_rms_norm
+    // encode_rms_norm
     writeln!(
         code,
-        "    /// Dispatch RMS norm: normalizes hidden_buf in-place using given weight."
+        "    /// Encode RMS norm: normalizes residual_buf -> hidden_buf using given weight."
     )?;
-    writeln!(code, "    fn dispatch_rms_norm(&self, weight: &Buffer) {{")?;
+    writeln!(
+        code,
+        "    fn encode_rms_norm(&self, cmd: &CommandBufferRef, weight: &Buffer) {{"
+    )?;
     writeln!(code, "        let n: u32 = HIDDEN_SIZE as u32;")?;
     writeln!(code, "        let eps: f32 = RMS_NORM_EPS;")?;
-    writeln!(
-        code,
-        "        // RMS norm reads from residual_buf, writes to hidden_buf"
-    )?;
-    writeln!(code, "        let cmd = self.queue.new_command_buffer();")?;
     writeln!(code, "        let enc = cmd.new_compute_command_encoder();")?;
     writeln!(
         code,
@@ -1274,43 +1296,20 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         "        enc.dispatch_thread_groups(grid_size, tg_size);"
     )?;
     writeln!(code, "        enc.end_encoding();")?;
-    writeln!(code, "        cmd.commit();")?;
-    writeln!(code, "        cmd.wait_until_completed();")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
-    // dispatch_matmul (reads from hidden_buf)
+    // encode_matmul
     writeln!(
         code,
-        "    /// Dispatch matrix-vector multiply: weight * hidden_buf -> new buffer."
+        "    /// Encode matrix-vector multiply: weight * input -> output."
     )?;
     writeln!(
         code,
-        "    fn dispatch_matmul(&self, weight: &Buffer, rows: usize, cols: usize) -> Buffer {{"
-    )?;
-    writeln!(
-        code,
-        "        self.dispatch_matmul_with_input(&self.hidden_buf, weight, rows, cols)"
-    )?;
-    writeln!(code, "    }}")?;
-    writeln!(code)?;
-
-    // dispatch_matmul_with_input
-    writeln!(
-        code,
-        "    /// Dispatch matrix-vector multiply with explicit input buffer."
-    )?;
-    writeln!(
-        code,
-        "    fn dispatch_matmul_with_input(&self, input: &Buffer, weight: &Buffer, rows: usize, cols: usize) -> Buffer {{"
-    )?;
-    writeln!(
-        code,
-        "        let out_buf = self.device.new_buffer((rows * 4) as u64, MTLResourceOptions::StorageModeShared);"
+        "    fn encode_matmul(&self, cmd: &CommandBufferRef, input: &Buffer, weight: &Buffer, output: &Buffer, rows: usize, cols: usize) {{"
     )?;
     writeln!(code, "        let r: u32 = rows as u32;")?;
     writeln!(code, "        let c: u32 = cols as u32;")?;
-    writeln!(code, "        let cmd = self.queue.new_command_buffer();")?;
     writeln!(code, "        let enc = cmd.new_compute_command_encoder();")?;
     writeln!(
         code,
@@ -1318,7 +1317,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     )?;
     writeln!(code, "        enc.set_buffer(0, Some(weight), 0);")?;
     writeln!(code, "        enc.set_buffer(1, Some(input), 0);")?;
-    writeln!(code, "        enc.set_buffer(2, Some(&out_buf), 0);")?;
+    writeln!(code, "        enc.set_buffer(2, Some(output), 0);")?;
     writeln!(
         code,
         "        enc.set_bytes(3, mem::size_of::<u32>() as u64, &r as *const u32 as *const _);"
@@ -1337,17 +1336,14 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         "        enc.dispatch_thread_groups(grid_size, tg_size);"
     )?;
     writeln!(code, "        enc.end_encoding();")?;
-    writeln!(code, "        cmd.commit();")?;
-    writeln!(code, "        cmd.wait_until_completed();")?;
-    writeln!(code, "        out_buf")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
-    // dispatch_rope
-    writeln!(code, "    /// Dispatch RoPE on a buffer in-place.")?;
+    // encode_rope
+    writeln!(code, "    /// Encode RoPE on a buffer in-place.")?;
     writeln!(
         code,
-        "    fn dispatch_rope(&self, buf: &Buffer, num_heads: usize, head_dim: usize, pos: usize) {{"
+        "    fn encode_rope(&self, cmd: &CommandBufferRef, buf: &Buffer, num_heads: usize, head_dim: usize, pos: usize) {{"
     )?;
     writeln!(code, "        let nh: u32 = num_heads as u32;")?;
     writeln!(code, "        let hd: u32 = head_dim as u32;")?;
@@ -1357,7 +1353,6 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "        let total_pairs = num_heads * (head_dim / 2);"
     )?;
-    writeln!(code, "        let cmd = self.queue.new_command_buffer();")?;
     writeln!(code, "        let enc = cmd.new_compute_command_encoder();")?;
     writeln!(
         code,
@@ -1390,29 +1385,22 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         "        enc.dispatch_thread_groups(grid_size, tg_size);"
     )?;
     writeln!(code, "        enc.end_encoding();")?;
-    writeln!(code, "        cmd.commit();")?;
-    writeln!(code, "        cmd.wait_until_completed();")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
-    // dispatch_attention
+    // encode_attention
     writeln!(
         code,
-        "    /// Dispatch attention kernel: Q * K^T -> softmax -> * V."
+        "    /// Encode attention kernel: Q * K^T -> softmax -> * V."
     )?;
     writeln!(
         code,
-        "    fn dispatch_attention(&self, q_buf: &Buffer, k_cache: &Buffer, v_cache: &Buffer, seq_len: usize) -> Buffer {{"
-    )?;
-    writeln!(
-        code,
-        "        let out_buf = self.device.new_buffer((NUM_HEADS * HEAD_DIM * 4) as u64, MTLResourceOptions::StorageModeShared);"
+        "    fn encode_attention(&self, cmd: &CommandBufferRef, q_buf: &Buffer, k_cache: &Buffer, v_cache: &Buffer, output: &Buffer, seq_len: usize) {{"
     )?;
     writeln!(code, "        let nh: u32 = NUM_HEADS as u32;")?;
     writeln!(code, "        let nkv: u32 = NUM_KV_HEADS as u32;")?;
     writeln!(code, "        let hd: u32 = HEAD_DIM as u32;")?;
     writeln!(code, "        let sl: u32 = seq_len as u32;")?;
-    writeln!(code, "        let cmd = self.queue.new_command_buffer();")?;
     writeln!(code, "        let enc = cmd.new_compute_command_encoder();")?;
     writeln!(
         code,
@@ -1421,7 +1409,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "        enc.set_buffer(0, Some(q_buf), 0);")?;
     writeln!(code, "        enc.set_buffer(1, Some(k_cache), 0);")?;
     writeln!(code, "        enc.set_buffer(2, Some(v_cache), 0);")?;
-    writeln!(code, "        enc.set_buffer(3, Some(&out_buf), 0);")?;
+    writeln!(code, "        enc.set_buffer(3, Some(output), 0);")?;
     writeln!(
         code,
         "        enc.set_bytes(4, mem::size_of::<u32>() as u64, &nh as *const u32 as *const _);"
@@ -1452,24 +1440,16 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         "        enc.dispatch_thread_groups(grid_size, tg_size);"
     )?;
     writeln!(code, "        enc.end_encoding();")?;
-    writeln!(code, "        cmd.commit();")?;
-    writeln!(code, "        cmd.wait_until_completed();")?;
-    writeln!(code, "        out_buf")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
-    // dispatch_silu_mul
-    writeln!(code, "    /// Dispatch fused SiLU-multiply kernel.")?;
+    // encode_silu_mul
+    writeln!(code, "    /// Encode fused SiLU-multiply kernel.")?;
     writeln!(
         code,
-        "    fn dispatch_silu_mul(&self, gate: &Buffer, up: &Buffer, n: usize) -> Buffer {{"
-    )?;
-    writeln!(
-        code,
-        "        let out_buf = self.device.new_buffer((n * 4) as u64, MTLResourceOptions::StorageModeShared);"
+        "    fn encode_silu_mul(&self, cmd: &CommandBufferRef, gate: &Buffer, up: &Buffer, output: &Buffer, n: usize) {{"
     )?;
     writeln!(code, "        let count: u32 = n as u32;")?;
-    writeln!(code, "        let cmd = self.queue.new_command_buffer();")?;
     writeln!(code, "        let enc = cmd.new_compute_command_encoder();")?;
     writeln!(
         code,
@@ -1477,7 +1457,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     )?;
     writeln!(code, "        enc.set_buffer(0, Some(gate), 0);")?;
     writeln!(code, "        enc.set_buffer(1, Some(up), 0);")?;
-    writeln!(code, "        enc.set_buffer(2, Some(&out_buf), 0);")?;
+    writeln!(code, "        enc.set_buffer(2, Some(output), 0);")?;
     writeln!(
         code,
         "        enc.set_bytes(3, mem::size_of::<u32>() as u64, &count as *const u32 as *const _);"
@@ -1492,31 +1472,19 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         "        enc.dispatch_thread_groups(grid_size, tg_size);"
     )?;
     writeln!(code, "        enc.end_encoding();")?;
-    writeln!(code, "        cmd.commit();")?;
-    writeln!(code, "        cmd.wait_until_completed();")?;
-    writeln!(code, "        out_buf")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
-    // dispatch_add (accumulates into first buffer in-place via elementwise_add)
+    // encode_add (accumulates into first buffer in-place via elementwise_add)
     writeln!(
         code,
-        "    /// Dispatch element-wise add (residual connection): a += b."
+        "    /// Encode element-wise add (residual connection): a += b."
     )?;
     writeln!(
         code,
-        "    fn dispatch_add(&self, a: &Buffer, b: &Buffer, n: usize) {{"
+        "    fn encode_add(&self, cmd: &CommandBufferRef, a: &Buffer, b: &Buffer, n: usize) {{"
     )?;
     writeln!(code, "        let count: u32 = n as u32;")?;
-    writeln!(
-        code,
-        "        // Use a temporary buffer for output, then copy back"
-    )?;
-    writeln!(
-        code,
-        "        let tmp = self.device.new_buffer((n * 4) as u64, MTLResourceOptions::StorageModeShared);"
-    )?;
-    writeln!(code, "        let cmd = self.queue.new_command_buffer();")?;
     writeln!(code, "        let enc = cmd.new_compute_command_encoder();")?;
     writeln!(
         code,
@@ -1524,7 +1492,10 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     )?;
     writeln!(code, "        enc.set_buffer(0, Some(a), 0);")?;
     writeln!(code, "        enc.set_buffer(1, Some(b), 0);")?;
-    writeln!(code, "        enc.set_buffer(2, Some(&tmp), 0);")?;
+    writeln!(
+        code,
+        "        enc.set_buffer(2, Some(&self.add_tmp_buf), 0);"
+    )?;
     writeln!(
         code,
         "        enc.set_bytes(3, mem::size_of::<u32>() as u64, &count as *const u32 as *const _);"
@@ -1540,15 +1511,13 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     )?;
     writeln!(code, "        enc.end_encoding();")?;
     writeln!(code)?;
-    writeln!(code, "        // Copy tmp back to a")?;
+    writeln!(code, "        // Copy add_tmp_buf back to a")?;
     writeln!(code, "        let blit = cmd.new_blit_command_encoder();")?;
     writeln!(
         code,
-        "        blit.copy_from_buffer(&tmp, 0, a, 0, (n * 4) as u64);"
+        "        blit.copy_from_buffer(&self.add_tmp_buf, 0, a, 0, (n * 4) as u64);"
     )?;
     writeln!(code, "        blit.end_encoding();")?;
-    writeln!(code, "        cmd.commit();")?;
-    writeln!(code, "        cmd.wait_until_completed();")?;
     writeln!(code, "    }}")?;
 
     writeln!(code, "}}")?;
@@ -1922,5 +1891,130 @@ mod tests {
         assert_eq!(sanitize_name("My Model!"), "my-model");
         assert_eq!(sanitize_name("test_model"), "test-model");
         assert_eq!(sanitize_name("simple"), "simple");
+    }
+
+    #[test]
+    fn generated_forward_uses_single_command_buffer() {
+        let config = minimal_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        // The forward function should create exactly one command buffer
+        let forward_start = model_rs.find("pub fn forward").unwrap();
+        let forward_body = &model_rs[forward_start..];
+        // Find the closing of forward (next "pub fn" or end of impl)
+        let forward_end = forward_body
+            .find("\n    fn encode_")
+            .unwrap_or(forward_body.len());
+        let forward_code = &forward_body[..forward_end];
+
+        // Should have exactly one new_command_buffer call
+        let cmd_buf_count = forward_code.matches("new_command_buffer()").count();
+        assert_eq!(
+            cmd_buf_count, 1,
+            "forward() should create exactly 1 command buffer, found {cmd_buf_count}"
+        );
+
+        // Should have exactly one commit + wait pair
+        let commit_count = forward_code.matches("cmd.commit()").count();
+        let wait_count = forward_code.matches("wait_until_completed()").count();
+        assert_eq!(
+            commit_count, 1,
+            "forward() should commit exactly once, found {commit_count}"
+        );
+        assert_eq!(
+            wait_count, 1,
+            "forward() should wait exactly once, found {wait_count}"
+        );
+    }
+
+    #[test]
+    fn generated_model_has_preallocated_working_buffers() {
+        let config = minimal_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        for buf_name in &[
+            "normed_buf",
+            "q_buf",
+            "k_buf",
+            "v_buf",
+            "attn_out_buf",
+            "attn_proj_buf",
+            "gate_buf",
+            "up_buf",
+            "ffn_hidden_buf",
+            "ffn_out_buf",
+            "add_tmp_buf",
+        ] {
+            assert!(
+                model_rs.contains(&format!("{buf_name}: Buffer")),
+                "MetalModel should have pre-allocated {buf_name} field"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_encode_helpers_take_command_buffer_ref() {
+        let config = minimal_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        for method in &[
+            "fn encode_rms_norm(&self, cmd: &CommandBufferRef",
+            "fn encode_matmul(&self, cmd: &CommandBufferRef",
+            "fn encode_rope(&self, cmd: &CommandBufferRef",
+            "fn encode_attention(&self, cmd: &CommandBufferRef",
+            "fn encode_silu_mul(&self, cmd: &CommandBufferRef",
+            "fn encode_add(&self, cmd: &CommandBufferRef",
+        ] {
+            assert!(
+                model_rs.contains(method),
+                "model.rs should contain encode helper: {method}"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_helpers_do_not_create_command_buffers() {
+        let config = minimal_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        // Find encode helpers section and check none create their own command buffers
+        let helpers_start = model_rs.find("fn encode_rms_norm").unwrap();
+        let helpers_code = &model_rs[helpers_start..];
+
+        // None of the encode_ helpers should call new_command_buffer
+        assert!(
+            !helpers_code.contains("self.queue.new_command_buffer()"),
+            "encode helpers should not create their own command buffers"
+        );
+
+        // None should call commit or wait
+        assert!(
+            !helpers_code.contains(".commit()"),
+            "encode helpers should not commit command buffers"
+        );
+        assert!(
+            !helpers_code.contains("wait_until_completed"),
+            "encode helpers should not wait on command buffers"
+        );
+    }
+
+    #[test]
+    fn generated_forward_no_per_op_buffer_allocation() {
+        let config = minimal_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        // Find the forward function body
+        let forward_start = model_rs.find("pub fn forward").unwrap();
+        let forward_body = &model_rs[forward_start..];
+        let forward_end = forward_body
+            .find("\n    fn encode_")
+            .unwrap_or(forward_body.len());
+        let forward_code = &forward_body[..forward_end];
+
+        // Forward should not allocate new buffers
+        assert!(
+            !forward_code.contains("device.new_buffer"),
+            "forward() should not allocate new buffers per call"
+        );
     }
 }
