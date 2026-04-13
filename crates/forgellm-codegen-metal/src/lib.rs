@@ -334,9 +334,24 @@ kernel void elementwise_add(
     output[id] = a[id] + b[id];
 }
 
+// ── add_inplace ─────────────────────────────────────────────────────────
+// In-place residual connection: a[i] += b[i]
+// Avoids a separate blit copy for residual add, reducing encoder overhead.
+kernel void add_inplace(
+    device float* a        [[buffer(0)]],
+    device const float* b  [[buffer(1)]],
+    constant uint& n       [[buffer(2)]],
+    uint id [[thread_position_in_grid]])
+{
+    if (id >= n) return;
+    a[id] += b[id];
+}
+
 // ── attention ───────────────────────────────────────────────────────────
-// Single-query attention: computes Q*K^T scores, applies causal mask and
-// softmax, then weighted sum of V. Each threadgroup handles one head.
+// Single-query attention with simdgroup cooperative reductions.
+// Computes Q*K^T scores using 32-lane simd dot products, applies softmax
+// with simd_max/simd_sum reductions, then weighted sum of V.
+// Each threadgroup handles one head with 256 threads (8 simdgroups).
 //
 // Buffers:
 //   q:       [num_heads * head_dim]       current query
@@ -348,82 +363,83 @@ kernel void attention(
     device const float* k_cache  [[buffer(1)]],
     device const float* v_cache  [[buffer(2)]],
     device float* output         [[buffer(3)]],
-    constant uint& num_heads     [[buffer(4)]],
-    constant uint& num_kv_heads  [[buffer(5)]],
-    constant uint& head_dim      [[buffer(6)]],
-    constant uint& seq_len       [[buffer(7)]],  // current position + 1
-    uint head_id [[threadgroup_position_in_grid]],
+    constant uint& seq_len       [[buffer(4)]],
+    constant uint& num_heads     [[buffer(5)]],
+    constant uint& num_kv_heads  [[buffer(6)]],
+    constant uint& head_dim      [[buffer(7)]],
+    uint tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]])
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]])
 {
-    if (head_id >= num_heads) return;
+    uint head = tgid;
+    if (head >= num_heads) return;
+    uint kv_head = head / (num_heads / num_kv_heads);
 
-    // GQA: map attention head to KV head
-    uint kv_head = head_id / (num_heads / num_kv_heads);
+    uint q_off = head * head_dim;
 
-    // Scratch space for attention scores (in threadgroup memory)
-    threadgroup float scores[4096];  // supports up to 4096 sequence length
+    // Step 1: Compute attention scores Q·K^T with simdgroup reduction
+    // Use shared memory for scores
+    threadgroup float scores[4096];  // max seq_len
 
-    uint q_off = head_id * head_dim;
-    float scale = rsqrt(float(head_dim));
-
-    // Compute Q * K^T scores
-    for (uint s = tid; s < seq_len; s += tg_size) {
+    for (uint s = simd_id; s < seq_len; s += 8) {
         uint k_off = s * num_kv_heads * head_dim + kv_head * head_dim;
-        float dot = 0.0f;
-        for (uint d = 0; d < head_dim; d++) {
+        float dot = 0.0;
+        for (uint d = simd_lane; d < head_dim; d += 32) {
             dot += q[q_off + d] * k_cache[k_off + d];
         }
-        scores[s] = dot * scale;
+        dot = simd_sum(dot);
+        if (simd_lane == 0) {
+            scores[s] = dot / sqrt(float(head_dim));
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Softmax over scores[0..seq_len]
+    // Step 2: Softmax over scores (cooperative)
     // Find max
-    threadgroup float shared_val[256];
     float local_max = -INFINITY;
-    for (uint s = tid; s < seq_len; s += tg_size) {
+    for (uint s = tid; s < seq_len; s += 256) {
         local_max = max(local_max, scores[s]);
     }
-    shared_val[tid] = local_max;
+    local_max = simd_max(local_max);
+    threadgroup float shared_max[8];
+    if (simd_lane == 0) shared_max[simd_id] = local_max;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_val[tid] = max(shared_val[tid], shared_val[tid + stride]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float m = shared_max[0];
+        for (uint i = 1; i < 8; i++) m = max(m, shared_max[i]);
+        shared_max[0] = m;
     }
-    float max_val = shared_val[0];
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    float max_val = shared_max[0];
 
     // Exp and sum
-    float local_sum = 0.0f;
-    for (uint s = tid; s < seq_len; s += tg_size) {
-        float e = exp(scores[s] - max_val);
-        scores[s] = e;
-        local_sum += e;
+    float local_sum = 0.0;
+    for (uint s = tid; s < seq_len; s += 256) {
+        scores[s] = exp(scores[s] - max_val);
+        local_sum += scores[s];
     }
-    shared_val[tid] = local_sum;
+    local_sum = simd_sum(local_sum);
+    threadgroup float shared_sum[8];
+    if (simd_lane == 0) shared_sum[simd_id] = local_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = tg_size / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_val[tid] += shared_val[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0;
+        for (uint i = 0; i < 8; i++) total += shared_sum[i];
+        shared_sum[0] = 1.0 / total;
     }
-    float inv_sum = 1.0f / shared_val[0];
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_sum = shared_sum[0];
 
-    for (uint s = tid; s < seq_len; s += tg_size) {
+    for (uint s = tid; s < seq_len; s += 256) {
         scores[s] *= inv_sum;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Weighted sum of V
-    for (uint d = tid; d < head_dim; d += tg_size) {
-        float acc = 0.0f;
+    // Step 3: Weighted sum of V: output = scores · V
+    // Each thread handles a range of head_dim dimensions
+    for (uint d = tid; d < head_dim; d += 256) {
+        float acc = 0.0;
         for (uint s = 0; s < seq_len; s++) {
             uint v_off = s * num_kv_heads * head_dim + kv_head * head_dim;
             acc += scores[s] * v_cache[v_off + d];
@@ -544,6 +560,7 @@ fn emit_metal_model_struct(
     writeln!(code, "    silu_mul_pipeline: ComputePipelineState,")?;
     writeln!(code, "    add_pipeline: ComputePipelineState,")?;
     writeln!(code, "    attention_pipeline: ComputePipelineState,")?;
+    writeln!(code, "    add_inplace_pipeline: ComputePipelineState,")?;
     writeln!(code)?;
     writeln!(code, "    // ── Weight buffers (Metal shared memory) ──")?;
     writeln!(
@@ -677,6 +694,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         ("silu_mul_pipeline", "silu_mul"),
         ("add_pipeline", "elementwise_add"),
         ("attention_pipeline", "attention"),
+        ("add_inplace_pipeline", "add_inplace"),
     ] {
         writeln!(
             code,
@@ -1041,6 +1059,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            silu_mul_pipeline,")?;
     writeln!(code, "            add_pipeline,")?;
     writeln!(code, "            attention_pipeline,")?;
+    writeln!(code, "            add_inplace_pipeline,")?;
     writeln!(code, "            embed_buf,")?;
     writeln!(code, "            layers,")?;
     writeln!(code, "            norm_buf,")?;
@@ -1127,44 +1146,46 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "        for layer in 0..NUM_LAYERS {{")?;
     writeln!(code)?;
 
-    // 2a. RMS norm (attention)
-    writeln!(code, "            // 2a. RMS norm (attention)")?;
+    // Batch pre-attention compute ops into one encoder
     writeln!(
         code,
-        "            self.encode_rms_norm(&cmd, &self.layers[layer].attn_norm);"
+        "            // Compute encoder: rms_norm, Q/K/V projections, RoPE"
     )?;
+    writeln!(code, "            {{")?;
+    writeln!(
+        code,
+        "                let enc = cmd.new_compute_command_encoder();"
+    )?;
+    writeln!(
+        code,
+        "                self.dispatch_rms_norm(&enc, &self.layers[layer].attn_norm);"
+    )?;
+    writeln!(
+        code,
+        "                self.dispatch_matmul(&enc, &self.hidden_buf, &self.layers[layer].q_weight, &self.q_buf, {hidden}, {hidden});"
+    )?;
+    writeln!(
+        code,
+        "                self.dispatch_matmul(&enc, &self.hidden_buf, &self.layers[layer].k_weight, &self.k_buf, {kv_dim}, {hidden});"
+    )?;
+    writeln!(
+        code,
+        "                self.dispatch_matmul(&enc, &self.hidden_buf, &self.layers[layer].v_weight, &self.v_buf, {kv_dim}, {hidden});"
+    )?;
+    writeln!(
+        code,
+        "                self.dispatch_rope(&enc, &self.q_buf, {num_heads}, {head_dim}, pos);"
+    )?;
+    writeln!(
+        code,
+        "                self.dispatch_rope(&enc, &self.k_buf, {num_kv_heads}, {head_dim}, pos);"
+    )?;
+    writeln!(code, "                enc.end_encoding();")?;
+    writeln!(code, "            }}")?;
     writeln!(code)?;
 
-    // 2b. Q, K, V projections
-    writeln!(code, "            // 2b. Q, K, V projections")?;
-    writeln!(
-        code,
-        "            self.encode_matmul(&cmd, &self.hidden_buf, &self.layers[layer].q_weight, &self.q_buf, {hidden}, {hidden});"
-    )?;
-    writeln!(
-        code,
-        "            self.encode_matmul(&cmd, &self.hidden_buf, &self.layers[layer].k_weight, &self.k_buf, {kv_dim}, {hidden});"
-    )?;
-    writeln!(
-        code,
-        "            self.encode_matmul(&cmd, &self.hidden_buf, &self.layers[layer].v_weight, &self.v_buf, {kv_dim}, {hidden});"
-    )?;
-    writeln!(code)?;
-
-    // 2c. RoPE
-    writeln!(code, "            // 2c. RoPE on Q and K")?;
-    writeln!(
-        code,
-        "            self.encode_rope(&cmd, &self.q_buf, {num_heads}, {head_dim}, pos);"
-    )?;
-    writeln!(
-        code,
-        "            self.encode_rope(&cmd, &self.k_buf, {num_kv_heads}, {head_dim}, pos);"
-    )?;
-    writeln!(code)?;
-
-    // 2d. Update KV cache
-    writeln!(code, "            // 2d. Update KV cache")?;
+    // 2d. Update KV cache (blit encoder)
+    writeln!(code, "            // Blit encoder: update KV cache")?;
     writeln!(code, "            {{")?;
     writeln!(
         code,
@@ -1194,76 +1215,77 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            }}")?;
     writeln!(code)?;
 
-    // 2e. Attention
+    // Batch post-attention compute ops into one encoder
     writeln!(
         code,
-        "            // 2e. Attention: Q * K^T -> softmax -> * V"
+        "            // Compute encoder: attention, O proj, residual, FFN"
+    )?;
+    writeln!(code, "            {{")?;
+    writeln!(
+        code,
+        "                let enc = cmd.new_compute_command_encoder();"
     )?;
     writeln!(
         code,
-        "            self.encode_attention(&cmd, &self.q_buf, &self.k_cache[layer], &self.v_cache[layer], &self.attn_out_buf, pos + 1);"
-    )?;
-    writeln!(code)?;
-
-    // 2f. Output projection + residual
-    writeln!(code, "            // 2f. Output projection + residual")?;
-    writeln!(
-        code,
-        "            self.encode_matmul(&cmd, &self.attn_out_buf, &self.layers[layer].o_weight, &self.attn_proj_buf, {hidden}, {hidden});"
+        "                self.dispatch_attention(&enc, &self.q_buf, &self.k_cache[layer], &self.v_cache[layer], &self.attn_out_buf, pos + 1);"
     )?;
     writeln!(
         code,
-        "            self.encode_add(&cmd, &self.residual_buf, &self.attn_proj_buf, {hidden});"
-    )?;
-    writeln!(code)?;
-
-    // 2g. RMS norm (FFN)
-    writeln!(code, "            // 2g. RMS norm (FFN)")?;
-    writeln!(
-        code,
-        "            self.encode_rms_norm(&cmd, &self.layers[layer].ffn_norm);"
-    )?;
-    writeln!(code)?;
-
-    // 2h-j. FFN
-    writeln!(
-        code,
-        "            // 2h. Gate + Up projections, SiLU-mul, Down projection"
+        "                self.dispatch_matmul(&enc, &self.attn_out_buf, &self.layers[layer].o_weight, &self.attn_proj_buf, {hidden}, {hidden});"
     )?;
     writeln!(
         code,
-        "            self.encode_matmul(&cmd, &self.hidden_buf, &self.layers[layer].gate_weight, &self.gate_buf, {intermediate}, {hidden});"
+        "                self.dispatch_add_inplace(&enc, &self.residual_buf, &self.attn_proj_buf, {hidden});"
     )?;
     writeln!(
         code,
-        "            self.encode_matmul(&cmd, &self.hidden_buf, &self.layers[layer].up_weight, &self.up_buf, {intermediate}, {hidden});"
+        "                self.dispatch_rms_norm(&enc, &self.layers[layer].ffn_norm);"
     )?;
     writeln!(
         code,
-        "            self.encode_silu_mul(&cmd, &self.gate_buf, &self.up_buf, &self.ffn_hidden_buf, {intermediate});"
+        "                self.dispatch_matmul(&enc, &self.hidden_buf, &self.layers[layer].gate_weight, &self.gate_buf, {intermediate}, {hidden});"
     )?;
     writeln!(
         code,
-        "            self.encode_matmul(&cmd, &self.ffn_hidden_buf, &self.layers[layer].down_weight, &self.ffn_out_buf, {hidden}, {intermediate});"
+        "                self.dispatch_matmul(&enc, &self.hidden_buf, &self.layers[layer].up_weight, &self.up_buf, {intermediate}, {hidden});"
     )?;
     writeln!(
         code,
-        "            self.encode_add(&cmd, &self.residual_buf, &self.ffn_out_buf, {hidden});"
+        "                self.dispatch_silu_mul(&enc, &self.gate_buf, &self.up_buf, &self.ffn_hidden_buf, {intermediate});"
     )?;
+    writeln!(
+        code,
+        "                self.dispatch_matmul(&enc, &self.ffn_hidden_buf, &self.layers[layer].down_weight, &self.ffn_out_buf, {hidden}, {intermediate});"
+    )?;
+    writeln!(
+        code,
+        "                self.dispatch_add_inplace(&enc, &self.residual_buf, &self.ffn_out_buf, {hidden});"
+    )?;
+    writeln!(code, "                enc.end_encoding();")?;
+    writeln!(code, "            }}")?;
     writeln!(code, "        }}")?;
     writeln!(code)?;
 
-    // 3. Final RMS norm
-    writeln!(code, "        // 3. Final RMS norm")?;
-    writeln!(code, "        self.encode_rms_norm(&cmd, &self.norm_buf);")?;
-    writeln!(code)?;
-
-    // 4. Logits projection
-    writeln!(code, "        // 4. Logits projection (hidden -> vocab)")?;
+    // 3. Final RMS norm + logits in one encoder
     writeln!(
         code,
-        "        self.encode_matmul(&cmd, &self.hidden_buf, &self.lm_head_buf, &self.logits_buf, {vocab}, {hidden});"
+        "        // Compute encoder: final RMS norm + logits projection"
     )?;
+    writeln!(code, "        {{")?;
+    writeln!(
+        code,
+        "            let enc = cmd.new_compute_command_encoder();"
+    )?;
+    writeln!(
+        code,
+        "            self.dispatch_rms_norm(&enc, &self.norm_buf);"
+    )?;
+    writeln!(
+        code,
+        "            self.dispatch_matmul(&enc, &self.hidden_buf, &self.lm_head_buf, &self.logits_buf, {vocab}, {hidden});"
+    )?;
+    writeln!(code, "            enc.end_encoding();")?;
+    writeln!(code, "        }}")?;
     writeln!(code)?;
 
     // 5. Single commit + wait, then read back logits
@@ -1291,25 +1313,32 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
-    // ── Private encode helpers (all take a shared command buffer) ──
+    // ── Private dispatch helpers (all take a shared compute encoder) ──
     writeln!(
         code,
-        "    // ── Encode helpers (append to a shared command buffer) ──"
+        "    // ── Dispatch helpers (append to a shared compute command encoder) ──"
+    )?;
+    writeln!(
+        code,
+        "    // These methods set pipeline state + buffers + dispatch on an existing"
+    )?;
+    writeln!(
+        code,
+        "    // encoder, avoiding per-operation encoder creation overhead."
     )?;
     writeln!(code)?;
 
-    // encode_rms_norm
+    // dispatch_rms_norm
     writeln!(
         code,
-        "    /// Encode RMS norm: normalizes residual_buf -> hidden_buf using given weight."
+        "    /// Dispatch RMS norm: normalizes residual_buf -> hidden_buf using given weight."
     )?;
     writeln!(
         code,
-        "    fn encode_rms_norm(&self, cmd: &CommandBufferRef, weight: &Buffer) {{"
+        "    fn dispatch_rms_norm(&self, enc: &ComputeCommandEncoderRef, weight: &Buffer) {{"
     )?;
     writeln!(code, "        let n: u32 = HIDDEN_SIZE as u32;")?;
     writeln!(code, "        let eps: f32 = RMS_NORM_EPS;")?;
-    writeln!(code, "        let enc = cmd.new_compute_command_encoder();")?;
     writeln!(
         code,
         "        enc.set_compute_pipeline_state(&self.rms_norm_pipeline);"
@@ -1340,22 +1369,20 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "        enc.dispatch_thread_groups(grid_size, tg_size);"
     )?;
-    writeln!(code, "        enc.end_encoding();")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
-    // encode_matmul
+    // dispatch_matmul
     writeln!(
         code,
-        "    /// Encode matrix-vector multiply: weight * input -> output."
+        "    /// Dispatch matrix-vector multiply: weight * input -> output."
     )?;
     writeln!(
         code,
-        "    fn encode_matmul(&self, cmd: &CommandBufferRef, input: &Buffer, weight: &Buffer, output: &Buffer, rows: usize, cols: usize) {{"
+        "    fn dispatch_matmul(&self, enc: &ComputeCommandEncoderRef, input: &Buffer, weight: &Buffer, output: &Buffer, rows: usize, cols: usize) {{"
     )?;
     writeln!(code, "        let r: u32 = rows as u32;")?;
     writeln!(code, "        let c: u32 = cols as u32;")?;
-    writeln!(code, "        let enc = cmd.new_compute_command_encoder();")?;
     writeln!(
         code,
         "        enc.set_compute_pipeline_state(&self.matmul_pipeline);"
@@ -1382,15 +1409,14 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "        enc.dispatch_thread_groups(grid_size, tg_size);"
     )?;
-    writeln!(code, "        enc.end_encoding();")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
-    // encode_rope
-    writeln!(code, "    /// Encode RoPE on a buffer in-place.")?;
+    // dispatch_rope
+    writeln!(code, "    /// Dispatch RoPE on a buffer in-place.")?;
     writeln!(
         code,
-        "    fn encode_rope(&self, cmd: &CommandBufferRef, buf: &Buffer, num_heads: usize, head_dim: usize, pos: usize) {{"
+        "    fn dispatch_rope(&self, enc: &ComputeCommandEncoderRef, buf: &Buffer, num_heads: usize, head_dim: usize, pos: usize) {{"
     )?;
     writeln!(code, "        let nh: u32 = num_heads as u32;")?;
     writeln!(code, "        let hd: u32 = head_dim as u32;")?;
@@ -1400,7 +1426,6 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "        let total_pairs = num_heads * (head_dim / 2);"
     )?;
-    writeln!(code, "        let enc = cmd.new_compute_command_encoder();")?;
     writeln!(
         code,
         "        enc.set_compute_pipeline_state(&self.rope_pipeline);"
@@ -1431,24 +1456,22 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "        enc.dispatch_thread_groups(grid_size, tg_size);"
     )?;
-    writeln!(code, "        enc.end_encoding();")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
-    // encode_attention
+    // dispatch_attention
     writeln!(
         code,
-        "    /// Encode attention kernel: Q * K^T -> softmax -> * V."
+        "    /// Dispatch attention kernel: Q * K^T -> softmax -> * V."
     )?;
     writeln!(
         code,
-        "    fn encode_attention(&self, cmd: &CommandBufferRef, q_buf: &Buffer, k_cache: &Buffer, v_cache: &Buffer, output: &Buffer, seq_len: usize) {{"
+        "    fn dispatch_attention(&self, enc: &ComputeCommandEncoderRef, q_buf: &Buffer, k_cache: &Buffer, v_cache: &Buffer, output: &Buffer, seq_len: usize) {{"
     )?;
+    writeln!(code, "        let sl: u32 = seq_len as u32;")?;
     writeln!(code, "        let nh: u32 = NUM_HEADS as u32;")?;
     writeln!(code, "        let nkv: u32 = NUM_KV_HEADS as u32;")?;
     writeln!(code, "        let hd: u32 = HEAD_DIM as u32;")?;
-    writeln!(code, "        let sl: u32 = seq_len as u32;")?;
-    writeln!(code, "        let enc = cmd.new_compute_command_encoder();")?;
     writeln!(
         code,
         "        enc.set_compute_pipeline_state(&self.attention_pipeline);"
@@ -1459,23 +1482,23 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "        enc.set_buffer(3, Some(output), 0);")?;
     writeln!(
         code,
-        "        enc.set_bytes(4, mem::size_of::<u32>() as u64, &nh as *const u32 as *const _);"
+        "        enc.set_bytes(4, mem::size_of::<u32>() as u64, &sl as *const u32 as *const _);"
     )?;
     writeln!(
         code,
-        "        enc.set_bytes(5, mem::size_of::<u32>() as u64, &nkv as *const u32 as *const _);"
+        "        enc.set_bytes(5, mem::size_of::<u32>() as u64, &nh as *const u32 as *const _);"
     )?;
     writeln!(
         code,
-        "        enc.set_bytes(6, mem::size_of::<u32>() as u64, &hd as *const u32 as *const _);"
+        "        enc.set_bytes(6, mem::size_of::<u32>() as u64, &nkv as *const u32 as *const _);"
     )?;
     writeln!(
         code,
-        "        enc.set_bytes(7, mem::size_of::<u32>() as u64, &sl as *const u32 as *const _);"
+        "        enc.set_bytes(7, mem::size_of::<u32>() as u64, &hd as *const u32 as *const _);"
     )?;
     writeln!(
         code,
-        "        // One threadgroup per head, 256 threads per group"
+        "        // One threadgroup per head, 256 threads (8 simdgroups for cooperative reductions)"
     )?;
     writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
     writeln!(
@@ -1486,18 +1509,16 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "        enc.dispatch_thread_groups(grid_size, tg_size);"
     )?;
-    writeln!(code, "        enc.end_encoding();")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
-    // encode_silu_mul
-    writeln!(code, "    /// Encode fused SiLU-multiply kernel.")?;
+    // dispatch_silu_mul
+    writeln!(code, "    /// Dispatch fused SiLU-multiply kernel.")?;
     writeln!(
         code,
-        "    fn encode_silu_mul(&self, cmd: &CommandBufferRef, gate: &Buffer, up: &Buffer, output: &Buffer, n: usize) {{"
+        "    fn dispatch_silu_mul(&self, enc: &ComputeCommandEncoderRef, gate: &Buffer, up: &Buffer, output: &Buffer, n: usize) {{"
     )?;
     writeln!(code, "        let count: u32 = n as u32;")?;
-    writeln!(code, "        let enc = cmd.new_compute_command_encoder();")?;
     writeln!(
         code,
         "        enc.set_compute_pipeline_state(&self.silu_mul_pipeline);"
@@ -1518,34 +1539,28 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "        enc.dispatch_thread_groups(grid_size, tg_size);"
     )?;
-    writeln!(code, "        enc.end_encoding();")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
-    // encode_add (accumulates into first buffer in-place via elementwise_add)
+    // dispatch_add_inplace (residual connection, no blit needed)
     writeln!(
         code,
-        "    /// Encode element-wise add (residual connection): a += b."
+        "    /// Dispatch in-place element-wise add (residual connection): a[i] += b[i]."
     )?;
     writeln!(
         code,
-        "    fn encode_add(&self, cmd: &CommandBufferRef, a: &Buffer, b: &Buffer, n: usize) {{"
+        "    fn dispatch_add_inplace(&self, enc: &ComputeCommandEncoderRef, a: &Buffer, b: &Buffer, n: usize) {{"
     )?;
     writeln!(code, "        let count: u32 = n as u32;")?;
-    writeln!(code, "        let enc = cmd.new_compute_command_encoder();")?;
     writeln!(
         code,
-        "        enc.set_compute_pipeline_state(&self.add_pipeline);"
+        "        enc.set_compute_pipeline_state(&self.add_inplace_pipeline);"
     )?;
     writeln!(code, "        enc.set_buffer(0, Some(a), 0);")?;
     writeln!(code, "        enc.set_buffer(1, Some(b), 0);")?;
     writeln!(
         code,
-        "        enc.set_buffer(2, Some(&self.add_tmp_buf), 0);"
-    )?;
-    writeln!(
-        code,
-        "        enc.set_bytes(3, mem::size_of::<u32>() as u64, &count as *const u32 as *const _);"
+        "        enc.set_bytes(2, mem::size_of::<u32>() as u64, &count as *const u32 as *const _);"
     )?;
     writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
     writeln!(
@@ -1556,15 +1571,6 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "        enc.dispatch_thread_groups(grid_size, tg_size);"
     )?;
-    writeln!(code, "        enc.end_encoding();")?;
-    writeln!(code)?;
-    writeln!(code, "        // Copy add_tmp_buf back to a")?;
-    writeln!(code, "        let blit = cmd.new_blit_command_encoder();")?;
-    writeln!(
-        code,
-        "        blit.copy_from_buffer(&self.add_tmp_buf, 0, a, 0, (n * 4) as u64);"
-    )?;
-    writeln!(code, "        blit.end_encoding();")?;
     writeln!(code, "    }}")?;
 
     writeln!(code, "}}")?;
@@ -1879,6 +1885,10 @@ mod tests {
             shaders.contains("kernel void attention"),
             "shaders should contain attention kernel"
         );
+        assert!(
+            shaders.contains("kernel void add_inplace"),
+            "shaders should contain add_inplace kernel"
+        );
     }
 
     #[test]
@@ -1900,6 +1910,10 @@ mod tests {
         assert!(
             shaders.contains("simd_sum"),
             "shaders should use simd_sum for warp-level reduction"
+        );
+        assert!(
+            shaders.contains("simd_max"),
+            "attention kernel should use simd_max for cooperative softmax"
         );
         assert!(
             shaders.contains("thread_index_in_simdgroup"),
@@ -1964,9 +1978,9 @@ mod tests {
         // The forward function should create exactly one command buffer
         let forward_start = model_rs.find("pub fn forward").unwrap();
         let forward_body = &model_rs[forward_start..];
-        // Find the closing of forward (next "pub fn" or end of impl)
+        // Find the closing of forward (next "fn dispatch_" or end of impl)
         let forward_end = forward_body
-            .find("\n    fn encode_")
+            .find("\n    fn dispatch_")
             .unwrap_or(forward_body.len());
         let forward_code = &forward_body[..forward_end];
 
@@ -2016,53 +2030,65 @@ mod tests {
     }
 
     #[test]
-    fn generated_encode_helpers_take_command_buffer_ref() {
+    fn generated_dispatch_helpers_take_compute_encoder_ref() {
         let config = minimal_config();
         let model_rs = generate_model_rs(&config).unwrap();
 
         for method in &[
-            "fn encode_rms_norm(&self, cmd: &CommandBufferRef",
-            "fn encode_matmul(&self, cmd: &CommandBufferRef",
-            "fn encode_rope(&self, cmd: &CommandBufferRef",
-            "fn encode_attention(&self, cmd: &CommandBufferRef",
-            "fn encode_silu_mul(&self, cmd: &CommandBufferRef",
-            "fn encode_add(&self, cmd: &CommandBufferRef",
+            "fn dispatch_rms_norm(&self, enc: &ComputeCommandEncoderRef",
+            "fn dispatch_matmul(&self, enc: &ComputeCommandEncoderRef",
+            "fn dispatch_rope(&self, enc: &ComputeCommandEncoderRef",
+            "fn dispatch_attention(&self, enc: &ComputeCommandEncoderRef",
+            "fn dispatch_silu_mul(&self, enc: &ComputeCommandEncoderRef",
+            "fn dispatch_add_inplace(&self, enc: &ComputeCommandEncoderRef",
         ] {
             assert!(
                 model_rs.contains(method),
-                "model.rs should contain encode helper: {method}"
+                "model.rs should contain dispatch helper: {method}"
             );
         }
     }
 
     #[test]
-    fn generated_helpers_do_not_create_command_buffers() {
+    fn generated_helpers_do_not_create_command_buffers_or_encoders() {
         let config = minimal_config();
         let model_rs = generate_model_rs(&config).unwrap();
 
-        // Find encode helpers section and check none create their own command buffers
-        let helpers_start = model_rs.find("fn encode_rms_norm").unwrap();
+        // Find dispatch helpers section and check none create their own encoders
+        let helpers_start = model_rs.find("fn dispatch_rms_norm").unwrap();
         let helpers_code = &model_rs[helpers_start..];
 
-        // None of the encode_ helpers should call new_command_buffer
+        // None of the dispatch_ helpers should call new_command_buffer
         assert!(
             !helpers_code.contains("self.queue.new_command_buffer()"),
-            "encode helpers should not create their own command buffers"
+            "dispatch helpers should not create their own command buffers"
+        );
+
+        // None should create their own compute encoders
+        assert!(
+            !helpers_code.contains("new_compute_command_encoder()"),
+            "dispatch helpers should not create their own compute encoders"
+        );
+
+        // None should call end_encoding
+        assert!(
+            !helpers_code.contains("end_encoding()"),
+            "dispatch helpers should not call end_encoding"
         );
 
         // None should call commit or wait
         assert!(
             !helpers_code.contains(".commit()"),
-            "encode helpers should not commit command buffers"
+            "dispatch helpers should not commit command buffers"
         );
         assert!(
             !helpers_code.contains("wait_until_completed"),
-            "encode helpers should not wait on command buffers"
+            "dispatch helpers should not wait on command buffers"
         );
     }
 
     #[test]
-    fn generated_forward_no_per_op_buffer_allocation() {
+    fn generated_forward_batches_compute_encoders() {
         let config = minimal_config();
         let model_rs = generate_model_rs(&config).unwrap();
 
@@ -2070,7 +2096,7 @@ mod tests {
         let forward_start = model_rs.find("pub fn forward").unwrap();
         let forward_body = &model_rs[forward_start..];
         let forward_end = forward_body
-            .find("\n    fn encode_")
+            .find("\n    fn dispatch_")
             .unwrap_or(forward_body.len());
         let forward_code = &forward_body[..forward_end];
 
@@ -2078,6 +2104,42 @@ mod tests {
         assert!(
             !forward_code.contains("device.new_buffer"),
             "forward() should not allocate new buffers per call"
+        );
+
+        // Forward should use batched compute encoders (fewer than one per op)
+        // Per layer: 1 compute encoder (pre-attention) + 1 blit + 1 compute encoder (post-attention)
+        // Plus 1 blit (embedding) + 1 compute encoder (final norm + logits)
+        // For 2 layers: 2*2 compute + 2 blit (layers) + 1 blit (embed) + 1 compute = 5 compute, 3 blit
+        let compute_encoder_count = forward_code
+            .matches("new_compute_command_encoder()")
+            .count();
+        let blit_encoder_count = forward_code.matches("new_blit_command_encoder()").count();
+
+        // With batching, we expect far fewer encoders than the old per-op approach
+        // Old: ~15+ compute encoders per layer. New: 2 compute + 1 blit per layer + 1 final compute
+        assert!(
+            compute_encoder_count <= 6,
+            "forward() should batch compute dispatches into fewer encoders, found {compute_encoder_count}"
+        );
+        assert!(
+            blit_encoder_count <= 4,
+            "forward() should have minimal blit encoders, found {blit_encoder_count}"
+        );
+    }
+
+    #[test]
+    fn generated_forward_uses_add_inplace() {
+        let config = minimal_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        // Should use in-place add (no blit copy-back needed)
+        assert!(
+            model_rs.contains("dispatch_add_inplace"),
+            "forward() should use dispatch_add_inplace for residual connections"
+        );
+        assert!(
+            model_rs.contains("add_inplace_pipeline"),
+            "MetalModel should have add_inplace_pipeline"
         );
     }
 }
