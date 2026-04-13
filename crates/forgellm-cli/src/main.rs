@@ -8,6 +8,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 use forgellm_codegen_gpu::generate_gpu_project;
+use forgellm_codegen_metal::generate_metal_project;
 use forgellm_frontend::{
     config::HFConfig, gguf, graph_builder, hub, ir::ModelConfig, weight_loader,
 };
@@ -40,7 +41,7 @@ enum Commands {
         #[arg(long)]
         model: String,
 
-        /// Target backend: cpu, wasm
+        /// Target backend: cpu, wasm, gpu, metal
         #[arg(long, default_value = "cpu")]
         target: String,
 
@@ -706,7 +707,9 @@ fn cmd_compile(args: CompileArgs<'_>) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("WASM project generation failed: {e}"))?,
         "gpu" => generate_gpu_project(&optimized, output_dir, &model_name)
             .map_err(|e| anyhow::anyhow!("GPU project generation failed: {e}"))?,
-        _ => bail!("unsupported target: {target} (supported: cpu, wasm, gpu)"),
+        "metal" => generate_metal_project(&optimized, output_dir, &model_name)
+            .map_err(|e| anyhow::anyhow!("Metal project generation failed: {e}"))?,
+        _ => bail!("unsupported target: {target} (supported: cpu, wasm, gpu, metal)"),
     }
 
     println!("Generated project at {output_path}/");
@@ -718,6 +721,11 @@ fn cmd_compile(args: CompileArgs<'_>) -> Result<()> {
         println!("  src/model.rs  — GpuModel with embedded WGSL shaders");
         println!("  src/main.rs   — weight loader + tokenizer + GPU inference CLI");
         println!("  Cargo.toml    — wgpu + pollster + tokenizers dependencies");
+    } else if target == "metal" {
+        println!("  src/model.rs      — MetalModel with native compute pipelines");
+        println!("  src/main.rs       — weight loader + tokenizer + Metal inference CLI");
+        println!("  shaders/kernels.metal — Metal Shading Language compute kernels");
+        println!("  Cargo.toml        — metal + objc + tokenizers dependencies");
     } else {
         println!("  src/model.rs  — kernels + forward function");
         println!("  src/main.rs   — weight loader + CLI");
@@ -742,6 +750,14 @@ fn cmd_compile(args: CompileArgs<'_>) -> Result<()> {
             println!("  2. Copy tokenizer:  cp tokenizer.json {output_path}/");
             println!("  3. Build:           cd {output_path} && cargo build --release");
             println!("  4. Run:             ./target/release/{model_name} weights.bin tokenizer.json \"Hello\"");
+        } else if target == "metal" {
+            println!();
+            println!("Next steps:");
+            println!("  1. Export weights:  forge export-weights --model {model_path} --output {output_path}/weights.bin");
+            println!("  2. Copy tokenizer:  cp tokenizer.json {output_path}/");
+            println!("  3. Build:           cd {output_path} && cargo build --release");
+            println!("  4. Run:             ./target/release/{model_name} weights.bin tokenizer.json \"Hello\"");
+            println!("  (Requires macOS with Apple Silicon)");
         } else if embed_weights {
             println!();
             println!("Next steps:");

@@ -17,6 +17,7 @@ forgellm-optimizer = { workspace = true }
 forgellm-codegen-cpu = { workspace = true }
 forgellm-codegen-wasm = { workspace = true }
 forgellm-codegen-gpu = { workspace = true }
+forgellm-codegen-metal = { workspace = true }
 forgellm-runtime = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
