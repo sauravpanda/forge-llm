@@ -421,7 +421,6 @@ fn emit_model_header(code: &mut String, config: &ModelConfig) -> Result<(), Meta
     writeln!(code)?;
     writeln!(code, "use metal::*;")?;
     writeln!(code, "use std::mem;")?;
-    writeln!(code, "use std::path::Path;")?;
     writeln!(code)?;
 
     // Model constants
@@ -516,6 +515,12 @@ fn emit_metal_model_struct(
     writeln!(code)?;
     writeln!(
         code,
+        "    /// LM head projection weight [VOCAB_SIZE, HIDDEN_SIZE] (f32)"
+    )?;
+    writeln!(code, "    lm_head_buf: Buffer,")?;
+    writeln!(code)?;
+    writeln!(
+        code,
         "    // ── Working buffers (re-used every forward pass) ──"
     )?;
     writeln!(code, "    hidden_buf: Buffer,")?;
@@ -564,6 +569,8 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     let head_dim = config.head_dim;
     let vocab = config.vocab_size;
     let effective_seq_len = config.max_seq_len.min(4096);
+    let is_q8 = config.dtype == DType::Q8_0;
+    let kv_dim = num_kv_heads * head_dim;
 
     writeln!(code, "impl MetalModel {{")?;
 
@@ -630,11 +637,10 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "        let f32_size = mem::size_of::<f32>();")?;
     writeln!(code, "        let embed_elems = VOCAB_SIZE * HIDDEN_SIZE;")?;
     writeln!(code, "        let hidden_elems = HIDDEN_SIZE;")?;
-    writeln!(code, "        let inter_elems = INTERMEDIATE_SIZE;")?;
     writeln!(code)?;
     writeln!(
         code,
-        "        let mut cursor: usize = 0;  // byte cursor into `weights`"
+        "        let cursor = std::cell::Cell::new(0usize);  // byte cursor into `weights`"
     )?;
     writeln!(code)?;
     writeln!(
@@ -643,14 +649,15 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     )?;
     writeln!(
         code,
-        "        let mut next_buffer = |device: &Device, n: usize, label: &str| -> Buffer {{"
+        "        let next_f32_buffer = |device: &Device, n: usize| -> Buffer {{"
     )?;
     writeln!(code, "            let byte_len = n * f32_size;")?;
+    writeln!(code, "            let cur = cursor.get();")?;
     writeln!(
         code,
-        "            let data = &weights[cursor..cursor + byte_len];"
+        "            let data = &weights[cur..cur + byte_len];"
     )?;
-    writeln!(code, "            cursor += byte_len;")?;
+    writeln!(code, "            cursor.set(cur + byte_len);")?;
     writeln!(code, "            device.new_buffer_with_data(")?;
     writeln!(code, "                data.as_ptr() as *const _,")?;
     writeln!(code, "                byte_len as u64,")?;
@@ -662,9 +669,95 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "        }};")?;
     writeln!(code)?;
 
+    if is_q8 {
+        // For Q8_0 models, projection weights are stored as raw Q8_0 bytes.
+        // We dequantize them to f32 at load time so the Metal shaders can
+        // use standard f32 matrix-vector multiplication.
+        writeln!(code, "        // Helper: dequantize f16 bits to f32")?;
+        writeln!(code, "        fn f16_to_f32(bits: u16) -> f32 {{")?;
+        writeln!(code, "            half::f16::from_bits(bits).to_f32()")?;
+        writeln!(code, "        }}")?;
+        writeln!(code)?;
+        writeln!(
+            code,
+            "        // Helper: read the next Q8_0 weight matrix (rows x cols elements)"
+        )?;
+        writeln!(code, "        // and dequantize to f32 Metal buffer.")?;
+        writeln!(
+            code,
+            "        // Q8_0 format: each block of 32 values = 2 bytes (f16 scale) + 32 bytes (int8)."
+        )?;
+        writeln!(
+            code,
+            "        let next_q8_buffer = |device: &Device, rows: usize, cols: usize| -> Buffer {{"
+        )?;
+        writeln!(code, "            let blocks_per_row = cols.div_ceil(32);")?;
+        writeln!(code, "            let row_bytes = blocks_per_row * 34;")?;
+        writeln!(code, "            let total_raw = rows * row_bytes;")?;
+        writeln!(code, "            let cur = cursor.get();")?;
+        writeln!(
+            code,
+            "            let raw = &weights[cur..cur + total_raw];"
+        )?;
+        writeln!(code, "            cursor.set(cur + total_raw);")?;
+        writeln!(code)?;
+        writeln!(
+            code,
+            "            let mut f32_data: Vec<f32> = Vec::with_capacity(rows * cols);"
+        )?;
+        writeln!(code, "            for row in 0..rows {{")?;
+        writeln!(code, "                let row_start = row * row_bytes;")?;
+        writeln!(code, "                for b in 0..blocks_per_row {{")?;
+        writeln!(
+            code,
+            "                    let block_start = row_start + b * 34;"
+        )?;
+        writeln!(
+            code,
+            "                    let scale_bits = u16::from_le_bytes([raw[block_start], raw[block_start + 1]]);"
+        )?;
+        writeln!(
+            code,
+            "                    let scale = f16_to_f32(scale_bits);"
+        )?;
+        writeln!(code, "                    let block_elem_start = b * 32;")?;
+        writeln!(code, "                    for j in 0..32 {{")?;
+        writeln!(
+            code,
+            "                        if block_elem_start + j < cols {{"
+        )?;
+        writeln!(
+            code,
+            "                            let q = raw[block_start + 2 + j] as i8;"
+        )?;
+        writeln!(
+            code,
+            "                            f32_data.push(scale * q as f32);"
+        )?;
+        writeln!(code, "                        }}")?;
+        writeln!(code, "                    }}")?;
+        writeln!(code, "                }}")?;
+        writeln!(code, "            }}")?;
+        writeln!(code)?;
+        writeln!(
+            code,
+            "            let byte_len = (f32_data.len() * f32_size) as u64;"
+        )?;
+        writeln!(code, "            device.new_buffer_with_data(")?;
+        writeln!(code, "                f32_data.as_ptr() as *const _,")?;
+        writeln!(code, "                byte_len,")?;
+        writeln!(
+            code,
+            "                MTLResourceOptions::StorageModeShared,"
+        )?;
+        writeln!(code, "            )")?;
+        writeln!(code, "        }};")?;
+        writeln!(code)?;
+    }
+
     writeln!(
         code,
-        "        let embed_buf = next_buffer(&device, embed_elems, \"embed\");"
+        "        let embed_buf = next_f32_buffer(&device, embed_elems);"
     )?;
     writeln!(code)?;
 
@@ -673,43 +766,85 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "        let mut layers: Vec<LayerBuffers> = Vec::with_capacity(NUM_LAYERS);"
     )?;
-    writeln!(code, "        for layer in 0..NUM_LAYERS {{")?;
+    writeln!(code, "        for _layer in 0..NUM_LAYERS {{")?;
+
+    // attn_norm is always f32
     writeln!(
         code,
-        "            let attn_norm = next_buffer(&device, hidden_elems, &format!(\"layer{{layer}}.attn_norm\"));"
+        "            let attn_norm = next_f32_buffer(&device, hidden_elems);"
     )?;
+
+    if is_q8 {
+        // Q8_0 projection weights
+        writeln!(
+            code,
+            "            let q_weight = next_q8_buffer(&device, {hidden}, {hidden});"
+        )?;
+        writeln!(
+            code,
+            "            let k_weight = next_q8_buffer(&device, {kv_dim}, {hidden});"
+        )?;
+        writeln!(
+            code,
+            "            let v_weight = next_q8_buffer(&device, {kv_dim}, {hidden});"
+        )?;
+        writeln!(
+            code,
+            "            let o_weight = next_q8_buffer(&device, {hidden}, {hidden});"
+        )?;
+    } else {
+        writeln!(
+            code,
+            "            let q_weight = next_f32_buffer(&device, {hidden} * {hidden});"
+        )?;
+        writeln!(
+            code,
+            "            let k_weight = next_f32_buffer(&device, {kv_dim} * {hidden});"
+        )?;
+        writeln!(
+            code,
+            "            let v_weight = next_f32_buffer(&device, {kv_dim} * {hidden});"
+        )?;
+        writeln!(
+            code,
+            "            let o_weight = next_f32_buffer(&device, {hidden} * {hidden});"
+        )?;
+    }
+
+    // ffn_norm is always f32
     writeln!(
         code,
-        "            let q_weight = next_buffer(&device, hidden_elems * hidden_elems, &format!(\"layer{{layer}}.q\"));"
+        "            let ffn_norm = next_f32_buffer(&device, hidden_elems);"
     )?;
-    writeln!(
-        code,
-        "            let k_weight = next_buffer(&device, hidden_elems * hidden_elems, &format!(\"layer{{layer}}.k\"));"
-    )?;
-    writeln!(
-        code,
-        "            let v_weight = next_buffer(&device, hidden_elems * hidden_elems, &format!(\"layer{{layer}}.v\"));"
-    )?;
-    writeln!(
-        code,
-        "            let o_weight = next_buffer(&device, hidden_elems * hidden_elems, &format!(\"layer{{layer}}.o\"));"
-    )?;
-    writeln!(
-        code,
-        "            let ffn_norm = next_buffer(&device, hidden_elems, &format!(\"layer{{layer}}.ffn_norm\"));"
-    )?;
-    writeln!(
-        code,
-        "            let gate_weight = next_buffer(&device, inter_elems * hidden_elems, &format!(\"layer{{layer}}.gate\"));"
-    )?;
-    writeln!(
-        code,
-        "            let up_weight = next_buffer(&device, inter_elems * hidden_elems, &format!(\"layer{{layer}}.up\"));"
-    )?;
-    writeln!(
-        code,
-        "            let down_weight = next_buffer(&device, hidden_elems * inter_elems, &format!(\"layer{{layer}}.down\"));"
-    )?;
+
+    if is_q8 {
+        writeln!(
+            code,
+            "            let gate_weight = next_q8_buffer(&device, {intermediate}, {hidden});"
+        )?;
+        writeln!(
+            code,
+            "            let up_weight = next_q8_buffer(&device, {intermediate}, {hidden});"
+        )?;
+        writeln!(
+            code,
+            "            let down_weight = next_q8_buffer(&device, {hidden}, {intermediate});"
+        )?;
+    } else {
+        writeln!(
+            code,
+            "            let gate_weight = next_f32_buffer(&device, {intermediate} * {hidden});"
+        )?;
+        writeln!(
+            code,
+            "            let up_weight = next_f32_buffer(&device, {intermediate} * {hidden});"
+        )?;
+        writeln!(
+            code,
+            "            let down_weight = next_f32_buffer(&device, {hidden} * {intermediate});"
+        )?;
+    }
+
     writeln!(code, "            layers.push(LayerBuffers {{")?;
     writeln!(code, "                attn_norm,")?;
     writeln!(code, "                q_weight,")?;
@@ -724,10 +859,25 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "        }}")?;
     writeln!(code)?;
 
+    // final_norm is always f32
     writeln!(
         code,
-        "        let norm_buf = next_buffer(&device, hidden_elems, \"final_norm\");"
+        "        let norm_buf = next_f32_buffer(&device, hidden_elems);"
     )?;
+    writeln!(code)?;
+
+    // lm_head
+    if is_q8 {
+        writeln!(
+            code,
+            "        let lm_head_buf = next_q8_buffer(&device, {vocab}, {hidden});"
+        )?;
+    } else {
+        writeln!(
+            code,
+            "        let lm_head_buf = next_f32_buffer(&device, {vocab} * {hidden});"
+        )?;
+    }
     writeln!(code)?;
 
     // Working buffers
@@ -792,6 +942,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            embed_buf,")?;
     writeln!(code, "            layers,")?;
     writeln!(code, "            norm_buf,")?;
+    writeln!(code, "            lm_head_buf,")?;
     writeln!(code, "            hidden_buf,")?;
     writeln!(code, "            residual_buf,")?;
     writeln!(code, "            logits_buf,")?;
@@ -1020,7 +1171,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     )?;
     writeln!(
         code,
-        "            enc.set_buffer(0, Some(&self.embed_buf), 0);"
+        "            enc.set_buffer(0, Some(&self.lm_head_buf), 0);"
     )?;
     writeln!(
         code,
@@ -1471,6 +1622,24 @@ fn generate_main_rs(model_name: &str, config: &ModelConfig) -> Result<String, Me
     writeln!(code, "    let tokenizer_path = &args[2];")?;
     writeln!(code, "    let prompt = &args[3];")?;
     writeln!(code)?;
+    writeln!(code, "    // Parse optional --max-tokens flag")?;
+    writeln!(code, "    let mut max_tokens: usize = 128;")?;
+    writeln!(code, "    let mut i = 4;")?;
+    writeln!(code, "    while i < args.len() {{")?;
+    writeln!(
+        code,
+        "        if args[i] == \"--max-tokens\" && i + 1 < args.len() {{"
+    )?;
+    writeln!(
+        code,
+        "            max_tokens = args[i + 1].parse().unwrap_or(128);"
+    )?;
+    writeln!(code, "            i += 2;")?;
+    writeln!(code, "        }} else {{")?;
+    writeln!(code, "            i += 1;")?;
+    writeln!(code, "        }}")?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
     writeln!(
         code,
         "    // Memory-map weights for zero-copy loading on Apple Silicon"
@@ -1485,7 +1654,7 @@ fn generate_main_rs(model_name: &str, config: &ModelConfig) -> Result<String, Me
     )?;
     writeln!(
         code,
-        "    let weights_mmap = unsafe {{ memmap2::Mmap::new(&weights_file).unwrap() }};"
+        "    let weights_mmap = unsafe {{ memmap2::Mmap::map(&weights_file).unwrap() }};"
     )?;
     writeln!(code)?;
     writeln!(code, "    // Load tokenizer")?;
@@ -1517,16 +1686,13 @@ fn generate_main_rs(model_name: &str, config: &ModelConfig) -> Result<String, Me
     writeln!(code, "    let prompt_tokens = encoding.get_ids();")?;
     writeln!(code)?;
     writeln!(code, "    // Process prompt tokens (prefill)")?;
+    writeln!(code, "    let mut logits = Vec::new();")?;
     writeln!(code, "    for &token in prompt_tokens.iter() {{")?;
-    writeln!(code, "        let _ = model.forward(token);")?;
+    writeln!(code, "        logits = model.forward(token);")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
     writeln!(code, "    // Generate tokens")?;
-    writeln!(code, "    let max_tokens: usize = 128;")?;
-    writeln!(
-        code,
-        "    let mut next_token = argmax(&model.forward(*prompt_tokens.last().unwrap_or(&0)));"
-    )?;
+    writeln!(code, "    let mut next_token = argmax(&logits);")?;
     writeln!(code)?;
     writeln!(code, "    for _ in 0..max_tokens {{")?;
     writeln!(
