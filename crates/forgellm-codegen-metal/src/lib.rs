@@ -862,6 +862,467 @@ kernel void attention(
         output[q_off + d] = acc;
     }
 }
+
+// ── Batched prefill kernels ────────────────────────────────────────────
+// These kernels process M input vectors against the same weight matrix
+// in a single dispatch, converting mat-vec into mat-mat for better GPU
+// utilization during prompt prefill.
+
+// ── rms_norm_batch ─────────────────────────────────────────────────────
+// RMS normalization for a batch of vectors.
+// Each threadgroup handles one vector: input[token * n .. (token+1) * n].
+// Grid: M threadgroups (one per token).
+kernel void rms_norm_batch(
+    device const float* input   [[buffer(0)]],  // [M, n]
+    device const float* weight  [[buffer(1)]],  // [n]
+    device float* output        [[buffer(2)]],  // [M, n]
+    constant uint& n            [[buffer(3)]],
+    constant float& eps         [[buffer(4)]],
+    constant uint& num_tokens   [[buffer(5)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]])
+{
+    if (tgid >= num_tokens) return;
+
+    uint base = tgid * n;
+
+    float sum_sq = 0.0f;
+    for (uint i = tid; i < n; i += 256) {
+        float v = input[base + i];
+        sum_sq += v * v;
+    }
+
+    sum_sq = simd_sum(sum_sq);
+
+    threadgroup float shared[8];
+    uint simd_id = tid / 32;
+    uint simd_lane = tid % 32;
+    if (simd_lane == 0) {
+        shared[simd_id] = sum_sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint i = 0; i < 8; i++) {
+            total += shared[i];
+        }
+        shared[0] = fast::rsqrt(total / float(n) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float inv_rms = shared[0];
+
+    for (uint i = tid; i < n; i += 256) {
+        output[base + i] = input[base + i] * inv_rms * weight[i];
+    }
+}
+
+// ── rope_batch ─────────────────────────────────────────────────────────
+// Rotary Position Embedding for a batch of vectors with different positions.
+// data layout: [M, num_heads * head_dim], positions: [M]
+// Each thread handles one (token, head, pair) combination.
+kernel void rope_batch(
+    device float* data           [[buffer(0)]],  // [M, num_heads * head_dim]
+    constant uint& num_heads     [[buffer(1)]],
+    constant uint& head_dim      [[buffer(2)]],
+    device const uint* positions  [[buffer(3)]],  // [M] position per token
+    constant float& theta        [[buffer(4)]],
+    constant uint& num_tokens    [[buffer(5)]],
+    uint id [[thread_position_in_grid]])
+{
+    uint half_dim = head_dim / 2;
+    uint pairs_per_token = num_heads * half_dim;
+    uint total = num_tokens * pairs_per_token;
+    if (id >= total) return;
+
+    uint token = id / pairs_per_token;
+    uint rem = id % pairs_per_token;
+    uint h = rem / half_dim;
+    uint i = rem % half_dim;
+    uint off = token * (num_heads * head_dim) + h * head_dim;
+
+    float freq = 1.0f / pow(theta, 2.0f * float(i) / float(head_dim));
+    float angle = float(positions[token]) * freq;
+    float c = cos(angle);
+    float s = sin(angle);
+
+    float x0 = data[off + 2 * i];
+    float x1 = data[off + 2 * i + 1];
+    data[off + 2 * i]     = x0 * c - x1 * s;
+    data[off + 2 * i + 1] = x0 * s + x1 * c;
+}
+
+// ── silu_mul_fused_batch ───────────────────────────────────────────────
+// Fused SiLU-multiply for a batch: gate_up layout [M, 2*n].
+// Each element: output[token*n + i] = silu(gate_up[token*2*n + i]) * gate_up[token*2*n + n + i]
+kernel void silu_mul_fused_batch(
+    device const float* gate_up [[buffer(0)]],  // [M, 2*n]
+    device float* output        [[buffer(1)]],  // [M, n]
+    constant uint& n            [[buffer(2)]],
+    constant uint& num_tokens   [[buffer(3)]],
+    uint id [[thread_position_in_grid]])
+{
+    uint total = num_tokens * n;
+    if (id >= total) return;
+    uint token = id / n;
+    uint i = id % n;
+    uint gu_base = token * 2 * n;
+    float g = gate_up[gu_base + i];
+    float u = gate_up[gu_base + n + i];
+    output[token * n + i] = (g / (1.0f + fast::exp(-g))) * u;
+}
+
+// ── add_inplace_batch ──────────────────────────────────────────────────
+// In-place residual connection for a batch: a[i] += b[i] for all M*n elements.
+kernel void add_inplace_batch(
+    device float* a        [[buffer(0)]],  // [M * n]
+    device const float* b  [[buffer(1)]],  // [M * n]
+    constant uint& total   [[buffer(2)]],  // M * n
+    uint id [[thread_position_in_grid]])
+{
+    if (id >= total) return;
+    a[id] += b[id];
+}
+
+// ── copy_embedding_batch ───────────────────────────────────────────────
+// Copy M embedding rows from embedding table to a contiguous batch buffer.
+// tokens: [M] array of token IDs, each selects a row of `dim` floats.
+kernel void copy_embedding_batch(
+    device const float* embed   [[buffer(0)]],  // [vocab_size, dim]
+    device float* output        [[buffer(1)]],  // [M, dim]
+    device const uint* tokens   [[buffer(2)]],  // [M]
+    constant uint& dim          [[buffer(3)]],
+    constant uint& num_tokens   [[buffer(4)]],
+    uint id [[thread_position_in_grid]])
+{
+    uint total = num_tokens * dim;
+    if (id >= total) return;
+    uint token_idx = id / dim;
+    uint d = id % dim;
+    output[id] = embed[tokens[token_idx] * dim + d];
+}
+
+// ── matmul_vec_batch ───────────────────────────────────────────────────
+// Batched matrix-vector multiply: process M input vectors against the same
+// weight matrix. Grid: ceil(rows/ROWS_PER_TG) * M threadgroups.
+// Each threadgroup handles one (token, row_group) pair.
+kernel void matmul_vec_batch(
+    device const float* matrix  [[buffer(0)]],  // [rows, cols] weight
+    device const float* inputs  [[buffer(1)]],  // [M, cols] input batch
+    device float* outputs       [[buffer(2)]],  // [M, rows] output batch
+    constant uint& num_tokens   [[buffer(3)]],  // M
+    constant uint& rows         [[buffer(4)]],
+    constant uint& cols         [[buffer(5)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]])
+{
+    uint row_tgs = (rows + ROWS_PER_TG - 1) / ROWS_PER_TG;
+    uint token = tgid / row_tgs;
+    uint tg_in_token = tgid % row_tgs;
+    if (token >= num_tokens) return;
+
+    // Load this token's input vector into shared memory
+    threadgroup float vec_tile[VEC_TILE_SIZE];
+    device const float* input = inputs + token * cols;
+    for (uint i = tid; i < cols; i += 256) {
+        vec_tile[i] = input[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint row_base = tg_in_token * ROWS_PER_TG + simd_id * ROWS_PER_SIMDGROUP;
+    if (row_base >= rows) return;
+
+    uint base0 = row_base * cols;
+    uint base1 = (row_base + 1) * cols;
+    uint base2 = (row_base + 2) * cols;
+    uint base3 = (row_base + 3) * cols;
+    uint base4 = (row_base + 4) * cols;
+    uint base5 = (row_base + 5) * cols;
+    uint base6 = (row_base + 6) * cols;
+    uint base7 = (row_base + 7) * cols;
+
+    uint cols_vec4 = cols & ~127u;
+    float4 sum4_0 = float4(0.0f);
+    float4 sum4_1 = float4(0.0f);
+    float4 sum4_2 = float4(0.0f);
+    float4 sum4_3 = float4(0.0f);
+    float4 sum4_4 = float4(0.0f);
+    float4 sum4_5 = float4(0.0f);
+    float4 sum4_6 = float4(0.0f);
+    float4 sum4_7 = float4(0.0f);
+
+    for (uint j = simd_lane * 4; j < cols_vec4; j += 128) {
+        float4 v = *reinterpret_cast<threadgroup const float4*>(vec_tile + j);
+        sum4_0 += *reinterpret_cast<device const float4*>(matrix + base0 + j) * v;
+        if (row_base + 1 < rows) sum4_1 += *reinterpret_cast<device const float4*>(matrix + base1 + j) * v;
+        if (row_base + 2 < rows) sum4_2 += *reinterpret_cast<device const float4*>(matrix + base2 + j) * v;
+        if (row_base + 3 < rows) sum4_3 += *reinterpret_cast<device const float4*>(matrix + base3 + j) * v;
+        if (row_base + 4 < rows) sum4_4 += *reinterpret_cast<device const float4*>(matrix + base4 + j) * v;
+        if (row_base + 5 < rows) sum4_5 += *reinterpret_cast<device const float4*>(matrix + base5 + j) * v;
+        if (row_base + 6 < rows) sum4_6 += *reinterpret_cast<device const float4*>(matrix + base6 + j) * v;
+        if (row_base + 7 < rows) sum4_7 += *reinterpret_cast<device const float4*>(matrix + base7 + j) * v;
+    }
+
+    float sum0 = sum4_0.x + sum4_0.y + sum4_0.z + sum4_0.w;
+    float sum1 = sum4_1.x + sum4_1.y + sum4_1.z + sum4_1.w;
+    float sum2 = sum4_2.x + sum4_2.y + sum4_2.z + sum4_2.w;
+    float sum3 = sum4_3.x + sum4_3.y + sum4_3.z + sum4_3.w;
+    float sum4 = sum4_4.x + sum4_4.y + sum4_4.z + sum4_4.w;
+    float sum5 = sum4_5.x + sum4_5.y + sum4_5.z + sum4_5.w;
+    float sum6 = sum4_6.x + sum4_6.y + sum4_6.z + sum4_6.w;
+    float sum7 = sum4_7.x + sum4_7.y + sum4_7.z + sum4_7.w;
+
+    for (uint j = cols_vec4 + simd_lane; j < cols; j += 32) {
+        float vv = vec_tile[j];
+        sum0 += matrix[base0 + j] * vv;
+        if (row_base + 1 < rows) sum1 += matrix[base1 + j] * vv;
+        if (row_base + 2 < rows) sum2 += matrix[base2 + j] * vv;
+        if (row_base + 3 < rows) sum3 += matrix[base3 + j] * vv;
+        if (row_base + 4 < rows) sum4 += matrix[base4 + j] * vv;
+        if (row_base + 5 < rows) sum5 += matrix[base5 + j] * vv;
+        if (row_base + 6 < rows) sum6 += matrix[base6 + j] * vv;
+        if (row_base + 7 < rows) sum7 += matrix[base7 + j] * vv;
+    }
+
+    sum0 = simd_sum(sum0); sum1 = simd_sum(sum1);
+    sum2 = simd_sum(sum2); sum3 = simd_sum(sum3);
+    sum4 = simd_sum(sum4); sum5 = simd_sum(sum5);
+    sum6 = simd_sum(sum6); sum7 = simd_sum(sum7);
+
+    device float* output = outputs + token * rows;
+    if (simd_lane == 0) {
+        if (row_base     < rows) output[row_base]     = sum0;
+        if (row_base + 1 < rows) output[row_base + 1] = sum1;
+        if (row_base + 2 < rows) output[row_base + 2] = sum2;
+        if (row_base + 3 < rows) output[row_base + 3] = sum3;
+        if (row_base + 4 < rows) output[row_base + 4] = sum4;
+        if (row_base + 5 < rows) output[row_base + 5] = sum5;
+        if (row_base + 6 < rows) output[row_base + 6] = sum6;
+        if (row_base + 7 < rows) output[row_base + 7] = sum7;
+    }
+}
+
+// ── matmul_vec_q8_batch ────────────────────────────────────────────────
+// Batched Q8_0 matrix-vector multiply for M input vectors.
+// Grid: ceil(rows/Q8_ROWS_PER_TG) * M threadgroups.
+kernel void matmul_vec_q8_batch(
+    device const uchar* matrix   [[buffer(0)]],  // Q8_0 raw bytes [rows, cols]
+    device const float* inputs   [[buffer(1)]],  // [M, cols] input batch
+    device float* outputs        [[buffer(2)]],  // [M, rows] output batch
+    constant uint& num_tokens    [[buffer(3)]],  // M
+    constant uint& rows          [[buffer(4)]],
+    constant uint& cols          [[buffer(5)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]])
+{
+    uint row_tgs = (rows + Q8_ROWS_PER_TG - 1) / Q8_ROWS_PER_TG;
+    uint token = tgid / row_tgs;
+    uint tg_in_token = tgid % row_tgs;
+    if (token >= num_tokens) return;
+
+    // Load this token's input vector into shared memory
+    threadgroup float vec_tile[VEC_TILE_SIZE];
+    device const float* input = inputs + token * cols;
+    for (uint i = tid; i < cols; i += 256) {
+        vec_tile[i] = input[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint row_base = tg_in_token * Q8_ROWS_PER_TG + simd_id * Q8_ROWS_PER_SG;
+    if (row_base >= rows) return;
+
+    uint blocks_per_row = cols / 32;
+    uint row_bytes = blocks_per_row * 34;
+
+    device const uchar* r0 = matrix + row_base * row_bytes;
+    device const uchar* r1 = matrix + (row_base + 1) * row_bytes;
+    device const uchar* r2 = matrix + (row_base + 2) * row_bytes;
+    device const uchar* r3 = matrix + (row_base + 3) * row_bytes;
+
+    float sum0 = 0.0, sum1 = 0.0, sum2 = 0.0, sum3 = 0.0;
+
+    for (uint blk = simd_lane; blk < blocks_per_row; blk += 32) {
+        uint bb = blk * 34;
+        uint vb = blk * 32;
+
+        float sc0 = float(*(device const half*)(r0 + bb));
+        float sc1 = float(*(device const half*)(r1 + bb));
+        float sc2 = float(*(device const half*)(r2 + bb));
+        float sc3 = float(*(device const half*)(r3 + bb));
+
+        device const packed_char4* d0 = (device const packed_char4*)(r0 + bb + 2);
+        device const packed_char4* d1 = (device const packed_char4*)(r1 + bb + 2);
+        device const packed_char4* d2 = (device const packed_char4*)(r2 + bb + 2);
+        device const packed_char4* d3 = (device const packed_char4*)(r3 + bb + 2);
+
+        float4 v0 = *(threadgroup const float4*)(vec_tile + vb);
+        float4 v1 = *(threadgroup const float4*)(vec_tile + vb + 4);
+        float4 v2 = *(threadgroup const float4*)(vec_tile + vb + 8);
+        float4 v3 = *(threadgroup const float4*)(vec_tile + vb + 12);
+        float4 v4 = *(threadgroup const float4*)(vec_tile + vb + 16);
+        float4 v5 = *(threadgroup const float4*)(vec_tile + vb + 20);
+        float4 v6 = *(threadgroup const float4*)(vec_tile + vb + 24);
+        float4 v7 = *(threadgroup const float4*)(vec_tile + vb + 28);
+
+        float bd0=0, bd1=0, bd2=0, bd3=0;
+        char4 c;
+
+        c=d0[0]; bd0+=float(c.x)*v0.x+float(c.y)*v0.y+float(c.z)*v0.z+float(c.w)*v0.w;
+        c=d0[1]; bd0+=float(c.x)*v1.x+float(c.y)*v1.y+float(c.z)*v1.z+float(c.w)*v1.w;
+        c=d0[2]; bd0+=float(c.x)*v2.x+float(c.y)*v2.y+float(c.z)*v2.z+float(c.w)*v2.w;
+        c=d0[3]; bd0+=float(c.x)*v3.x+float(c.y)*v3.y+float(c.z)*v3.z+float(c.w)*v3.w;
+        c=d0[4]; bd0+=float(c.x)*v4.x+float(c.y)*v4.y+float(c.z)*v4.z+float(c.w)*v4.w;
+        c=d0[5]; bd0+=float(c.x)*v5.x+float(c.y)*v5.y+float(c.z)*v5.z+float(c.w)*v5.w;
+        c=d0[6]; bd0+=float(c.x)*v6.x+float(c.y)*v6.y+float(c.z)*v6.z+float(c.w)*v6.w;
+        c=d0[7]; bd0+=float(c.x)*v7.x+float(c.y)*v7.y+float(c.z)*v7.z+float(c.w)*v7.w;
+
+        c=d1[0]; bd1+=float(c.x)*v0.x+float(c.y)*v0.y+float(c.z)*v0.z+float(c.w)*v0.w;
+        c=d1[1]; bd1+=float(c.x)*v1.x+float(c.y)*v1.y+float(c.z)*v1.z+float(c.w)*v1.w;
+        c=d1[2]; bd1+=float(c.x)*v2.x+float(c.y)*v2.y+float(c.z)*v2.z+float(c.w)*v2.w;
+        c=d1[3]; bd1+=float(c.x)*v3.x+float(c.y)*v3.y+float(c.z)*v3.z+float(c.w)*v3.w;
+        c=d1[4]; bd1+=float(c.x)*v4.x+float(c.y)*v4.y+float(c.z)*v4.z+float(c.w)*v4.w;
+        c=d1[5]; bd1+=float(c.x)*v5.x+float(c.y)*v5.y+float(c.z)*v5.z+float(c.w)*v5.w;
+        c=d1[6]; bd1+=float(c.x)*v6.x+float(c.y)*v6.y+float(c.z)*v6.z+float(c.w)*v6.w;
+        c=d1[7]; bd1+=float(c.x)*v7.x+float(c.y)*v7.y+float(c.z)*v7.z+float(c.w)*v7.w;
+
+        c=d2[0]; bd2+=float(c.x)*v0.x+float(c.y)*v0.y+float(c.z)*v0.z+float(c.w)*v0.w;
+        c=d2[1]; bd2+=float(c.x)*v1.x+float(c.y)*v1.y+float(c.z)*v1.z+float(c.w)*v1.w;
+        c=d2[2]; bd2+=float(c.x)*v2.x+float(c.y)*v2.y+float(c.z)*v2.z+float(c.w)*v2.w;
+        c=d2[3]; bd2+=float(c.x)*v3.x+float(c.y)*v3.y+float(c.z)*v3.z+float(c.w)*v3.w;
+        c=d2[4]; bd2+=float(c.x)*v4.x+float(c.y)*v4.y+float(c.z)*v4.z+float(c.w)*v4.w;
+        c=d2[5]; bd2+=float(c.x)*v5.x+float(c.y)*v5.y+float(c.z)*v5.z+float(c.w)*v5.w;
+        c=d2[6]; bd2+=float(c.x)*v6.x+float(c.y)*v6.y+float(c.z)*v6.z+float(c.w)*v6.w;
+        c=d2[7]; bd2+=float(c.x)*v7.x+float(c.y)*v7.y+float(c.z)*v7.z+float(c.w)*v7.w;
+
+        c=d3[0]; bd3+=float(c.x)*v0.x+float(c.y)*v0.y+float(c.z)*v0.z+float(c.w)*v0.w;
+        c=d3[1]; bd3+=float(c.x)*v1.x+float(c.y)*v1.y+float(c.z)*v1.z+float(c.w)*v1.w;
+        c=d3[2]; bd3+=float(c.x)*v2.x+float(c.y)*v2.y+float(c.z)*v2.z+float(c.w)*v2.w;
+        c=d3[3]; bd3+=float(c.x)*v3.x+float(c.y)*v3.y+float(c.z)*v3.z+float(c.w)*v3.w;
+        c=d3[4]; bd3+=float(c.x)*v4.x+float(c.y)*v4.y+float(c.z)*v4.z+float(c.w)*v4.w;
+        c=d3[5]; bd3+=float(c.x)*v5.x+float(c.y)*v5.y+float(c.z)*v5.z+float(c.w)*v5.w;
+        c=d3[6]; bd3+=float(c.x)*v6.x+float(c.y)*v6.y+float(c.z)*v6.z+float(c.w)*v6.w;
+        c=d3[7]; bd3+=float(c.x)*v7.x+float(c.y)*v7.y+float(c.z)*v7.z+float(c.w)*v7.w;
+
+        sum0 += sc0 * bd0; sum1 += sc1 * bd1; sum2 += sc2 * bd2; sum3 += sc3 * bd3;
+    }
+
+    sum0 = simd_sum(sum0); sum1 = simd_sum(sum1);
+    sum2 = simd_sum(sum2); sum3 = simd_sum(sum3);
+
+    device float* output = outputs + token * rows;
+    if (simd_lane == 0) {
+        if (row_base     < rows) output[row_base]     = sum0;
+        if (row_base + 1 < rows) output[row_base + 1] = sum1;
+        if (row_base + 2 < rows) output[row_base + 2] = sum2;
+        if (row_base + 3 < rows) output[row_base + 3] = sum3;
+    }
+}
+
+// ── matmul_vec_q4_batch ────────────────────────────────────────────────
+// Batched Q4_0 matrix-vector multiply for M input vectors.
+// Grid: ceil(rows/Q4_ROWS_PER_TG) * M threadgroups.
+kernel void matmul_vec_q4_batch(
+    device const uchar* matrix   [[buffer(0)]],  // Q4_0 raw bytes [rows, cols]
+    device const float* inputs   [[buffer(1)]],  // [M, cols] input batch
+    device float* outputs        [[buffer(2)]],  // [M, rows] output batch
+    constant uint& num_tokens    [[buffer(3)]],  // M
+    constant uint& rows          [[buffer(4)]],
+    constant uint& cols          [[buffer(5)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]])
+{
+    uint row_tgs = (rows + Q4_ROWS_PER_TG - 1) / Q4_ROWS_PER_TG;
+    uint token = tgid / row_tgs;
+    uint tg_in_token = tgid % row_tgs;
+    if (token >= num_tokens) return;
+
+    threadgroup float vec_tile[VEC_TILE_SIZE];
+    device const float* input = inputs + token * cols;
+    for (uint i = tid; i < cols; i += 256) {
+        vec_tile[i] = input[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint row_base = tg_in_token * Q4_ROWS_PER_TG + simd_id * Q4_ROWS_PER_SG;
+    if (row_base >= rows) return;
+
+    uint blocks_per_row = cols / 32;
+    uint row_bytes = blocks_per_row * 18;
+
+    device const uchar* r0 = matrix + row_base * row_bytes;
+    device const uchar* r1 = matrix + (row_base + 1) * row_bytes;
+    device const uchar* r2 = matrix + (row_base + 2) * row_bytes;
+    device const uchar* r3 = matrix + (row_base + 3) * row_bytes;
+
+    float sum0 = 0.0, sum1 = 0.0, sum2 = 0.0, sum3 = 0.0;
+
+    for (uint blk = simd_lane; blk < blocks_per_row; blk += 32) {
+        uint bb = blk * 18;
+        uint vb = blk * 32;
+
+        float sc0 = float(*(device const half*)(r0 + bb));
+        float sc1 = float(*(device const half*)(r1 + bb));
+        float sc2 = float(*(device const half*)(r2 + bb));
+        float sc3 = float(*(device const half*)(r3 + bb));
+
+        device const packed_uchar4* p0 = (device const packed_uchar4*)(r0 + bb + 2);
+        device const packed_uchar4* p1 = (device const packed_uchar4*)(r1 + bb + 2);
+        device const packed_uchar4* p2 = (device const packed_uchar4*)(r2 + bb + 2);
+        device const packed_uchar4* p3 = (device const packed_uchar4*)(r3 + bb + 2);
+
+        float4 v0 = *(threadgroup const float4*)(vec_tile + vb);
+        float4 v1 = *(threadgroup const float4*)(vec_tile + vb + 4);
+        float4 v2 = *(threadgroup const float4*)(vec_tile + vb + 8);
+        float4 v3 = *(threadgroup const float4*)(vec_tile + vb + 12);
+        float4 v4 = *(threadgroup const float4*)(vec_tile + vb + 16);
+        float4 v5 = *(threadgroup const float4*)(vec_tile + vb + 20);
+        float4 v6 = *(threadgroup const float4*)(vec_tile + vb + 24);
+        float4 v7 = *(threadgroup const float4*)(vec_tile + vb + 28);
+
+        float bd0=0, bd1=0, bd2=0, bd3=0;
+        uchar4 b;
+
+        b=p0[0]; bd0+=float(int(b.x&0xF)-8)*v0.x+float(int(b.x>>4)-8)*v4.x+float(int(b.y&0xF)-8)*v0.y+float(int(b.y>>4)-8)*v4.y+float(int(b.z&0xF)-8)*v0.z+float(int(b.z>>4)-8)*v4.z+float(int(b.w&0xF)-8)*v0.w+float(int(b.w>>4)-8)*v4.w;
+        b=p0[1]; bd0+=float(int(b.x&0xF)-8)*v1.x+float(int(b.x>>4)-8)*v5.x+float(int(b.y&0xF)-8)*v1.y+float(int(b.y>>4)-8)*v5.y+float(int(b.z&0xF)-8)*v1.z+float(int(b.z>>4)-8)*v5.z+float(int(b.w&0xF)-8)*v1.w+float(int(b.w>>4)-8)*v5.w;
+        b=p0[2]; bd0+=float(int(b.x&0xF)-8)*v2.x+float(int(b.x>>4)-8)*v6.x+float(int(b.y&0xF)-8)*v2.y+float(int(b.y>>4)-8)*v6.y+float(int(b.z&0xF)-8)*v2.z+float(int(b.z>>4)-8)*v6.z+float(int(b.w&0xF)-8)*v2.w+float(int(b.w>>4)-8)*v6.w;
+        b=p0[3]; bd0+=float(int(b.x&0xF)-8)*v3.x+float(int(b.x>>4)-8)*v7.x+float(int(b.y&0xF)-8)*v3.y+float(int(b.y>>4)-8)*v7.y+float(int(b.z&0xF)-8)*v3.z+float(int(b.z>>4)-8)*v7.z+float(int(b.w&0xF)-8)*v3.w+float(int(b.w>>4)-8)*v7.w;
+
+        b=p1[0]; bd1+=float(int(b.x&0xF)-8)*v0.x+float(int(b.x>>4)-8)*v4.x+float(int(b.y&0xF)-8)*v0.y+float(int(b.y>>4)-8)*v4.y+float(int(b.z&0xF)-8)*v0.z+float(int(b.z>>4)-8)*v4.z+float(int(b.w&0xF)-8)*v0.w+float(int(b.w>>4)-8)*v4.w;
+        b=p1[1]; bd1+=float(int(b.x&0xF)-8)*v1.x+float(int(b.x>>4)-8)*v5.x+float(int(b.y&0xF)-8)*v1.y+float(int(b.y>>4)-8)*v5.y+float(int(b.z&0xF)-8)*v1.z+float(int(b.z>>4)-8)*v5.z+float(int(b.w&0xF)-8)*v1.w+float(int(b.w>>4)-8)*v5.w;
+        b=p1[2]; bd1+=float(int(b.x&0xF)-8)*v2.x+float(int(b.x>>4)-8)*v6.x+float(int(b.y&0xF)-8)*v2.y+float(int(b.y>>4)-8)*v6.y+float(int(b.z&0xF)-8)*v2.z+float(int(b.z>>4)-8)*v6.z+float(int(b.w&0xF)-8)*v2.w+float(int(b.w>>4)-8)*v6.w;
+        b=p1[3]; bd1+=float(int(b.x&0xF)-8)*v3.x+float(int(b.x>>4)-8)*v7.x+float(int(b.y&0xF)-8)*v3.y+float(int(b.y>>4)-8)*v7.y+float(int(b.z&0xF)-8)*v3.z+float(int(b.z>>4)-8)*v7.z+float(int(b.w&0xF)-8)*v3.w+float(int(b.w>>4)-8)*v7.w;
+
+        b=p2[0]; bd2+=float(int(b.x&0xF)-8)*v0.x+float(int(b.x>>4)-8)*v4.x+float(int(b.y&0xF)-8)*v0.y+float(int(b.y>>4)-8)*v4.y+float(int(b.z&0xF)-8)*v0.z+float(int(b.z>>4)-8)*v4.z+float(int(b.w&0xF)-8)*v0.w+float(int(b.w>>4)-8)*v4.w;
+        b=p2[1]; bd2+=float(int(b.x&0xF)-8)*v1.x+float(int(b.x>>4)-8)*v5.x+float(int(b.y&0xF)-8)*v1.y+float(int(b.y>>4)-8)*v5.y+float(int(b.z&0xF)-8)*v1.z+float(int(b.z>>4)-8)*v5.z+float(int(b.w&0xF)-8)*v1.w+float(int(b.w>>4)-8)*v5.w;
+        b=p2[2]; bd2+=float(int(b.x&0xF)-8)*v2.x+float(int(b.x>>4)-8)*v6.x+float(int(b.y&0xF)-8)*v2.y+float(int(b.y>>4)-8)*v6.y+float(int(b.z&0xF)-8)*v2.z+float(int(b.z>>4)-8)*v6.z+float(int(b.w&0xF)-8)*v2.w+float(int(b.w>>4)-8)*v6.w;
+        b=p2[3]; bd2+=float(int(b.x&0xF)-8)*v3.x+float(int(b.x>>4)-8)*v7.x+float(int(b.y&0xF)-8)*v3.y+float(int(b.y>>4)-8)*v7.y+float(int(b.z&0xF)-8)*v3.z+float(int(b.z>>4)-8)*v7.z+float(int(b.w&0xF)-8)*v3.w+float(int(b.w>>4)-8)*v7.w;
+
+        b=p3[0]; bd3+=float(int(b.x&0xF)-8)*v0.x+float(int(b.x>>4)-8)*v4.x+float(int(b.y&0xF)-8)*v0.y+float(int(b.y>>4)-8)*v4.y+float(int(b.z&0xF)-8)*v0.z+float(int(b.z>>4)-8)*v4.z+float(int(b.w&0xF)-8)*v0.w+float(int(b.w>>4)-8)*v4.w;
+        b=p3[1]; bd3+=float(int(b.x&0xF)-8)*v1.x+float(int(b.x>>4)-8)*v5.x+float(int(b.y&0xF)-8)*v1.y+float(int(b.y>>4)-8)*v5.y+float(int(b.z&0xF)-8)*v1.z+float(int(b.z>>4)-8)*v5.z+float(int(b.w&0xF)-8)*v1.w+float(int(b.w>>4)-8)*v5.w;
+        b=p3[2]; bd3+=float(int(b.x&0xF)-8)*v2.x+float(int(b.x>>4)-8)*v6.x+float(int(b.y&0xF)-8)*v2.y+float(int(b.y>>4)-8)*v6.y+float(int(b.z&0xF)-8)*v2.z+float(int(b.z>>4)-8)*v6.z+float(int(b.w&0xF)-8)*v2.w+float(int(b.w>>4)-8)*v6.w;
+        b=p3[3]; bd3+=float(int(b.x&0xF)-8)*v3.x+float(int(b.x>>4)-8)*v7.x+float(int(b.y&0xF)-8)*v3.y+float(int(b.y>>4)-8)*v7.y+float(int(b.z&0xF)-8)*v3.z+float(int(b.z>>4)-8)*v7.z+float(int(b.w&0xF)-8)*v3.w+float(int(b.w>>4)-8)*v7.w;
+
+        sum0 += sc0 * bd0; sum1 += sc1 * bd1; sum2 += sc2 * bd2; sum3 += sc3 * bd3;
+    }
+
+    sum0 = simd_sum(sum0); sum1 = simd_sum(sum1);
+    sum2 = simd_sum(sum2); sum3 = simd_sum(sum3);
+
+    device float* output = outputs + token * rows;
+    if (simd_lane == 0) {
+        if (row_base     < rows) output[row_base]     = sum0;
+        if (row_base + 1 < rows) output[row_base + 1] = sum1;
+        if (row_base + 2 < rows) output[row_base + 2] = sum2;
+        if (row_base + 3 < rows) output[row_base + 3] = sum3;
+    }
+}
 "#
     .replace("VEC_TILE_SIZE", &vec_tile_size.to_string())
 }
@@ -941,6 +1402,11 @@ fn emit_model_header(code: &mut String, config: &ModelConfig) -> Result<(), Meta
         config.rms_norm_eps
     )?;
     writeln!(code, "pub const ROPE_THETA: f32 = {:e};", config.rope_theta)?;
+    writeln!(
+        code,
+        "/// Maximum batch size for batched prefill (prompt tokens processed at once)."
+    )?;
+    writeln!(code, "pub const MAX_BATCH_SIZE: usize = 512;")?;
     writeln!(code)?;
 
     Ok(())
@@ -984,6 +1450,25 @@ fn emit_metal_model_struct(
     writeln!(code, "    copy_pipeline: ComputePipelineState,")?;
     writeln!(code, "    copy_offset_pipeline: ComputePipelineState,")?;
     writeln!(code)?;
+    writeln!(code, "    // ── Batched prefill pipelines ──")?;
+    writeln!(code, "    matmul_batch_pipeline: ComputePipelineState,")?;
+    writeln!(code, "    matmul_q8_batch_pipeline: ComputePipelineState,")?;
+    writeln!(code, "    matmul_q4_batch_pipeline: ComputePipelineState,")?;
+    writeln!(code, "    rms_norm_batch_pipeline: ComputePipelineState,")?;
+    writeln!(code, "    rope_batch_pipeline: ComputePipelineState,")?;
+    writeln!(
+        code,
+        "    silu_mul_fused_batch_pipeline: ComputePipelineState,"
+    )?;
+    writeln!(
+        code,
+        "    add_inplace_batch_pipeline: ComputePipelineState,"
+    )?;
+    writeln!(
+        code,
+        "    copy_embedding_batch_pipeline: ComputePipelineState,"
+    )?;
+    writeln!(code)?;
     writeln!(code, "    // ── Weight buffers (Metal shared memory) ──")?;
     writeln!(
         code,
@@ -1026,6 +1511,43 @@ fn emit_metal_model_struct(
     writeln!(code, "    ffn_out_buf: Buffer,")?;
     writeln!(code, "    add_tmp_buf: Buffer,")?;
     writeln!(code, "    logits_buf: Buffer,")?;
+    writeln!(code)?;
+    writeln!(code, "    // ── Batched prefill working buffers ──")?;
+    writeln!(code, "    /// Batch hidden states [MAX_BATCH, HIDDEN_SIZE]")?;
+    writeln!(code, "    batch_hidden_buf: Buffer,")?;
+    writeln!(
+        code,
+        "    /// Batch residual states [MAX_BATCH, HIDDEN_SIZE]"
+    )?;
+    writeln!(code, "    batch_residual_buf: Buffer,")?;
+    writeln!(code, "    /// Batch QKV output [MAX_BATCH, qkv_rows]")?;
+    writeln!(code, "    batch_qkv_buf: Buffer,")?;
+    writeln!(
+        code,
+        "    /// Batch attention output [MAX_BATCH, HIDDEN_SIZE]"
+    )?;
+    writeln!(code, "    batch_attn_out_buf: Buffer,")?;
+    writeln!(
+        code,
+        "    /// Batch attention projection [MAX_BATCH, HIDDEN_SIZE]"
+    )?;
+    writeln!(code, "    batch_attn_proj_buf: Buffer,")?;
+    writeln!(
+        code,
+        "    /// Batch gate+up output [MAX_BATCH, 2*INTERMEDIATE_SIZE]"
+    )?;
+    writeln!(code, "    batch_gate_up_buf: Buffer,")?;
+    writeln!(
+        code,
+        "    /// Batch FFN hidden [MAX_BATCH, INTERMEDIATE_SIZE]"
+    )?;
+    writeln!(code, "    batch_ffn_hidden_buf: Buffer,")?;
+    writeln!(code, "    /// Batch FFN output [MAX_BATCH, HIDDEN_SIZE]")?;
+    writeln!(code, "    batch_ffn_out_buf: Buffer,")?;
+    writeln!(code, "    /// Token IDs buffer for batch embedding lookup")?;
+    writeln!(code, "    batch_tokens_buf: Buffer,")?;
+    writeln!(code, "    /// Positions buffer for batch RoPE")?;
+    writeln!(code, "    batch_positions_buf: Buffer,")?;
     writeln!(code)?;
     writeln!(code, "    // ── KV cache buffers (per-layer) ──")?;
     writeln!(code, "    k_cache: Vec<Buffer>,  // per-layer")?;
@@ -1143,6 +1665,14 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         ("add_inplace_pipeline", "add_inplace"),
         ("copy_pipeline", "copy_buffer"),
         ("copy_offset_pipeline", "copy_offset"),
+        ("matmul_batch_pipeline", "matmul_vec_batch"),
+        ("matmul_q8_batch_pipeline", "matmul_vec_q8_batch"),
+        ("matmul_q4_batch_pipeline", "matmul_vec_q4_batch"),
+        ("rms_norm_batch_pipeline", "rms_norm_batch"),
+        ("rope_batch_pipeline", "rope_batch"),
+        ("silu_mul_fused_batch_pipeline", "silu_mul_fused_batch"),
+        ("add_inplace_batch_pipeline", "add_inplace_batch"),
+        ("copy_embedding_batch_pipeline", "copy_embedding_batch"),
     ] {
         writeln!(
             code,
@@ -1544,6 +2074,57 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     )?;
     writeln!(code)?;
 
+    // Batch prefill working buffers
+    let batch_hidden_bytes = hidden * 4; // per-token
+    let batch_qkv_bytes = (hidden + 2 * kv_dim) * 4;
+    let batch_gate_up_bytes = 2 * intermediate * 4;
+    let batch_intermediate_bytes = intermediate * 4;
+    writeln!(
+        code,
+        "        // Batched prefill working buffers (sized for MAX_BATCH_SIZE tokens)"
+    )?;
+    writeln!(
+        code,
+        "        let batch_hidden_buf = device.new_buffer((MAX_BATCH_SIZE * {batch_hidden_bytes}) as u64, opts);"
+    )?;
+    writeln!(
+        code,
+        "        let batch_residual_buf = device.new_buffer((MAX_BATCH_SIZE * {batch_hidden_bytes}) as u64, opts);"
+    )?;
+    writeln!(
+        code,
+        "        let batch_qkv_buf = device.new_buffer((MAX_BATCH_SIZE * {batch_qkv_bytes}) as u64, opts);"
+    )?;
+    writeln!(
+        code,
+        "        let batch_attn_out_buf = device.new_buffer((MAX_BATCH_SIZE * {batch_hidden_bytes}) as u64, opts);"
+    )?;
+    writeln!(
+        code,
+        "        let batch_attn_proj_buf = device.new_buffer((MAX_BATCH_SIZE * {batch_hidden_bytes}) as u64, opts);"
+    )?;
+    writeln!(
+        code,
+        "        let batch_gate_up_buf = device.new_buffer((MAX_BATCH_SIZE * {batch_gate_up_bytes}) as u64, opts);"
+    )?;
+    writeln!(
+        code,
+        "        let batch_ffn_hidden_buf = device.new_buffer((MAX_BATCH_SIZE * {batch_intermediate_bytes}) as u64, opts);"
+    )?;
+    writeln!(
+        code,
+        "        let batch_ffn_out_buf = device.new_buffer((MAX_BATCH_SIZE * {batch_hidden_bytes}) as u64, opts);"
+    )?;
+    writeln!(
+        code,
+        "        let batch_tokens_buf = device.new_buffer((MAX_BATCH_SIZE * mem::size_of::<u32>()) as u64, opts);"
+    )?;
+    writeln!(
+        code,
+        "        let batch_positions_buf = device.new_buffer((MAX_BATCH_SIZE * mem::size_of::<u32>()) as u64, opts);"
+    )?;
+    writeln!(code)?;
+
     // KV cache buffers
     writeln!(code, "        // KV cache buffers (per-layer)")?;
     writeln!(
@@ -1582,6 +2163,14 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            add_inplace_pipeline,")?;
     writeln!(code, "            copy_pipeline,")?;
     writeln!(code, "            copy_offset_pipeline,")?;
+    writeln!(code, "            matmul_batch_pipeline,")?;
+    writeln!(code, "            matmul_q8_batch_pipeline,")?;
+    writeln!(code, "            matmul_q4_batch_pipeline,")?;
+    writeln!(code, "            rms_norm_batch_pipeline,")?;
+    writeln!(code, "            rope_batch_pipeline,")?;
+    writeln!(code, "            silu_mul_fused_batch_pipeline,")?;
+    writeln!(code, "            add_inplace_batch_pipeline,")?;
+    writeln!(code, "            copy_embedding_batch_pipeline,")?;
     writeln!(code, "            embed_buf,")?;
     writeln!(code, "            layers,")?;
     writeln!(code, "            norm_buf,")?;
@@ -1597,6 +2186,16 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            ffn_out_buf,")?;
     writeln!(code, "            add_tmp_buf,")?;
     writeln!(code, "            logits_buf,")?;
+    writeln!(code, "            batch_hidden_buf,")?;
+    writeln!(code, "            batch_residual_buf,")?;
+    writeln!(code, "            batch_qkv_buf,")?;
+    writeln!(code, "            batch_attn_out_buf,")?;
+    writeln!(code, "            batch_attn_proj_buf,")?;
+    writeln!(code, "            batch_gate_up_buf,")?;
+    writeln!(code, "            batch_ffn_hidden_buf,")?;
+    writeln!(code, "            batch_ffn_out_buf,")?;
+    writeln!(code, "            batch_tokens_buf,")?;
+    writeln!(code, "            batch_positions_buf,")?;
     writeln!(code, "            k_cache,")?;
     writeln!(code, "            v_cache,")?;
     writeln!(code, "            pos: 0,")?;
@@ -1814,10 +2413,10 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
-    // ── forward_prefill: async forward for prefill tokens (no logits readback) ──
+    // ── forward_prefill: single-token async forward (backward compat) ──
     writeln!(
         code,
-        "    /// Asynchronous forward pass for prefill tokens (no logits readback)."
+        "    /// Asynchronous forward pass for a single prefill token (no logits readback)."
     )?;
     writeln!(code, "    ///")?;
     writeln!(
@@ -1832,24 +2431,76 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "    pub fn forward_prefill(&mut self, token_id: u32) {{"
     )?;
-    writeln!(code, "        let pos = self.pos;")?;
+    writeln!(code, "        self.forward_prefill_batch(&[token_id]);")?;
+    writeln!(code, "    }}")?;
     writeln!(code)?;
+
+    // ── forward_prefill_batch: batched prefill for multiple tokens ──
+    // Batched matmuls for QKV/O/FFN projections, sequential attention (causal dependency).
+    let batch_matmul_fn = if is_q8 {
+        "dispatch_matmul_q8_batch"
+    } else if is_q4 {
+        "dispatch_matmul_q4_batch"
+    } else {
+        "dispatch_matmul_batch"
+    };
+
     writeln!(
         code,
-        "        // Wait for previous prefill command buffer to complete before reusing buffers"
+        "    /// Batched prefill: process multiple prompt tokens in one GPU dispatch."
     )?;
+    writeln!(code, "    ///")?;
+    writeln!(
+        code,
+        "    /// Uses batched matmul kernels for QKV/O/FFN projections (mat-mat instead"
+    )?;
+    writeln!(
+        code,
+        "    /// of mat-vec), with sequential attention due to causal dependency."
+    )?;
+    writeln!(
+        code,
+        "    /// This provides significant speedup during prompt prefill."
+    )?;
+    writeln!(
+        code,
+        "    pub fn forward_prefill_batch(&mut self, tokens: &[u32]) {{"
+    )?;
+    writeln!(code, "        let m = tokens.len().min(MAX_BATCH_SIZE);")?;
+    writeln!(code, "        if m == 0 {{ return; }}")?;
+    writeln!(code, "        let start_pos = self.pos;")?;
+    writeln!(code)?;
+    writeln!(code, "        // Wait for any pending command buffer")?;
     writeln!(code, "        if let Some(prev) = self.prev_cmd.take() {{")?;
     writeln!(code, "            prev.wait_until_completed();")?;
     writeln!(code, "        }}")?;
     writeln!(code)?;
-    writeln!(code, "        let cmd = self.queue.new_command_buffer();")?;
-    writeln!(code)?;
 
-    // Single compute encoder for the entire prefill forward pass (no blit transitions)
+    // Upload token IDs and positions to GPU
     writeln!(
         code,
-        "        // Single compute encoder for the entire prefill forward pass (no blit transitions)"
+        "        // Upload token IDs and positions to GPU buffers"
     )?;
+    writeln!(code, "        unsafe {{")?;
+    writeln!(
+        code,
+        "            let tok_ptr = self.batch_tokens_buf.contents() as *mut u32;"
+    )?;
+    writeln!(
+        code,
+        "            let pos_ptr = self.batch_positions_buf.contents() as *mut u32;"
+    )?;
+    writeln!(code, "            for i in 0..m {{")?;
+    writeln!(code, "                *tok_ptr.add(i) = tokens[i];")?;
+    writeln!(
+        code,
+        "                *pos_ptr.add(i) = (start_pos + i) as u32;"
+    )?;
+    writeln!(code, "            }}")?;
+    writeln!(code, "        }}")?;
+    writeln!(code)?;
+
+    writeln!(code, "        let cmd = self.queue.new_command_buffer();")?;
     writeln!(code, "        {{")?;
     writeln!(
         code,
@@ -1857,18 +2508,19 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     )?;
     writeln!(code)?;
 
-    // 1. Embedding lookup via compute copy
+    // 1. Batch embedding lookup
     writeln!(
         code,
-        "            // 1. Embedding lookup via compute copy (no blit encoder needed)"
+        "            // 1. Batch embedding lookup: copy all token embeddings at once"
     )?;
     writeln!(
         code,
-        "            self.dispatch_copy_offset(&enc, &self.embed_buf, &self.hidden_buf, (token_id as usize) * HIDDEN_SIZE, HIDDEN_SIZE);"
+        "            self.dispatch_copy_embedding_batch(&enc, m);"
     )?;
+    // Copy batch_hidden -> batch_residual
     writeln!(
         code,
-        "            self.dispatch_copy(&enc, &self.hidden_buf, &self.residual_buf, HIDDEN_SIZE);"
+        "            self.dispatch_add_inplace_batch_copy(&enc, &self.batch_hidden_buf, &self.batch_residual_buf, m * {hidden});"
     )?;
     writeln!(code)?;
 
@@ -1876,100 +2528,141 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            // 2. Transformer layers")?;
     writeln!(code, "            for layer in 0..NUM_LAYERS {{")?;
     writeln!(code)?;
+
+    // Batch RMS norm: residual -> hidden (batched)
     writeln!(
         code,
-        "                // Pre-attention: rms_norm, fused QKV projection, RoPE"
+        "                // Batch RMS norm: batch_residual -> batch_hidden"
     )?;
     writeln!(
         code,
-        "                self.dispatch_rms_norm(&enc, &self.layers[layer].attn_norm);"
+        "                self.dispatch_rms_norm_batch(&enc, &self.batch_residual_buf, &self.layers[layer].attn_norm, &self.batch_hidden_buf, m);"
+    )?;
+
+    // Batch QKV matmul
+    writeln!(
+        code,
+        "                // Batch QKV matmul: [M, hidden] x [qkv_rows, hidden]^T -> [M, qkv_rows]"
     )?;
     writeln!(
         code,
-        "                // Fused Q+K+V matmul: single dispatch for all three projections"
-    )?;
-    writeln!(
-        code,
-        "                self.{matmul_fn}(&enc, &self.hidden_buf, &self.layers[layer].qkv_weight, &self.qkv_buf, {qkv_rows}, {hidden});"
-    )?;
-    writeln!(
-        code,
-        "                self.dispatch_rope_offset(&enc, &self.qkv_buf, {q_byte_offset}, {num_heads}, {head_dim}, pos);"
-    )?;
-    writeln!(
-        code,
-        "                self.dispatch_rope_offset(&enc, &self.qkv_buf, {k_byte_offset}, {num_kv_heads}, {head_dim}, pos);"
+        "                self.{batch_matmul_fn}(&enc, &self.batch_hidden_buf, &self.layers[layer].qkv_weight, &self.batch_qkv_buf, m, {qkv_rows}, {hidden});"
     )?;
     writeln!(code)?;
+
+    // Batch RoPE on Q and K portions
+    writeln!(code, "                // Batch RoPE on Q portion")?;
     writeln!(
         code,
-        "                // KV cache update from fused qkv_buf"
+        "                self.dispatch_rope_batch(&enc, &self.batch_qkv_buf, 0, {num_heads}, {head_dim}, m, {qkv_rows});"
     )?;
-    writeln!(code, "                let kv_offset = pos * {kv_dim};")?;
+    writeln!(code, "                // Batch RoPE on K portion")?;
+    let k_float_offset = hidden;
     writeln!(
         code,
-        "                self.dispatch_copy_from_offset(&enc, &self.qkv_buf, {k_byte_offset}, &self.k_cache[layer], kv_offset, {kv_dim});"
-    )?;
-    writeln!(
-        code,
-        "                self.dispatch_copy_from_offset(&enc, &self.qkv_buf, {v_byte_offset}, &self.v_cache[layer], kv_offset, {kv_dim});"
+        "                self.dispatch_rope_batch(&enc, &self.batch_qkv_buf, {k_float_offset}, {num_kv_heads}, {head_dim}, m, {qkv_rows});"
     )?;
     writeln!(code)?;
+
+    // Sequential attention: must process each token individually (causal dependency)
     writeln!(
         code,
-        "                // Attention using Q from qkv_buf (offset 0)"
+        "                // Sequential attention (causal dependency requires per-token processing)"
+    )?;
+    writeln!(code, "                for t in 0..m {{")?;
+    writeln!(code, "                    let pos_t = start_pos + t;")?;
+
+    // Copy this token's K and V from batch_qkv_buf to KV cache
+    let qkv_token_bytes = (hidden + 2 * kv_dim) * 4;
+    writeln!(
+        code,
+        "                    let qkv_token_offset = t * {qkv_token_bytes};"
     )?;
     writeln!(
         code,
-        "                self.dispatch_attention_offset(&enc, &self.qkv_buf, {q_byte_offset}, &self.k_cache[layer], &self.v_cache[layer], &self.attn_out_buf, pos + 1);"
+        "                    let kv_offset = pos_t * {kv_dim};"
     )?;
     writeln!(
         code,
-        "                self.{matmul_fn}(&enc, &self.attn_out_buf, &self.layers[layer].o_weight, &self.attn_proj_buf, {hidden}, {hidden});"
+        "                    self.dispatch_copy_from_offset(&enc, &self.batch_qkv_buf, qkv_token_offset + {k_byte_offset}, &self.k_cache[layer], kv_offset, {kv_dim});"
     )?;
     writeln!(
         code,
-        "                self.dispatch_add_inplace(&enc, &self.residual_buf, &self.attn_proj_buf, {hidden});"
+        "                    self.dispatch_copy_from_offset(&enc, &self.batch_qkv_buf, qkv_token_offset + {v_byte_offset}, &self.v_cache[layer], kv_offset, {kv_dim});"
+    )?;
+
+    // Attention: use Q from batch_qkv_buf at this token's offset
+    writeln!(
+        code,
+        "                    self.dispatch_attention_offset(&enc, &self.batch_qkv_buf, qkv_token_offset + {q_byte_offset}, &self.k_cache[layer], &self.v_cache[layer], &self.attn_out_buf, pos_t + 1);"
+    )?;
+
+    // O projection: single-token matmul into batch_attn_proj at token offset
+    writeln!(
+        code,
+        "                    self.{matmul_fn}(&enc, &self.attn_out_buf, &self.layers[layer].o_weight, &self.attn_proj_buf, {hidden}, {hidden});"
+    )?;
+
+    // Copy attn_proj to batch_attn_proj_buf at the right offset
+    writeln!(
+        code,
+        "                    self.dispatch_copy_to_offset_bytes(&enc, &self.attn_proj_buf, &self.batch_attn_proj_buf, t * {hidden}, {hidden});"
+    )?;
+    writeln!(code, "                }}")?;
+    writeln!(code)?;
+
+    // Batch add: residual += attn_proj for all tokens
+    writeln!(
+        code,
+        "                self.dispatch_add_inplace_batch_n(&enc, &self.batch_residual_buf, &self.batch_attn_proj_buf, m * {hidden});"
+    )?;
+    writeln!(code)?;
+
+    // Batch FFN
+    writeln!(
+        code,
+        "                // Batch FFN: rms_norm, gate+up matmul, silu_mul, down matmul"
     )?;
     writeln!(
         code,
-        "                // FFN: rms_norm, fused gate+up projection, silu_mul, down projection"
+        "                self.dispatch_rms_norm_batch(&enc, &self.batch_residual_buf, &self.layers[layer].ffn_norm, &self.batch_hidden_buf, m);"
     )?;
     writeln!(
         code,
-        "                self.dispatch_rms_norm(&enc, &self.layers[layer].ffn_norm);"
+        "                self.{batch_matmul_fn}(&enc, &self.batch_hidden_buf, &self.layers[layer].gate_up_weight, &self.batch_gate_up_buf, m, {gate_up_rows}, {hidden});"
     )?;
     writeln!(
         code,
-        "                self.{matmul_fn}(&enc, &self.hidden_buf, &self.layers[layer].gate_up_weight, &self.gate_up_buf, {gate_up_rows}, {hidden});"
+        "                self.dispatch_silu_mul_fused_batch(&enc, &self.batch_gate_up_buf, &self.batch_ffn_hidden_buf, {intermediate}, m);"
     )?;
     writeln!(
         code,
-        "                self.dispatch_silu_mul_fused(&enc, &self.gate_up_buf, &self.ffn_hidden_buf, {intermediate});"
+        "                self.{batch_matmul_fn}(&enc, &self.batch_ffn_hidden_buf, &self.layers[layer].down_weight, &self.batch_ffn_out_buf, m, {hidden}, {intermediate});"
     )?;
     writeln!(
         code,
-        "                self.{matmul_fn}(&enc, &self.ffn_hidden_buf, &self.layers[layer].down_weight, &self.ffn_out_buf, {hidden}, {intermediate});"
-    )?;
-    writeln!(
-        code,
-        "                self.dispatch_add_inplace(&enc, &self.residual_buf, &self.ffn_out_buf, {hidden});"
+        "                self.dispatch_add_inplace_batch_n(&enc, &self.batch_residual_buf, &self.batch_ffn_out_buf, m * {hidden});"
     )?;
     writeln!(code, "            }}")?;
+    writeln!(code)?;
+
+    // Copy last token's residual to single-token residual_buf for next forward() call
+    writeln!(
+        code,
+        "            // Copy last token's residual to single-token buffer for subsequent forward()"
+    )?;
+    writeln!(
+        code,
+        "            self.dispatch_copy_from_offset_bytes(&enc, &self.batch_residual_buf, (m - 1) * {hidden} * 4, &self.residual_buf, 0, {hidden});"
+    )?;
     writeln!(code)?;
     writeln!(code, "            enc.end_encoding();")?;
     writeln!(code, "        }}")?;
     writeln!(code)?;
 
-    // No final norm or logits projection needed for prefill intermediate tokens
-    // Commit without waiting — the next forward_prefill or forward will wait
-    writeln!(
-        code,
-        "        // Commit without waiting — overlap GPU work with next token's CPU encoding"
-    )?;
     writeln!(code, "        cmd.commit();")?;
     writeln!(code, "        self.prev_cmd = Some(cmd.to_owned());")?;
-    writeln!(code, "        self.pos += 1;")?;
+    writeln!(code, "        self.pos += m;")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
@@ -2641,6 +3334,510 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     )?;
     writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
     writeln!(code, "    }}")?;
+    writeln!(code)?;
+
+    // ── Batched prefill dispatch helpers ──
+    writeln!(code, "    // ── Batched prefill dispatch helpers ──")?;
+    writeln!(code)?;
+
+    // dispatch_copy_embedding_batch
+    writeln!(
+        code,
+        "    /// Dispatch batched embedding lookup: copy M token embeddings at once."
+    )?;
+    writeln!(
+        code,
+        "    fn dispatch_copy_embedding_batch(&self, enc: &ComputeCommandEncoderRef, num_tokens: usize) {{"
+    )?;
+    writeln!(code, "        let dim: u32 = HIDDEN_SIZE as u32;")?;
+    writeln!(code, "        let nt: u32 = num_tokens as u32;")?;
+    writeln!(
+        code,
+        "        enc.set_compute_pipeline_state(&self.copy_embedding_batch_pipeline);"
+    )?;
+    writeln!(code, "        enc.set_buffer(0, Some(&self.embed_buf), 0);")?;
+    writeln!(
+        code,
+        "        enc.set_buffer(1, Some(&self.batch_hidden_buf), 0);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_buffer(2, Some(&self.batch_tokens_buf), 0);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(3, mem::size_of::<u32>() as u64, &dim as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(4, mem::size_of::<u32>() as u64, &nt as *const u32 as *const _);"
+    )?;
+    writeln!(code, "        let total = num_tokens * HIDDEN_SIZE;")?;
+    writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
+    writeln!(
+        code,
+        "        let grid_size = MTLSize::new(((total + 255) / 256) as u64, 1, 1);"
+    )?;
+    writeln!(
+        code,
+        "        enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
+
+    // dispatch_rms_norm_batch
+    writeln!(
+        code,
+        "    /// Dispatch batched RMS norm: normalizes M vectors at once."
+    )?;
+    writeln!(
+        code,
+        "    fn dispatch_rms_norm_batch(&self, enc: &ComputeCommandEncoderRef, input: &Buffer, weight: &Buffer, output: &Buffer, num_tokens: usize) {{"
+    )?;
+    writeln!(code, "        let n: u32 = HIDDEN_SIZE as u32;")?;
+    writeln!(code, "        let eps: f32 = RMS_NORM_EPS;")?;
+    writeln!(code, "        let nt: u32 = num_tokens as u32;")?;
+    writeln!(
+        code,
+        "        enc.set_compute_pipeline_state(&self.rms_norm_batch_pipeline);"
+    )?;
+    writeln!(code, "        enc.set_buffer(0, Some(input), 0);")?;
+    writeln!(code, "        enc.set_buffer(1, Some(weight), 0);")?;
+    writeln!(code, "        enc.set_buffer(2, Some(output), 0);")?;
+    writeln!(
+        code,
+        "        enc.set_bytes(3, mem::size_of::<u32>() as u64, &n as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(4, mem::size_of::<f32>() as u64, &eps as *const f32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(5, mem::size_of::<u32>() as u64, &nt as *const u32 as *const _);"
+    )?;
+    writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
+    writeln!(
+        code,
+        "        let grid_size = MTLSize::new(num_tokens as u64, 1, 1);"
+    )?;
+    writeln!(
+        code,
+        "        enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
+
+    // dispatch_matmul_batch (f32)
+    writeln!(
+        code,
+        "    /// Dispatch batched f32 matmul: [M, cols] x [rows, cols]^T -> [M, rows]."
+    )?;
+    writeln!(
+        code,
+        "    fn dispatch_matmul_batch(&self, enc: &ComputeCommandEncoderRef, input: &Buffer, weight: &Buffer, output: &Buffer, num_tokens: usize, rows: usize, cols: usize) {{"
+    )?;
+    writeln!(code, "        let nt: u32 = num_tokens as u32;")?;
+    writeln!(code, "        let r: u32 = rows as u32;")?;
+    writeln!(code, "        let c: u32 = cols as u32;")?;
+    writeln!(
+        code,
+        "        enc.set_compute_pipeline_state(&self.matmul_batch_pipeline);"
+    )?;
+    writeln!(code, "        enc.set_buffer(0, Some(weight), 0);")?;
+    writeln!(code, "        enc.set_buffer(1, Some(input), 0);")?;
+    writeln!(code, "        enc.set_buffer(2, Some(output), 0);")?;
+    writeln!(
+        code,
+        "        enc.set_bytes(3, mem::size_of::<u32>() as u64, &nt as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(4, mem::size_of::<u32>() as u64, &r as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(5, mem::size_of::<u32>() as u64, &c as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        let row_tgs = (rows + 63) / 64;  // 64 rows per threadgroup for f32"
+    )?;
+    writeln!(code, "        let num_tg = (row_tgs * num_tokens) as u64;")?;
+    writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
+    writeln!(code, "        let grid_size = MTLSize::new(num_tg, 1, 1);")?;
+    writeln!(
+        code,
+        "        enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
+
+    // dispatch_matmul_q8_batch
+    writeln!(
+        code,
+        "    /// Dispatch batched Q8_0 matmul: [M, cols] x [rows, cols]^T -> [M, rows]."
+    )?;
+    writeln!(
+        code,
+        "    fn dispatch_matmul_q8_batch(&self, enc: &ComputeCommandEncoderRef, input: &Buffer, weight: &Buffer, output: &Buffer, num_tokens: usize, rows: usize, cols: usize) {{"
+    )?;
+    writeln!(code, "        let nt: u32 = num_tokens as u32;")?;
+    writeln!(code, "        let r: u32 = rows as u32;")?;
+    writeln!(code, "        let c: u32 = cols as u32;")?;
+    writeln!(
+        code,
+        "        enc.set_compute_pipeline_state(&self.matmul_q8_batch_pipeline);"
+    )?;
+    writeln!(code, "        enc.set_buffer(0, Some(weight), 0);")?;
+    writeln!(code, "        enc.set_buffer(1, Some(input), 0);")?;
+    writeln!(code, "        enc.set_buffer(2, Some(output), 0);")?;
+    writeln!(
+        code,
+        "        enc.set_bytes(3, mem::size_of::<u32>() as u64, &nt as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(4, mem::size_of::<u32>() as u64, &r as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(5, mem::size_of::<u32>() as u64, &c as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        let row_tgs = (rows + 31) / 32;  // 32 rows per threadgroup for Q8"
+    )?;
+    writeln!(code, "        let num_tg = (row_tgs * num_tokens) as u64;")?;
+    writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
+    writeln!(code, "        let grid_size = MTLSize::new(num_tg, 1, 1);")?;
+    writeln!(
+        code,
+        "        enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
+
+    // dispatch_matmul_q4_batch
+    writeln!(
+        code,
+        "    /// Dispatch batched Q4_0 matmul: [M, cols] x [rows, cols]^T -> [M, rows]."
+    )?;
+    writeln!(
+        code,
+        "    fn dispatch_matmul_q4_batch(&self, enc: &ComputeCommandEncoderRef, input: &Buffer, weight: &Buffer, output: &Buffer, num_tokens: usize, rows: usize, cols: usize) {{"
+    )?;
+    writeln!(code, "        let nt: u32 = num_tokens as u32;")?;
+    writeln!(code, "        let r: u32 = rows as u32;")?;
+    writeln!(code, "        let c: u32 = cols as u32;")?;
+    writeln!(
+        code,
+        "        enc.set_compute_pipeline_state(&self.matmul_q4_batch_pipeline);"
+    )?;
+    writeln!(code, "        enc.set_buffer(0, Some(weight), 0);")?;
+    writeln!(code, "        enc.set_buffer(1, Some(input), 0);")?;
+    writeln!(code, "        enc.set_buffer(2, Some(output), 0);")?;
+    writeln!(
+        code,
+        "        enc.set_bytes(3, mem::size_of::<u32>() as u64, &nt as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(4, mem::size_of::<u32>() as u64, &r as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(5, mem::size_of::<u32>() as u64, &c as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        let row_tgs = (rows + 31) / 32;  // 32 rows per threadgroup for Q4"
+    )?;
+    writeln!(code, "        let num_tg = (row_tgs * num_tokens) as u64;")?;
+    writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
+    writeln!(code, "        let grid_size = MTLSize::new(num_tg, 1, 1);")?;
+    writeln!(
+        code,
+        "        enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
+
+    // dispatch_rope_batch
+    writeln!(
+        code,
+        "    /// Dispatch batched RoPE: apply RoPE to M vectors with different positions."
+    )?;
+    writeln!(
+        code,
+        "    /// `data_float_offset` is the offset in floats within each token's row in the batch buffer."
+    )?;
+    writeln!(
+        code,
+        "    /// `row_stride` is the number of floats per token row in the batch buffer."
+    )?;
+    writeln!(
+        code,
+        "    fn dispatch_rope_batch(&self, enc: &ComputeCommandEncoderRef, buf: &Buffer, data_float_offset: usize, num_heads: usize, head_dim: usize, num_tokens: usize, row_stride: usize) {{"
+    )?;
+    writeln!(code, "        let nh: u32 = num_heads as u32;")?;
+    writeln!(code, "        let hd: u32 = head_dim as u32;")?;
+    writeln!(code, "        let theta: f32 = ROPE_THETA;")?;
+    writeln!(code, "        let nt: u32 = num_tokens as u32;")?;
+    writeln!(
+        code,
+        "        let pairs_per_token = num_heads * (head_dim / 2);"
+    )?;
+    writeln!(
+        code,
+        "        let total_pairs = num_tokens * pairs_per_token;"
+    )?;
+    // The rope_batch kernel expects contiguous [M, num_heads * head_dim] data.
+    // Since our batch_qkv_buf is [M, qkv_rows] and Q/K are at offsets within each row,
+    // we need to pass the buffer at the right byte offset for each token's data.
+    // Actually, the rope_batch kernel accesses data[token * (num_heads * head_dim) + ...],
+    // but our layout is data[token * row_stride + data_float_offset + ...].
+    // We need the kernel to know the row_stride. Let me adjust the kernel approach:
+    // Since Q and K are contiguous within each token's qkv_rows, and the batch buffer
+    // is [M, qkv_rows], we can pass the buffer at offset (data_float_offset * 4) and
+    // use a stride parameter. But the rope_batch kernel as written expects [M, num_heads*head_dim].
+    //
+    // Simplest approach: use the single-token rope kernel for each token in a loop.
+    // This is still efficient because we're dispatching all within the same command encoder.
+    writeln!(
+        code,
+        "        // Apply RoPE to each token individually (different positions, non-contiguous layout)"
+    )?;
+    writeln!(code, "        for t in 0..num_tokens {{")?;
+    writeln!(
+        code,
+        "            let byte_offset = (t * row_stride + data_float_offset) * mem::size_of::<f32>();"
+    )?;
+    writeln!(
+        code,
+        "            let p: u32 = unsafe {{ *(self.batch_positions_buf.contents() as *const u32).add(t) }};"
+    )?;
+    writeln!(
+        code,
+        "            enc.set_compute_pipeline_state(&self.rope_pipeline);"
+    )?;
+    writeln!(
+        code,
+        "            enc.set_buffer(0, Some(buf), byte_offset as u64);"
+    )?;
+    writeln!(
+        code,
+        "            enc.set_bytes(1, mem::size_of::<u32>() as u64, &nh as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "            enc.set_bytes(2, mem::size_of::<u32>() as u64, &hd as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "            enc.set_bytes(3, mem::size_of::<u32>() as u64, &p as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "            enc.set_bytes(4, mem::size_of::<f32>() as u64, &theta as *const f32 as *const _);"
+    )?;
+    writeln!(code, "            let tg_size = MTLSize::new(256, 1, 1);")?;
+    writeln!(
+        code,
+        "            let grid_size = MTLSize::new(((pairs_per_token + 255) / 256) as u64, 1, 1);"
+    )?;
+    writeln!(
+        code,
+        "            enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(code, "            unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
+    writeln!(code, "        }}")?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
+
+    // dispatch_silu_mul_fused_batch
+    writeln!(
+        code,
+        "    /// Dispatch batched fused SiLU-multiply for M tokens."
+    )?;
+    writeln!(
+        code,
+        "    fn dispatch_silu_mul_fused_batch(&self, enc: &ComputeCommandEncoderRef, gate_up: &Buffer, output: &Buffer, n: usize, num_tokens: usize) {{"
+    )?;
+    writeln!(code, "        let count: u32 = n as u32;")?;
+    writeln!(code, "        let nt: u32 = num_tokens as u32;")?;
+    writeln!(
+        code,
+        "        enc.set_compute_pipeline_state(&self.silu_mul_fused_batch_pipeline);"
+    )?;
+    writeln!(code, "        enc.set_buffer(0, Some(gate_up), 0);")?;
+    writeln!(code, "        enc.set_buffer(1, Some(output), 0);")?;
+    writeln!(
+        code,
+        "        enc.set_bytes(2, mem::size_of::<u32>() as u64, &count as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(3, mem::size_of::<u32>() as u64, &nt as *const u32 as *const _);"
+    )?;
+    writeln!(code, "        let total = num_tokens * n;")?;
+    writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
+    writeln!(
+        code,
+        "        let grid_size = MTLSize::new(((total + 255) / 256) as u64, 1, 1);"
+    )?;
+    writeln!(
+        code,
+        "        enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
+
+    // dispatch_add_inplace_batch_n (add n elements in-place)
+    writeln!(
+        code,
+        "    /// Dispatch in-place add for total_n elements: a[i] += b[i]."
+    )?;
+    writeln!(
+        code,
+        "    fn dispatch_add_inplace_batch_n(&self, enc: &ComputeCommandEncoderRef, a: &Buffer, b: &Buffer, total_n: usize) {{"
+    )?;
+    writeln!(code, "        let count: u32 = total_n as u32;")?;
+    writeln!(
+        code,
+        "        enc.set_compute_pipeline_state(&self.add_inplace_batch_pipeline);"
+    )?;
+    writeln!(code, "        enc.set_buffer(0, Some(a), 0);")?;
+    writeln!(code, "        enc.set_buffer(1, Some(b), 0);")?;
+    writeln!(
+        code,
+        "        enc.set_bytes(2, mem::size_of::<u32>() as u64, &count as *const u32 as *const _);"
+    )?;
+    writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
+    writeln!(
+        code,
+        "        let grid_size = MTLSize::new(((total_n + 255) / 256) as u64, 1, 1);"
+    )?;
+    writeln!(
+        code,
+        "        enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
+
+    // dispatch_add_inplace_batch_copy (copy src to dst using copy_buffer kernel)
+    writeln!(
+        code,
+        "    /// Copy src to dst using compute copy kernel (for batch residual init)."
+    )?;
+    writeln!(
+        code,
+        "    fn dispatch_add_inplace_batch_copy(&self, enc: &ComputeCommandEncoderRef, src: &Buffer, dst: &Buffer, count: usize) {{"
+    )?;
+    writeln!(code, "        let n: u32 = count as u32;")?;
+    writeln!(
+        code,
+        "        enc.set_compute_pipeline_state(&self.copy_pipeline);"
+    )?;
+    writeln!(code, "        enc.set_buffer(0, Some(src), 0);")?;
+    writeln!(code, "        enc.set_buffer(1, Some(dst), 0);")?;
+    writeln!(
+        code,
+        "        enc.set_bytes(2, mem::size_of::<u32>() as u64, &n as *const u32 as *const _);"
+    )?;
+    writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
+    writeln!(
+        code,
+        "        let grid_size = MTLSize::new(((count + 255) / 256) as u64, 1, 1);"
+    )?;
+    writeln!(
+        code,
+        "        enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
+
+    // dispatch_copy_to_offset_bytes (copy src to dst at float offset)
+    writeln!(
+        code,
+        "    /// Copy src buffer to dst at a float offset (for scatter into batch buffers)."
+    )?;
+    writeln!(
+        code,
+        "    fn dispatch_copy_to_offset_bytes(&self, enc: &ComputeCommandEncoderRef, src: &Buffer, dst: &Buffer, dst_float_offset: usize, count: usize) {{"
+    )?;
+    writeln!(code, "        let n: u32 = count as u32;")?;
+    writeln!(
+        code,
+        "        enc.set_compute_pipeline_state(&self.copy_pipeline);"
+    )?;
+    writeln!(code, "        enc.set_buffer(0, Some(src), 0);")?;
+    writeln!(
+        code,
+        "        enc.set_buffer(1, Some(dst), (dst_float_offset * mem::size_of::<f32>()) as u64);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(2, mem::size_of::<u32>() as u64, &n as *const u32 as *const _);"
+    )?;
+    writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
+    writeln!(
+        code,
+        "        let grid_size = MTLSize::new(((count + 255) / 256) as u64, 1, 1);"
+    )?;
+    writeln!(
+        code,
+        "        enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
+
+    // dispatch_copy_from_offset_bytes (copy from src at byte offset to dst at float offset)
+    writeln!(
+        code,
+        "    /// Copy from src at byte offset to dst at float offset."
+    )?;
+    writeln!(
+        code,
+        "    fn dispatch_copy_from_offset_bytes(&self, enc: &ComputeCommandEncoderRef, src: &Buffer, src_byte_offset: usize, dst: &Buffer, dst_float_offset: usize, count: usize) {{"
+    )?;
+    writeln!(code, "        let n: u32 = count as u32;")?;
+    writeln!(
+        code,
+        "        enc.set_compute_pipeline_state(&self.copy_pipeline);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_buffer(0, Some(src), src_byte_offset as u64);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_buffer(1, Some(dst), (dst_float_offset * mem::size_of::<f32>()) as u64);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(2, mem::size_of::<u32>() as u64, &n as *const u32 as *const _);"
+    )?;
+    writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
+    writeln!(
+        code,
+        "        let grid_size = MTLSize::new(((count + 255) / 256) as u64, 1, 1);"
+    )?;
+    writeln!(
+        code,
+        "        enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
+    writeln!(code, "    }}")?;
 
     writeln!(code, "}}")?;
     writeln!(code)?;
@@ -2814,36 +4011,26 @@ fn generate_main_rs(model_name: &str, config: &ModelConfig) -> Result<String, Me
     writeln!(code)?;
     writeln!(
         code,
-        "    // Process prompt tokens (prefill) with double-buffered command submission."
+        "    // Process prompt tokens with batched prefill (mat-mat instead of mat-vec)."
     )?;
     writeln!(
         code,
-        "    // During prefill we only need logits from the last token, so we can"
+        "    // Uses double-buffered batch dispatch for GPU-efficient matmul."
     )?;
     writeln!(
         code,
-        "    // overlap GPU execution of token N with CPU encoding of token N+1."
+        "    // The last token uses synchronous forward() to get logits."
     )?;
-    writeln!(code, "    let mut logits = Vec::new();")?;
     writeln!(code, "    let prompt_len = prompt_tokens.len();")?;
+    writeln!(code, "    let logits = if prompt_len > 1 {{")?;
     writeln!(
         code,
-        "    for (idx, &token) in prompt_tokens.iter().enumerate() {{"
+        "        model.forward_prefill_batch(&prompt_tokens[..prompt_len - 1]);"
     )?;
-    writeln!(code, "        if idx == prompt_len - 1 {{")?;
-    writeln!(
-        code,
-        "            // Last token: need logits, use synchronous forward"
-    )?;
-    writeln!(code, "            logits = model.forward(token);")?;
-    writeln!(code, "        }} else {{")?;
-    writeln!(
-        code,
-        "            // Intermediate token: use async prefill (no logits readback)"
-    )?;
-    writeln!(code, "            model.forward_prefill(token);")?;
-    writeln!(code, "        }}")?;
-    writeln!(code, "    }}")?;
+    writeln!(code, "        model.forward(prompt_tokens[prompt_len - 1])")?;
+    writeln!(code, "    }} else {{")?;
+    writeln!(code, "        model.forward(prompt_tokens[0])")?;
+    writeln!(code, "    }};")?;
     writeln!(code)?;
     writeln!(code, "    // Generate tokens")?;
     writeln!(code, "    let mut next_token = argmax(&logits);")?;
@@ -2933,19 +4120,14 @@ fn generate_main_rs(model_name: &str, config: &ModelConfig) -> Result<String, Me
         code,
         "fn prefill(model: &mut model::MetalModel, tokens: &[u32]) -> Vec<f32> {{"
     )?;
-    writeln!(code, "    let mut logits = Vec::new();")?;
     writeln!(code, "    let len = tokens.len();")?;
+    writeln!(code, "    if len > 1 {{")?;
     writeln!(
         code,
-        "    for (idx, &token) in tokens.iter().enumerate() {{"
+        "        model.forward_prefill_batch(&tokens[..len - 1]);"
     )?;
-    writeln!(code, "        if idx == len - 1 {{")?;
-    writeln!(code, "            logits = model.forward(token);")?;
-    writeln!(code, "        }} else {{")?;
-    writeln!(code, "            model.forward_prefill(token);")?;
-    writeln!(code, "        }}")?;
     writeln!(code, "    }}")?;
-    writeln!(code, "    logits")?;
+    writeln!(code, "    model.forward(tokens[len - 1])")?;
     writeln!(code, "}}")?;
     writeln!(code)?;
 
@@ -4257,6 +5439,230 @@ mod tests {
         assert!(
             main_rs.contains("model.forward_prefill"),
             "main.rs should call model.forward_prefill"
+        );
+    }
+
+    // ── Batched prefill tests ──────────────────────────────────────────
+
+    #[test]
+    fn generated_shaders_contain_batch_kernels() {
+        let shaders = generate_metal_shaders(&minimal_config());
+
+        assert!(
+            shaders.contains("kernel void matmul_vec_batch"),
+            "shaders should contain matmul_vec_batch kernel"
+        );
+        assert!(
+            shaders.contains("kernel void matmul_vec_q8_batch"),
+            "shaders should contain matmul_vec_q8_batch kernel"
+        );
+        assert!(
+            shaders.contains("kernel void matmul_vec_q4_batch"),
+            "shaders should contain matmul_vec_q4_batch kernel"
+        );
+        assert!(
+            shaders.contains("kernel void rms_norm_batch"),
+            "shaders should contain rms_norm_batch kernel"
+        );
+        assert!(
+            shaders.contains("kernel void silu_mul_fused_batch"),
+            "shaders should contain silu_mul_fused_batch kernel"
+        );
+        assert!(
+            shaders.contains("kernel void add_inplace_batch"),
+            "shaders should contain add_inplace_batch kernel"
+        );
+        assert!(
+            shaders.contains("kernel void copy_embedding_batch"),
+            "shaders should contain copy_embedding_batch kernel"
+        );
+    }
+
+    #[test]
+    fn generated_model_has_batch_pipelines() {
+        let config = minimal_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        for pipeline in &[
+            "matmul_batch_pipeline",
+            "matmul_q8_batch_pipeline",
+            "matmul_q4_batch_pipeline",
+            "rms_norm_batch_pipeline",
+            "rope_batch_pipeline",
+            "silu_mul_fused_batch_pipeline",
+            "add_inplace_batch_pipeline",
+            "copy_embedding_batch_pipeline",
+        ] {
+            assert!(
+                model_rs.contains(&format!("{pipeline}: ComputePipelineState")),
+                "MetalModel should have {pipeline} field"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_model_has_batch_buffers() {
+        let config = minimal_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        for buf in &[
+            "batch_hidden_buf",
+            "batch_residual_buf",
+            "batch_qkv_buf",
+            "batch_attn_out_buf",
+            "batch_attn_proj_buf",
+            "batch_gate_up_buf",
+            "batch_ffn_hidden_buf",
+            "batch_ffn_out_buf",
+            "batch_tokens_buf",
+            "batch_positions_buf",
+        ] {
+            assert!(
+                model_rs.contains(&format!("{buf}: Buffer")),
+                "MetalModel should have {buf} field"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_model_has_forward_prefill_batch() {
+        let config = minimal_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        assert!(
+            model_rs.contains("pub fn forward_prefill_batch(&mut self, tokens: &[u32])"),
+            "MetalModel should have forward_prefill_batch method"
+        );
+
+        // forward_prefill should delegate to forward_prefill_batch
+        assert!(
+            model_rs.contains("self.forward_prefill_batch(&[token_id])"),
+            "forward_prefill should delegate to forward_prefill_batch"
+        );
+    }
+
+    #[test]
+    fn generated_model_has_max_batch_size_constant() {
+        let config = minimal_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        assert!(
+            model_rs.contains("pub const MAX_BATCH_SIZE: usize = 512"),
+            "model.rs should define MAX_BATCH_SIZE constant"
+        );
+    }
+
+    #[test]
+    fn forward_prefill_batch_uses_batch_dispatch() {
+        let config = minimal_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        let batch_start = model_rs
+            .find("pub fn forward_prefill_batch(&mut self, tokens: &[u32])")
+            .unwrap();
+        let batch_body = &model_rs[batch_start..];
+        let batch_end = batch_body
+            .find("\n    pub fn reset")
+            .unwrap_or(batch_body.len());
+        let batch_code = &batch_body[..batch_end];
+
+        // Should use batched dispatch methods
+        assert!(
+            batch_code.contains("dispatch_rms_norm_batch"),
+            "forward_prefill_batch should use dispatch_rms_norm_batch"
+        );
+        assert!(
+            batch_code.contains("dispatch_copy_embedding_batch"),
+            "forward_prefill_batch should use dispatch_copy_embedding_batch"
+        );
+        assert!(
+            batch_code.contains("dispatch_silu_mul_fused_batch"),
+            "forward_prefill_batch should use dispatch_silu_mul_fused_batch"
+        );
+        // Should have sequential attention loop
+        assert!(
+            batch_code.contains("for t in 0..m"),
+            "forward_prefill_batch should have sequential attention loop"
+        );
+    }
+
+    #[test]
+    fn q8_forward_prefill_batch_uses_q8_batch_dispatch() {
+        let config = minimal_q8_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        let batch_start = model_rs
+            .find("pub fn forward_prefill_batch(&mut self, tokens: &[u32])")
+            .unwrap();
+        let batch_body = &model_rs[batch_start..];
+        let batch_end = batch_body
+            .find("\n    pub fn reset")
+            .unwrap_or(batch_body.len());
+        let batch_code = &batch_body[..batch_end];
+
+        assert!(
+            batch_code.contains("dispatch_matmul_q8_batch"),
+            "Q8 forward_prefill_batch should use dispatch_matmul_q8_batch"
+        );
+    }
+
+    #[test]
+    fn q4_forward_prefill_batch_uses_q4_batch_dispatch() {
+        let config = minimal_q4_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        let batch_start = model_rs
+            .find("pub fn forward_prefill_batch(&mut self, tokens: &[u32])")
+            .unwrap();
+        let batch_body = &model_rs[batch_start..];
+        let batch_end = batch_body
+            .find("\n    pub fn reset")
+            .unwrap_or(batch_body.len());
+        let batch_code = &batch_body[..batch_end];
+
+        assert!(
+            batch_code.contains("dispatch_matmul_q4_batch"),
+            "Q4 forward_prefill_batch should use dispatch_matmul_q4_batch"
+        );
+    }
+
+    #[test]
+    fn generated_main_rs_uses_batched_prefill() {
+        let config = minimal_config();
+        let main_rs = generate_main_rs("test-model", &config).unwrap();
+
+        assert!(
+            main_rs.contains("forward_prefill_batch"),
+            "main.rs should use forward_prefill_batch for prompt tokens"
+        );
+    }
+
+    #[test]
+    fn f32_forward_prefill_batch_uses_f32_batch_dispatch() {
+        let config = minimal_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        let batch_start = model_rs
+            .find("pub fn forward_prefill_batch(&mut self, tokens: &[u32])")
+            .unwrap();
+        let batch_body = &model_rs[batch_start..];
+        let batch_end = batch_body
+            .find("\n    pub fn reset")
+            .unwrap_or(batch_body.len());
+        let batch_code = &batch_body[..batch_end];
+
+        assert!(
+            batch_code.contains("dispatch_matmul_batch"),
+            "f32 forward_prefill_batch should use dispatch_matmul_batch"
+        );
+        // Should NOT use Q8 or Q4 batch dispatch
+        assert!(
+            !batch_code.contains("dispatch_matmul_q8_batch"),
+            "f32 forward_prefill_batch should not use dispatch_matmul_q8_batch"
+        );
+        assert!(
+            !batch_code.contains("dispatch_matmul_q4_batch"),
+            "f32 forward_prefill_batch should not use dispatch_matmul_q4_batch"
         );
     }
 }
