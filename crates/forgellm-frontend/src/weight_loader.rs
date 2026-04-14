@@ -894,7 +894,7 @@ fn f32_to_f16(x: f32) -> u16 {
     if unbiased < -14 {
         // Subnormal f16
         let shift = (-14 - unbiased) as u32;
-        let h_mant = ((mant | 0x80_0000) >> (14 + shift)) as u32;
+        let h_mant = (mant | 0x80_0000) >> (14 + shift);
         return ((sign << 15) | h_mant) as u16;
     }
 

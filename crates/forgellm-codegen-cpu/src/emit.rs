@@ -1545,7 +1545,7 @@ fn emit_specialized_q8_matmul_functions(
         let n_rem8 = n % 8;
         let n_chunks4_tail = n_rem8 / 4;
         let n_rem4 = n_rem8 % 4;
-        if n * ((k + 31) / 32 * 34) >= par_byte_threshold {
+        if n * (k.div_ceil(32) * 34) >= par_byte_threshold {
             writeln!(
                 code,
                 "    output.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
@@ -1625,7 +1625,7 @@ fn emit_specialized_q8_matmul_functions(
             code,
             "fn matmul_vec_q8_0_{k}x{n}(output: &mut [f32; {n}], input: &[f32; {k}], weight: &[u8]) {{"
         )?;
-        if n * ((k + 31) / 32 * 34) >= par_byte_threshold {
+        if n * (k.div_ceil(32) * 34) >= par_byte_threshold {
             writeln!(
                 code,
                 "    output.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
@@ -2165,7 +2165,7 @@ fn emit_specialized_q4_matmul_functions(
         let n_rem8 = n % 8;
         let n_chunks4_tail = n_rem8 / 4;
         let n_rem4 = n_rem8 % 4;
-        if n * ((k + 31) / 32 * 34) >= par_byte_threshold {
+        if n * (k.div_ceil(32) * 34) >= par_byte_threshold {
             writeln!(
                 code,
                 "    output.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
@@ -2245,7 +2245,7 @@ fn emit_specialized_q4_matmul_functions(
             code,
             "fn matmul_vec_q4_0_{k}x{n}(output: &mut [f32; {n}], input: &[f32; {k}], weight: &[u8]) {{"
         )?;
-        if n * ((k + 31) / 32 * 34) >= par_byte_threshold {
+        if n * (k.div_ceil(32) * 34) >= par_byte_threshold {
             writeln!(
                 code,
                 "    output.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
