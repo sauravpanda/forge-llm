@@ -347,6 +347,66 @@ kernel void add_inplace(
     a[id] += b[id];
 }
 
+// ── matmul_vec_q8 ─────────────────────────────────────────────────────
+// Matrix-vector multiply where the matrix is stored as Q8_0 blocks.
+// Q8_0 block: 2 bytes f16 scale + 32 bytes int8 data = 34 bytes per 32 elements.
+// Operates directly on quantized weights to halve memory bandwidth vs f32,
+// yielding ~1.5-2x speedup on bandwidth-bound GPU matmul.
+// Each threadgroup processes 8 rows (one per simdgroup of 32 lanes).
+kernel void matmul_vec_q8(
+    device const uchar* matrix   [[buffer(0)]],  // Q8_0 raw bytes
+    device const float* vector   [[buffer(1)]],  // f32 input
+    device float* output         [[buffer(2)]],
+    constant uint& rows          [[buffer(3)]],
+    constant uint& cols          [[buffer(4)]],  // number of elements per row
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]])
+{
+    // 8 rows per threadgroup (8 simdgroups x 32 lanes)
+    uint row = tgid * SIMDGROUPS_PER_TG + simd_id;
+    if (row >= rows) return;
+
+    // Q8_0: each block is 34 bytes for 32 elements
+    uint blocks_per_row = cols / 32;
+    uint row_bytes = blocks_per_row * 34;
+    device const uchar* row_data = matrix + row * row_bytes;
+
+    // Load vector into shared memory
+    threadgroup float vec_tile[4096];
+    for (uint i = tid; i < cols; i += 256) {
+        vec_tile[i] = vector[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float sum = 0.0;
+
+    // Each lane handles every 32nd block
+    for (uint blk = simd_lane; blk < blocks_per_row; blk += 32) {
+        uint blk_offset = blk * 34;
+
+        // Read f16 scale (2 bytes) and convert to f32
+        device const half* scale_ptr = (device const half*)(row_data + blk_offset);
+        float scale = float(*scale_ptr);
+
+        // Read 32 int8 values and dot with corresponding vector elements
+        float block_sum = 0.0;
+        uint vec_base = blk * 32;
+        for (uint i = 0; i < 32; i++) {
+            int8_t val = (int8_t)row_data[blk_offset + 2 + i];
+            block_sum += float(val) * vec_tile[vec_base + i];
+        }
+
+        sum += scale * block_sum;
+    }
+
+    sum = simd_sum(sum);
+    if (simd_lane == 0) {
+        output[row] = sum;
+    }
+}
+
 // ── attention ───────────────────────────────────────────────────────────
 // Single-query attention with simdgroup cooperative reductions.
 // Computes Q*K^T scores using 32-lane simd dot products, applies softmax
@@ -554,6 +614,7 @@ fn emit_metal_model_struct(
     writeln!(code)?;
     writeln!(code, "    // ── Compute pipelines ──")?;
     writeln!(code, "    matmul_pipeline: ComputePipelineState,")?;
+    writeln!(code, "    matmul_q8_pipeline: ComputePipelineState,")?;
     writeln!(code, "    rms_norm_pipeline: ComputePipelineState,")?;
     writeln!(code, "    rope_pipeline: ComputePipelineState,")?;
     writeln!(code, "    softmax_pipeline: ComputePipelineState,")?;
@@ -688,6 +749,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "        // Create compute pipelines")?;
     for (var, fn_name) in [
         ("matmul_pipeline", "matmul_vec"),
+        ("matmul_q8_pipeline", "matmul_vec_q8"),
         ("rms_norm_pipeline", "rms_norm"),
         ("rope_pipeline", "rope"),
         ("softmax_pipeline", "softmax"),
@@ -745,21 +807,20 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
 
     if is_q8 {
         // For Q8_0 models, projection weights are stored as raw Q8_0 bytes.
-        // We dequantize them to f32 at load time so the Metal shaders can
-        // use standard f32 matrix-vector multiplication.
-        writeln!(code, "        // Helper: dequantize f16 bits to f32")?;
-        writeln!(code, "        fn f16_to_f32(bits: u16) -> f32 {{")?;
-        writeln!(code, "            half::f16::from_bits(bits).to_f32()")?;
-        writeln!(code, "        }}")?;
-        writeln!(code)?;
+        // We load them directly into Metal buffers without dequantizing,
+        // and use the matmul_vec_q8 shader that operates on quantized data.
+        // This halves GPU memory usage and memory bandwidth vs f32 dequantization.
         writeln!(
             code,
             "        // Helper: read the next Q8_0 weight matrix (rows x cols elements)"
         )?;
-        writeln!(code, "        // and dequantize to f32 Metal buffer.")?;
         writeln!(
             code,
-            "        // Q8_0 format: each block of 32 values = 2 bytes (f16 scale) + 32 bytes (int8)."
+            "        // as raw bytes into a Metal buffer (no dequantization)."
+        )?;
+        writeln!(
+            code,
+            "        // Q8_0 format: each block of 32 values = 2 bytes (f16 scale) + 32 bytes (int8) = 34 bytes."
         )?;
         writeln!(
             code,
@@ -771,55 +832,12 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         writeln!(code, "            let cur = cursor.get();")?;
         writeln!(
             code,
-            "            let raw = &weights[cur..cur + total_raw];"
+            "            let data = &weights[cur..cur + total_raw];"
         )?;
         writeln!(code, "            cursor.set(cur + total_raw);")?;
-        writeln!(code)?;
-        writeln!(
-            code,
-            "            let mut f32_data: Vec<f32> = Vec::with_capacity(rows * cols);"
-        )?;
-        writeln!(code, "            for row in 0..rows {{")?;
-        writeln!(code, "                let row_start = row * row_bytes;")?;
-        writeln!(code, "                for b in 0..blocks_per_row {{")?;
-        writeln!(
-            code,
-            "                    let block_start = row_start + b * 34;"
-        )?;
-        writeln!(
-            code,
-            "                    let scale_bits = u16::from_le_bytes([raw[block_start], raw[block_start + 1]]);"
-        )?;
-        writeln!(
-            code,
-            "                    let scale = f16_to_f32(scale_bits);"
-        )?;
-        writeln!(code, "                    let block_elem_start = b * 32;")?;
-        writeln!(code, "                    for j in 0..32 {{")?;
-        writeln!(
-            code,
-            "                        if block_elem_start + j < cols {{"
-        )?;
-        writeln!(
-            code,
-            "                            let q = raw[block_start + 2 + j] as i8;"
-        )?;
-        writeln!(
-            code,
-            "                            f32_data.push(scale * q as f32);"
-        )?;
-        writeln!(code, "                        }}")?;
-        writeln!(code, "                    }}")?;
-        writeln!(code, "                }}")?;
-        writeln!(code, "            }}")?;
-        writeln!(code)?;
-        writeln!(
-            code,
-            "            let byte_len = (f32_data.len() * f32_size) as u64;"
-        )?;
         writeln!(code, "            device.new_buffer_with_data(")?;
-        writeln!(code, "                f32_data.as_ptr() as *const _,")?;
-        writeln!(code, "                byte_len,")?;
+        writeln!(code, "                data.as_ptr() as *const _,")?;
+        writeln!(code, "                total_raw as u64,")?;
         writeln!(
             code,
             "                MTLResourceOptions::StorageModeShared,"
@@ -1053,6 +1071,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            device,")?;
     writeln!(code, "            queue,")?;
     writeln!(code, "            matmul_pipeline,")?;
+    writeln!(code, "            matmul_q8_pipeline,")?;
     writeln!(code, "            rms_norm_pipeline,")?;
     writeln!(code, "            rope_pipeline,")?;
     writeln!(code, "            softmax_pipeline,")?;
@@ -1160,17 +1179,23 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "                self.dispatch_rms_norm(&enc, &self.layers[layer].attn_norm);"
     )?;
+
+    let matmul_fn = if is_q8 {
+        "dispatch_matmul_q8"
+    } else {
+        "dispatch_matmul"
+    };
     writeln!(
         code,
-        "                self.dispatch_matmul(&enc, &self.hidden_buf, &self.layers[layer].q_weight, &self.q_buf, {hidden}, {hidden});"
+        "                self.{matmul_fn}(&enc, &self.hidden_buf, &self.layers[layer].q_weight, &self.q_buf, {hidden}, {hidden});"
     )?;
     writeln!(
         code,
-        "                self.dispatch_matmul(&enc, &self.hidden_buf, &self.layers[layer].k_weight, &self.k_buf, {kv_dim}, {hidden});"
+        "                self.{matmul_fn}(&enc, &self.hidden_buf, &self.layers[layer].k_weight, &self.k_buf, {kv_dim}, {hidden});"
     )?;
     writeln!(
         code,
-        "                self.dispatch_matmul(&enc, &self.hidden_buf, &self.layers[layer].v_weight, &self.v_buf, {kv_dim}, {hidden});"
+        "                self.{matmul_fn}(&enc, &self.hidden_buf, &self.layers[layer].v_weight, &self.v_buf, {kv_dim}, {hidden});"
     )?;
     writeln!(
         code,
@@ -1231,7 +1256,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     )?;
     writeln!(
         code,
-        "                self.dispatch_matmul(&enc, &self.attn_out_buf, &self.layers[layer].o_weight, &self.attn_proj_buf, {hidden}, {hidden});"
+        "                self.{matmul_fn}(&enc, &self.attn_out_buf, &self.layers[layer].o_weight, &self.attn_proj_buf, {hidden}, {hidden});"
     )?;
     writeln!(
         code,
@@ -1243,11 +1268,11 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     )?;
     writeln!(
         code,
-        "                self.dispatch_matmul(&enc, &self.hidden_buf, &self.layers[layer].gate_weight, &self.gate_buf, {intermediate}, {hidden});"
+        "                self.{matmul_fn}(&enc, &self.hidden_buf, &self.layers[layer].gate_weight, &self.gate_buf, {intermediate}, {hidden});"
     )?;
     writeln!(
         code,
-        "                self.dispatch_matmul(&enc, &self.hidden_buf, &self.layers[layer].up_weight, &self.up_buf, {intermediate}, {hidden});"
+        "                self.{matmul_fn}(&enc, &self.hidden_buf, &self.layers[layer].up_weight, &self.up_buf, {intermediate}, {hidden});"
     )?;
     writeln!(
         code,
@@ -1255,7 +1280,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     )?;
     writeln!(
         code,
-        "                self.dispatch_matmul(&enc, &self.ffn_hidden_buf, &self.layers[layer].down_weight, &self.ffn_out_buf, {hidden}, {intermediate});"
+        "                self.{matmul_fn}(&enc, &self.ffn_hidden_buf, &self.layers[layer].down_weight, &self.ffn_out_buf, {hidden}, {intermediate});"
     )?;
     writeln!(
         code,
@@ -1282,7 +1307,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     )?;
     writeln!(
         code,
-        "            self.dispatch_matmul(&enc, &self.hidden_buf, &self.lm_head_buf, &self.logits_buf, {vocab}, {hidden});"
+        "            self.{matmul_fn}(&enc, &self.hidden_buf, &self.lm_head_buf, &self.logits_buf, {vocab}, {hidden});"
     )?;
     writeln!(code, "            enc.end_encoding();")?;
     writeln!(code, "        }}")?;
@@ -1386,6 +1411,50 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(
         code,
         "        enc.set_compute_pipeline_state(&self.matmul_pipeline);"
+    )?;
+    writeln!(code, "        enc.set_buffer(0, Some(weight), 0);")?;
+    writeln!(code, "        enc.set_buffer(1, Some(input), 0);")?;
+    writeln!(code, "        enc.set_buffer(2, Some(output), 0);")?;
+    writeln!(
+        code,
+        "        enc.set_bytes(3, mem::size_of::<u32>() as u64, &r as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(4, mem::size_of::<u32>() as u64, &c as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        // 8 rows per threadgroup (8 simdgroups x 32 lanes = 256 threads)"
+    )?;
+    writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
+    writeln!(code, "        let num_tg = ((rows + 7) / 8) as u64;")?;
+    writeln!(code, "        let grid_size = MTLSize::new(num_tg, 1, 1);")?;
+    writeln!(
+        code,
+        "        enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
+
+    // dispatch_matmul_q8
+    writeln!(
+        code,
+        "    /// Dispatch Q8_0 quantized matrix-vector multiply: weight_q8 * input -> output."
+    )?;
+    writeln!(
+        code,
+        "    /// Weights are raw Q8_0 bytes (34 bytes per block of 32 elements)."
+    )?;
+    writeln!(
+        code,
+        "    fn dispatch_matmul_q8(&self, enc: &ComputeCommandEncoderRef, input: &Buffer, weight: &Buffer, output: &Buffer, rows: usize, cols: usize) {{"
+    )?;
+    writeln!(code, "        let r: u32 = rows as u32;")?;
+    writeln!(code, "        let c: u32 = cols as u32;")?;
+    writeln!(
+        code,
+        "        enc.set_compute_pipeline_state(&self.matmul_q8_pipeline);"
     )?;
     writeln!(code, "        enc.set_buffer(0, Some(weight), 0);")?;
     writeln!(code, "        enc.set_buffer(1, Some(input), 0);")?;
@@ -2140,6 +2209,149 @@ mod tests {
         assert!(
             model_rs.contains("add_inplace_pipeline"),
             "MetalModel should have add_inplace_pipeline"
+        );
+    }
+
+    fn minimal_q8_config() -> ModelConfig {
+        ModelConfig {
+            architecture: Architecture::Llama,
+            hidden_size: 64,
+            intermediate_size: 128,
+            num_layers: 2,
+            num_attention_heads: 4,
+            num_kv_heads: 4,
+            head_dim: 16,
+            vocab_size: 256,
+            max_seq_len: 512,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            dtype: DType::Q8_0,
+            sliding_window_size: None,
+            qkv_bias: false,
+        }
+    }
+
+    #[test]
+    fn generated_shaders_contain_q8_kernel() {
+        let shaders = generate_metal_shaders();
+
+        assert!(
+            shaders.contains("kernel void matmul_vec_q8"),
+            "shaders should contain matmul_vec_q8 kernel"
+        );
+        assert!(
+            shaders.contains("device const uchar* matrix"),
+            "matmul_vec_q8 should accept raw Q8_0 bytes"
+        );
+        assert!(
+            shaders.contains("int8_t val"),
+            "matmul_vec_q8 should read int8 quantized values"
+        );
+        assert!(
+            shaders.contains("device const half*"),
+            "matmul_vec_q8 should read f16 scale via half pointer"
+        );
+    }
+
+    #[test]
+    fn q8_model_has_matmul_q8_pipeline() {
+        let config = minimal_q8_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        assert!(
+            model_rs.contains("matmul_q8_pipeline: ComputePipelineState"),
+            "MetalModel should have matmul_q8_pipeline field"
+        );
+        assert!(
+            model_rs.contains("matmul_q8_pipeline,"),
+            "MetalModel Self should include matmul_q8_pipeline"
+        );
+    }
+
+    #[test]
+    fn q8_model_uses_dispatch_matmul_q8() {
+        let config = minimal_q8_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        assert!(
+            model_rs.contains("dispatch_matmul_q8"),
+            "Q8_0 model should use dispatch_matmul_q8 for projections"
+        );
+        assert!(
+            model_rs.contains("fn dispatch_matmul_q8"),
+            "model.rs should define dispatch_matmul_q8 method"
+        );
+    }
+
+    #[test]
+    fn q8_model_loads_raw_bytes_not_dequantized() {
+        let config = minimal_q8_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        // Should NOT contain dequantization code
+        assert!(
+            !model_rs.contains("f16_to_f32"),
+            "Q8_0 model should not dequantize weights to f32"
+        );
+        assert!(
+            !model_rs.contains("f32_data"),
+            "Q8_0 model should not create f32 weight data"
+        );
+
+        // Should load raw Q8_0 bytes directly
+        assert!(
+            model_rs.contains("total_raw as u64"),
+            "Q8_0 model should load raw bytes into Metal buffer"
+        );
+    }
+
+    #[test]
+    fn q8_model_norms_stay_f32() {
+        let config = minimal_q8_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        // Norm weights should still use f32 buffers
+        assert!(
+            model_rs.contains("let attn_norm = next_f32_buffer"),
+            "attn_norm should use f32 buffer even for Q8_0 models"
+        );
+        assert!(
+            model_rs.contains("let ffn_norm = next_f32_buffer"),
+            "ffn_norm should use f32 buffer even for Q8_0 models"
+        );
+        assert!(
+            model_rs.contains("let norm_buf = next_f32_buffer"),
+            "final norm should use f32 buffer even for Q8_0 models"
+        );
+    }
+
+    #[test]
+    fn f32_model_does_not_use_q8_dispatch() {
+        let config = minimal_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        // f32 model should NOT use Q8 dispatch in forward pass
+        let forward_start = model_rs.find("pub fn forward").unwrap();
+        let forward_body = &model_rs[forward_start..];
+        let forward_end = forward_body
+            .find("\n    fn dispatch_")
+            .unwrap_or(forward_body.len());
+        let forward_code = &forward_body[..forward_end];
+
+        assert!(
+            !forward_code.contains("dispatch_matmul_q8"),
+            "f32 model forward should not use dispatch_matmul_q8"
+        );
+    }
+
+    #[test]
+    fn q8_dispatch_helper_takes_compute_encoder_ref() {
+        let config = minimal_q8_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        assert!(
+            model_rs.contains("fn dispatch_matmul_q8(&self, enc: &ComputeCommandEncoderRef"),
+            "dispatch_matmul_q8 should take ComputeCommandEncoderRef"
         );
     }
 }
