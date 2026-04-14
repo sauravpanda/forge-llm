@@ -177,4 +177,83 @@ mod tests {
         let result = template.format(&messages);
         assert_eq!(result, "Hello\nWorld");
     }
+
+    // ── Real-world validation tests ──────────────────────────────────────
+
+    #[test]
+    fn chatml_empty_messages_produces_assistant_header() {
+        // An empty message list should still produce the assistant prompt header
+        // so the model knows to start generating.
+        let template = ChatTemplate::ChatML;
+        let result = template.format(&[]);
+        assert_eq!(
+            result, "<|im_start|>assistant\n",
+            "empty messages should produce just the assistant header"
+        );
+    }
+
+    #[test]
+    fn llama3_empty_messages_produces_assistant_header() {
+        let template = ChatTemplate::Llama3;
+        let result = template.format(&[]);
+        assert!(
+            result.contains("<|start_header_id|>assistant<|end_header_id|>"),
+            "empty Llama3 messages should still produce assistant header"
+        );
+    }
+
+    #[test]
+    fn chatml_handles_special_characters_in_content() {
+        // Content with newlines, angle brackets, and pipe characters should
+        // be preserved verbatim (no escaping in ChatML).
+        let template = ChatTemplate::ChatML;
+        let content = "Here is code:\n```rust\nfn main() { println!(\"<|test|>\"); }\n```";
+        let result = template.format_prompt(content);
+        assert!(
+            result.contains(content),
+            "special characters in content should be preserved verbatim"
+        );
+    }
+
+    #[test]
+    fn chatml_multi_turn_preserves_order() {
+        // A multi-turn conversation should maintain message order and all
+        // role transitions should be correct.
+        let template = ChatTemplate::ChatML;
+        let messages = vec![
+            ChatMessage::system("You are a calculator."),
+            ChatMessage::user("What is 2+2?"),
+            ChatMessage::assistant("4"),
+            ChatMessage::user("And 3+3?"),
+        ];
+        let result = template.format(&messages);
+
+        // Verify ordering: system before first user, assistant before second user
+        let sys_pos = result.find("system\nYou are a calculator.").unwrap();
+        let user1_pos = result.find("user\nWhat is 2+2?").unwrap();
+        let asst_pos = result.find("assistant\n4").unwrap();
+        let user2_pos = result.find("user\nAnd 3+3?").unwrap();
+        let final_asst = result.rfind("<|im_start|>assistant\n").unwrap();
+
+        assert!(sys_pos < user1_pos, "system should come before first user");
+        assert!(
+            user1_pos < asst_pos,
+            "first user should come before assistant response"
+        );
+        assert!(
+            asst_pos < user2_pos,
+            "assistant response should come before second user"
+        );
+        assert!(
+            user2_pos < final_asst,
+            "second user should come before final assistant prompt"
+        );
+    }
+
+    #[test]
+    fn from_architecture_unknown_defaults_to_chatml() {
+        // Unknown architectures should default to ChatML rather than panicking.
+        let template = ChatTemplate::from_architecture("unknown_arch_xyz");
+        assert_eq!(template, ChatTemplate::ChatML);
+    }
 }

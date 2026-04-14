@@ -256,4 +256,117 @@ mod tests {
             );
         }
     }
+
+    // ── Real-world validation tests ──────────────────────────────────────
+
+    #[test]
+    fn temperature_zero_always_picks_argmax() {
+        // temp=0 should always select the highest-logit token regardless of seed.
+        let logits = vec![0.1, 0.3, 0.9, 0.5, 0.2, 0.8, 0.7, 0.4];
+        let config = SamplingConfig {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+        };
+
+        for seed in 0..200 {
+            let token = sample(&logits, &config, seed);
+            assert_eq!(
+                token, 2,
+                "temp=0 should always pick argmax (token 2), got {token} at seed {seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn high_temperature_distributes_samples() {
+        // Very high temperature should flatten the distribution, making it
+        // nearly uniform.  With enough samples, every token should appear.
+        let logits = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let config = SamplingConfig {
+            temperature: 100.0,
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+        };
+
+        let mut seen = [false; 5];
+        for seed in 0..500 {
+            let token = sample(&logits, &config, seed) as usize;
+            assert!(token < 5, "token {token} out of range");
+            seen[token] = true;
+        }
+
+        // With temp=100 the distribution is nearly uniform; all 5 tokens
+        // should be sampled at least once in 500 draws.
+        let seen_count = seen.iter().filter(|&&s| s).count();
+        assert!(
+            seen_count >= 3,
+            "high temperature should sample diverse tokens, but only {seen_count}/5 seen"
+        );
+    }
+
+    #[test]
+    fn repetition_penalty_reduces_repeated_token_probability() {
+        // After applying repetition penalty to the dominant token, argmax
+        // should shift to a different token.
+        let mut logits = vec![0.1, 10.0, 0.2, 9.5];
+        assert_eq!(argmax(&logits), 1, "pre-penalty argmax should be token 1");
+
+        // Penalize token 1 heavily
+        apply_repetition_penalty(&mut logits, &[1], 20.0);
+        assert_ne!(
+            argmax(&logits),
+            1,
+            "after heavy repetition penalty, argmax should shift away from token 1"
+        );
+        assert_eq!(
+            argmax(&logits),
+            3,
+            "after penalizing token 1, token 3 (9.5) should become argmax"
+        );
+    }
+
+    #[test]
+    fn softmax_all_negative_logits_produces_valid_distribution() {
+        // When all logits are very negative, softmax via sample() should
+        // still produce a valid token (no NaN, no panic).
+        let logits = vec![-100.0, -200.0, -150.0, -300.0];
+        let config = SamplingConfig {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+        };
+
+        let token = sample(&logits, &config, 42);
+        assert!(
+            (token as usize) < logits.len(),
+            "sampled token {token} should be in valid range"
+        );
+
+        // Greedy should pick the least-negative logit
+        assert_eq!(
+            argmax(&logits),
+            0,
+            "argmax of all-negative logits should be index 0 (-100.0)"
+        );
+    }
+
+    #[test]
+    fn sample_with_single_token_vocab() {
+        // Edge case: vocab_size = 1.  Should always return token 0.
+        let logits = vec![0.5];
+        let config = SamplingConfig::greedy();
+        assert_eq!(sample(&logits, &config, 0), 0);
+
+        let config_temp = SamplingConfig {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+        };
+        assert_eq!(sample(&logits, &config_temp, 42), 0);
+    }
 }

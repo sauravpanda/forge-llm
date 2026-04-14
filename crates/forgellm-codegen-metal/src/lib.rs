@@ -6907,4 +6907,118 @@ mod tests {
             "CLI generation loop should include thread::yield_now() for thermal management"
         );
     }
+
+    // ── Real-world validation tests ──────────────────────────────────────
+
+    #[test]
+    fn generated_forward_handles_single_token_prompt() {
+        // With a single token (the first prompt token), forward() should work
+        // at pos=0 where seq_len=1. The attention kernel must handle the case
+        // where there is only one KV entry (no prefill context).
+        let config = minimal_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        // The forward function should accept any u32 token_id (no minimum pos guard)
+        let forward_start = model_rs
+            .find("pub fn forward(&mut self, token_id: u32) -> Vec<f32>")
+            .expect("forward() must exist");
+        let forward_body = &model_rs[forward_start..forward_start + 400];
+
+        // Should NOT require pos > 0 or seq_len > 1
+        assert!(
+            !forward_body.contains("assert!(self.pos > 0"),
+            "forward() must accept pos=0 (first token with no prefill)"
+        );
+
+        // The attention kernel should handle seq_len=1 via the pos field
+        assert!(
+            model_rs.contains("self.pos"),
+            "forward() should use self.pos to track sequence position"
+        );
+    }
+
+    #[test]
+    fn generated_reset_clears_kv_cache_position() {
+        // After reset(), the model should be in a clean state. The pos field
+        // must be 0 so new generation starts from scratch.
+        let config = minimal_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        let reset_start = model_rs
+            .find("pub fn reset(&mut self)")
+            .expect("reset() must exist");
+        let reset_body = &model_rs[reset_start..reset_start + 200];
+
+        // Reset must zero the position counter
+        assert!(
+            reset_body.contains("self.pos = 0"),
+            "reset() must set self.pos = 0"
+        );
+
+        // Verify reset clears prev_cmd (double-buffering state)
+        assert!(
+            reset_body.contains("self.prev_cmd = None"),
+            "reset() should clear prev_cmd for clean command buffer state"
+        );
+    }
+
+    #[test]
+    fn generated_serve_handles_empty_messages_gracefully() {
+        // The serve endpoint should not crash when receiving an empty messages array.
+        // The format_chat_messages function should handle this gracefully.
+        let config = minimal_config();
+        let main_rs = generate_main_rs("test-model", &config).unwrap();
+
+        // The format_chat_messages function should exist and handle empty input
+        let format_fn_start = main_rs
+            .find("fn format_chat_messages")
+            .expect("format_chat_messages must exist");
+        let format_fn_body =
+            &main_rs[format_fn_start..format_fn_start + 500.min(main_rs.len() - format_fn_start)];
+
+        // It should iterate over messages (an empty slice produces an empty loop)
+        assert!(
+            format_fn_body.contains("for msg in messages"),
+            "format_chat_messages should iterate over the messages slice"
+        );
+        // It should always append the assistant prompt suffix
+        assert!(
+            format_fn_body.contains("<|im_start|>assistant"),
+            "format_chat_messages should always append assistant prompt header"
+        );
+
+        // The serve function should call model.reset() before each request
+        let serve_fn_start = main_rs
+            .find("fn serve(")
+            .expect("serve function must exist");
+        let serve_fn_body = &main_rs[serve_fn_start..];
+        assert!(
+            serve_fn_body.contains("model.reset()"),
+            "serve function should reset model between requests"
+        );
+    }
+
+    #[test]
+    fn generated_model_forward_increments_pos() {
+        // Each forward() call must increment self.pos so the next token
+        // uses the correct RoPE position and KV cache offset.
+        let config = minimal_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        let forward_start = model_rs
+            .find("pub fn forward(&mut self, token_id: u32) -> Vec<f32>")
+            .unwrap();
+        let forward_body = &model_rs[forward_start..];
+        let forward_end = forward_body
+            .find("\n    pub fn forward_profile")
+            .or_else(|| forward_body.find("\n    pub fn forward_prefill"))
+            .or_else(|| forward_body.find("\n    fn dispatch_"))
+            .unwrap_or(forward_body.len());
+        let forward_code = &forward_body[..forward_end];
+
+        assert!(
+            forward_code.contains("self.pos += 1") || forward_code.contains("self.pos +=1"),
+            "forward() must increment self.pos after processing a token"
+        );
+    }
 }
