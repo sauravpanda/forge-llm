@@ -112,7 +112,7 @@ fn generate_metal_shaders() -> String {
 // Metal Shading Language compute kernels for transformer inference.
 //
 // Optimized with simdgroup cooperative reductions, shared memory vector
-// caching, float4 vectorized loads, multi-block Q8_0 processing per SIMD
+// caching, float4 vectorized loads, multi-block Q8_0/Q4_0 processing per SIMD
 // lane, and fast:: math intrinsics for Apple Silicon throughput.
 //
 
@@ -456,6 +456,11 @@ kernel void add_inplace(
 constant constexpr uint Q8_ROWS_PER_SG = 4;
 constant constexpr uint Q8_ROWS_PER_TG = SIMDGROUPS_PER_TG * Q8_ROWS_PER_SG; // 32
 
+// Q4_0 uses the same 4-row-per-simdgroup layout as Q8_0 (nibble unpacking
+// doubles ALU work, so the same register budget applies).
+constant constexpr uint Q4_ROWS_PER_SG = 4;
+constant constexpr uint Q4_ROWS_PER_TG = SIMDGROUPS_PER_TG * Q4_ROWS_PER_SG; // 32
+
 kernel void matmul_vec_q8(
     device const uchar* matrix   [[buffer(0)]],  // Q8_0 raw bytes
     device const float* vector   [[buffer(1)]],  // f32 input
@@ -555,6 +560,166 @@ kernel void matmul_vec_q8(
         c=d3[5]; bd3+=float(c.x)*v5.x+float(c.y)*v5.y+float(c.z)*v5.z+float(c.w)*v5.w;
         c=d3[6]; bd3+=float(c.x)*v6.x+float(c.y)*v6.y+float(c.z)*v6.z+float(c.w)*v6.w;
         c=d3[7]; bd3+=float(c.x)*v7.x+float(c.y)*v7.y+float(c.z)*v7.z+float(c.w)*v7.w;
+
+        sum0 += sc0 * bd0; sum1 += sc1 * bd1; sum2 += sc2 * bd2; sum3 += sc3 * bd3;
+    }
+
+    sum0 = simd_sum(sum0); sum1 = simd_sum(sum1);
+    sum2 = simd_sum(sum2); sum3 = simd_sum(sum3);
+
+    if (simd_lane == 0) {
+        if (row_base     < rows) output[row_base]     = sum0;
+        if (row_base + 1 < rows) output[row_base + 1] = sum1;
+        if (row_base + 2 < rows) output[row_base + 2] = sum2;
+        if (row_base + 3 < rows) output[row_base + 3] = sum3;
+    }
+}
+
+// ── matmul_vec_q4 ─────────────────────────────────────────────────────
+// Matrix-vector multiply where the matrix is stored as Q4_0 blocks.
+// Q4_0 block: 2 bytes f16 scale + 16 packed bytes (32 4-bit values) = 18 bytes per 32 elements.
+// Each packed byte holds two 4-bit unsigned values; subtract 8 to get signed.
+// Low nibble (& 0x0F) - 8 → element[i], high nibble (>> 4) - 8 → element[i+16].
+//
+// Same threadgroup geometry as Q8_0: 4 rows per simdgroup, 32 rows per TG.
+// Inner loop fully unrolled with uchar4 loads and float4 vector reads.
+kernel void matmul_vec_q4(
+    device const uchar* matrix   [[buffer(0)]],  // Q4_0 raw bytes
+    device const float* vector   [[buffer(1)]],  // f32 input
+    device float* output         [[buffer(2)]],
+    constant uint& rows          [[buffer(3)]],
+    constant uint& cols          [[buffer(4)]],  // number of elements per row
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]])
+{
+    // Load vector into shared memory
+    threadgroup float vec_tile[4096];
+    for (uint i = tid; i < cols; i += 256) {
+        vec_tile[i] = vector[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Each simdgroup handles 4 consecutive rows
+    uint row_base = tgid * Q4_ROWS_PER_TG + simd_id * Q4_ROWS_PER_SG;
+    if (row_base >= rows) return;
+
+    // Q4_0: each block is 18 bytes for 32 elements
+    uint blocks_per_row = cols / 32;
+    uint row_bytes = blocks_per_row * 18;
+
+    // Pointers to each row's Q4_0 data
+    device const uchar* r0 = matrix + row_base * row_bytes;
+    device const uchar* r1 = matrix + (row_base + 1) * row_bytes;
+    device const uchar* r2 = matrix + (row_base + 2) * row_bytes;
+    device const uchar* r3 = matrix + (row_base + 3) * row_bytes;
+
+    float sum0 = 0.0, sum1 = 0.0, sum2 = 0.0, sum3 = 0.0;
+
+    for (uint blk = simd_lane; blk < blocks_per_row; blk += 32) {
+        uint bb = blk * 18;
+        uint vb = blk * 32;
+
+        // Prefetch all 4 scales
+        float sc0 = float(*(device const half*)(r0 + bb));
+        float sc1 = float(*(device const half*)(r1 + bb));
+        float sc2 = float(*(device const half*)(r2 + bb));
+        float sc3 = float(*(device const half*)(r3 + bb));
+
+        // Packed byte pointers (16 bytes = 32 nibbles = 32 elements)
+        device const uchar4* p0 = (device const uchar4*)(r0 + bb + 2);
+        device const uchar4* p1 = (device const uchar4*)(r1 + bb + 2);
+        device const uchar4* p2 = (device const uchar4*)(r2 + bb + 2);
+        device const uchar4* p3 = (device const uchar4*)(r3 + bb + 2);
+
+        // Load 8 float4 vector values for 32 elements from shared memory
+        // Low nibble elements: indices [0..15], High nibble elements: indices [16..31]
+        float4 v0 = *(threadgroup const float4*)(vec_tile + vb);       // [0..3]
+        float4 v1 = *(threadgroup const float4*)(vec_tile + vb + 4);   // [4..7]
+        float4 v2 = *(threadgroup const float4*)(vec_tile + vb + 8);   // [8..11]
+        float4 v3 = *(threadgroup const float4*)(vec_tile + vb + 12);  // [12..15]
+        float4 v4 = *(threadgroup const float4*)(vec_tile + vb + 16);  // [16..19]
+        float4 v5 = *(threadgroup const float4*)(vec_tile + vb + 20);  // [20..23]
+        float4 v6 = *(threadgroup const float4*)(vec_tile + vb + 24);  // [24..27]
+        float4 v7 = *(threadgroup const float4*)(vec_tile + vb + 28);  // [28..31]
+
+        // Fully unrolled block dot products — 4 rows x 4 uchar4 reads
+        // Each uchar4 has 4 packed bytes; low nibble → elem[j], high nibble → elem[j+16]
+        float bd0=0, bd1=0, bd2=0, bd3=0;
+        uchar4 b;
+
+        // Row 0: p0[0]→v0/v4, p0[1]→v1/v5, p0[2]→v2/v6, p0[3]→v3/v7
+        b=p0[0]; bd0+=float(int(b.x&0xF)-8)*v0.x+float(int(b.x>>4)-8)*v4.x
+                    +float(int(b.y&0xF)-8)*v0.y+float(int(b.y>>4)-8)*v4.y
+                    +float(int(b.z&0xF)-8)*v0.z+float(int(b.z>>4)-8)*v4.z
+                    +float(int(b.w&0xF)-8)*v0.w+float(int(b.w>>4)-8)*v4.w;
+        b=p0[1]; bd0+=float(int(b.x&0xF)-8)*v1.x+float(int(b.x>>4)-8)*v5.x
+                    +float(int(b.y&0xF)-8)*v1.y+float(int(b.y>>4)-8)*v5.y
+                    +float(int(b.z&0xF)-8)*v1.z+float(int(b.z>>4)-8)*v5.z
+                    +float(int(b.w&0xF)-8)*v1.w+float(int(b.w>>4)-8)*v5.w;
+        b=p0[2]; bd0+=float(int(b.x&0xF)-8)*v2.x+float(int(b.x>>4)-8)*v6.x
+                    +float(int(b.y&0xF)-8)*v2.y+float(int(b.y>>4)-8)*v6.y
+                    +float(int(b.z&0xF)-8)*v2.z+float(int(b.z>>4)-8)*v6.z
+                    +float(int(b.w&0xF)-8)*v2.w+float(int(b.w>>4)-8)*v6.w;
+        b=p0[3]; bd0+=float(int(b.x&0xF)-8)*v3.x+float(int(b.x>>4)-8)*v7.x
+                    +float(int(b.y&0xF)-8)*v3.y+float(int(b.y>>4)-8)*v7.y
+                    +float(int(b.z&0xF)-8)*v3.z+float(int(b.z>>4)-8)*v7.z
+                    +float(int(b.w&0xF)-8)*v3.w+float(int(b.w>>4)-8)*v7.w;
+
+        // Row 1
+        b=p1[0]; bd1+=float(int(b.x&0xF)-8)*v0.x+float(int(b.x>>4)-8)*v4.x
+                    +float(int(b.y&0xF)-8)*v0.y+float(int(b.y>>4)-8)*v4.y
+                    +float(int(b.z&0xF)-8)*v0.z+float(int(b.z>>4)-8)*v4.z
+                    +float(int(b.w&0xF)-8)*v0.w+float(int(b.w>>4)-8)*v4.w;
+        b=p1[1]; bd1+=float(int(b.x&0xF)-8)*v1.x+float(int(b.x>>4)-8)*v5.x
+                    +float(int(b.y&0xF)-8)*v1.y+float(int(b.y>>4)-8)*v5.y
+                    +float(int(b.z&0xF)-8)*v1.z+float(int(b.z>>4)-8)*v5.z
+                    +float(int(b.w&0xF)-8)*v1.w+float(int(b.w>>4)-8)*v5.w;
+        b=p1[2]; bd1+=float(int(b.x&0xF)-8)*v2.x+float(int(b.x>>4)-8)*v6.x
+                    +float(int(b.y&0xF)-8)*v2.y+float(int(b.y>>4)-8)*v6.y
+                    +float(int(b.z&0xF)-8)*v2.z+float(int(b.z>>4)-8)*v6.z
+                    +float(int(b.w&0xF)-8)*v2.w+float(int(b.w>>4)-8)*v6.w;
+        b=p1[3]; bd1+=float(int(b.x&0xF)-8)*v3.x+float(int(b.x>>4)-8)*v7.x
+                    +float(int(b.y&0xF)-8)*v3.y+float(int(b.y>>4)-8)*v7.y
+                    +float(int(b.z&0xF)-8)*v3.z+float(int(b.z>>4)-8)*v7.z
+                    +float(int(b.w&0xF)-8)*v3.w+float(int(b.w>>4)-8)*v7.w;
+
+        // Row 2
+        b=p2[0]; bd2+=float(int(b.x&0xF)-8)*v0.x+float(int(b.x>>4)-8)*v4.x
+                    +float(int(b.y&0xF)-8)*v0.y+float(int(b.y>>4)-8)*v4.y
+                    +float(int(b.z&0xF)-8)*v0.z+float(int(b.z>>4)-8)*v4.z
+                    +float(int(b.w&0xF)-8)*v0.w+float(int(b.w>>4)-8)*v4.w;
+        b=p2[1]; bd2+=float(int(b.x&0xF)-8)*v1.x+float(int(b.x>>4)-8)*v5.x
+                    +float(int(b.y&0xF)-8)*v1.y+float(int(b.y>>4)-8)*v5.y
+                    +float(int(b.z&0xF)-8)*v1.z+float(int(b.z>>4)-8)*v5.z
+                    +float(int(b.w&0xF)-8)*v1.w+float(int(b.w>>4)-8)*v5.w;
+        b=p2[2]; bd2+=float(int(b.x&0xF)-8)*v2.x+float(int(b.x>>4)-8)*v6.x
+                    +float(int(b.y&0xF)-8)*v2.y+float(int(b.y>>4)-8)*v6.y
+                    +float(int(b.z&0xF)-8)*v2.z+float(int(b.z>>4)-8)*v6.z
+                    +float(int(b.w&0xF)-8)*v2.w+float(int(b.w>>4)-8)*v6.w;
+        b=p2[3]; bd2+=float(int(b.x&0xF)-8)*v3.x+float(int(b.x>>4)-8)*v7.x
+                    +float(int(b.y&0xF)-8)*v3.y+float(int(b.y>>4)-8)*v7.y
+                    +float(int(b.z&0xF)-8)*v3.z+float(int(b.z>>4)-8)*v7.z
+                    +float(int(b.w&0xF)-8)*v3.w+float(int(b.w>>4)-8)*v7.w;
+
+        // Row 3
+        b=p3[0]; bd3+=float(int(b.x&0xF)-8)*v0.x+float(int(b.x>>4)-8)*v4.x
+                    +float(int(b.y&0xF)-8)*v0.y+float(int(b.y>>4)-8)*v4.y
+                    +float(int(b.z&0xF)-8)*v0.z+float(int(b.z>>4)-8)*v4.z
+                    +float(int(b.w&0xF)-8)*v0.w+float(int(b.w>>4)-8)*v4.w;
+        b=p3[1]; bd3+=float(int(b.x&0xF)-8)*v1.x+float(int(b.x>>4)-8)*v5.x
+                    +float(int(b.y&0xF)-8)*v1.y+float(int(b.y>>4)-8)*v5.y
+                    +float(int(b.z&0xF)-8)*v1.z+float(int(b.z>>4)-8)*v5.z
+                    +float(int(b.w&0xF)-8)*v1.w+float(int(b.w>>4)-8)*v5.w;
+        b=p3[2]; bd3+=float(int(b.x&0xF)-8)*v2.x+float(int(b.x>>4)-8)*v6.x
+                    +float(int(b.y&0xF)-8)*v2.y+float(int(b.y>>4)-8)*v6.y
+                    +float(int(b.z&0xF)-8)*v2.z+float(int(b.z>>4)-8)*v6.z
+                    +float(int(b.w&0xF)-8)*v2.w+float(int(b.w>>4)-8)*v6.w;
+        b=p3[3]; bd3+=float(int(b.x&0xF)-8)*v3.x+float(int(b.x>>4)-8)*v7.x
+                    +float(int(b.y&0xF)-8)*v3.y+float(int(b.y>>4)-8)*v7.y
+                    +float(int(b.z&0xF)-8)*v3.z+float(int(b.z>>4)-8)*v7.z
+                    +float(int(b.w&0xF)-8)*v3.w+float(int(b.w>>4)-8)*v7.w;
 
         sum0 += sc0 * bd0; sum1 += sc1 * bd1; sum2 += sc2 * bd2; sum3 += sc3 * bd3;
     }
@@ -794,6 +959,7 @@ fn emit_metal_model_struct(
     writeln!(code, "    // ── Compute pipelines ──")?;
     writeln!(code, "    matmul_pipeline: ComputePipelineState,")?;
     writeln!(code, "    matmul_q8_pipeline: ComputePipelineState,")?;
+    writeln!(code, "    matmul_q4_pipeline: ComputePipelineState,")?;
     writeln!(code, "    rms_norm_pipeline: ComputePipelineState,")?;
     writeln!(code, "    rope_pipeline: ComputePipelineState,")?;
     writeln!(code, "    softmax_pipeline: ComputePipelineState,")?;
@@ -906,6 +1072,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     let vocab = config.vocab_size;
     let effective_seq_len = config.max_seq_len.min(4096);
     let is_q8 = config.dtype == DType::Q8_0;
+    let is_q4 = config.dtype == DType::Q4_0;
     let kv_dim = num_kv_heads * head_dim;
 
     writeln!(code, "impl MetalModel {{")?;
@@ -952,6 +1119,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     for (var, fn_name) in [
         ("matmul_pipeline", "matmul_vec"),
         ("matmul_q8_pipeline", "matmul_vec_q8"),
+        ("matmul_q4_pipeline", "matmul_vec_q4"),
         ("rms_norm_pipeline", "rms_norm"),
         ("rope_pipeline", "rope"),
         ("softmax_pipeline", "softmax"),
@@ -1087,6 +1255,83 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         writeln!(code)?;
     }
 
+    if is_q4 {
+        // For Q4_0 models, projection weights are stored as raw Q4_0 bytes.
+        // We load them directly into Metal buffers without dequantizing,
+        // and use the matmul_vec_q4 shader that operates on quantized data.
+        // This quarters GPU memory usage vs f32 dequantization.
+        writeln!(
+            code,
+            "        // Helper: read the next Q4_0 weight matrix (rows x cols elements)"
+        )?;
+        writeln!(
+            code,
+            "        // as raw bytes into a Metal buffer (no dequantization)."
+        )?;
+        writeln!(
+            code,
+            "        // Q4_0 format: each block of 32 values = 2 bytes (f16 scale) + 16 bytes (4-bit pairs) = 18 bytes."
+        )?;
+        writeln!(
+            code,
+            "        let next_q4_buffer = |device: &Device, rows: usize, cols: usize| -> Buffer {{"
+        )?;
+        writeln!(code, "            let blocks_per_row = cols.div_ceil(32);")?;
+        writeln!(code, "            let row_bytes = blocks_per_row * 18;")?;
+        writeln!(code, "            let total_raw = rows * row_bytes;")?;
+        writeln!(code, "            let cur = cursor.get();")?;
+        writeln!(
+            code,
+            "            let data = &weights[cur..cur + total_raw];"
+        )?;
+        writeln!(code, "            cursor.set(cur + total_raw);")?;
+        writeln!(code, "            device.new_buffer_with_data(")?;
+        writeln!(code, "                data.as_ptr() as *const _,")?;
+        writeln!(code, "                total_raw as u64,")?;
+        writeln!(
+            code,
+            "                MTLResourceOptions::StorageModeShared,"
+        )?;
+        writeln!(code, "            )")?;
+        writeln!(code, "        }};")?;
+        writeln!(code)?;
+        writeln!(
+            code,
+            "        // Helper: read consecutive Q4_0 weight matrices as a single fused buffer."
+        )?;
+        writeln!(
+            code,
+            "        // Reads `total_rows` rows of Q4_0 data (each row has `cols` elements)."
+        )?;
+        writeln!(
+            code,
+            "        // Used for fused QKV and gate+up projections where weights are adjacent in the file."
+        )?;
+        writeln!(
+            code,
+            "        let next_q4_fused_buffer = |device: &Device, total_rows: usize, cols: usize| -> Buffer {{"
+        )?;
+        writeln!(code, "            let blocks_per_row = cols.div_ceil(32);")?;
+        writeln!(code, "            let row_bytes = blocks_per_row * 18;")?;
+        writeln!(code, "            let total_raw = total_rows * row_bytes;")?;
+        writeln!(code, "            let cur = cursor.get();")?;
+        writeln!(
+            code,
+            "            let data = &weights[cur..cur + total_raw];"
+        )?;
+        writeln!(code, "            cursor.set(cur + total_raw);")?;
+        writeln!(code, "            device.new_buffer_with_data(")?;
+        writeln!(code, "                data.as_ptr() as *const _,")?;
+        writeln!(code, "                total_raw as u64,")?;
+        writeln!(
+            code,
+            "                MTLResourceOptions::StorageModeShared,"
+        )?;
+        writeln!(code, "            )")?;
+        writeln!(code, "        }};")?;
+        writeln!(code)?;
+    }
+
     writeln!(
         code,
         "        let embed_buf = next_f32_buffer(&device, embed_elems);"
@@ -1117,6 +1362,16 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
             code,
             "            let o_weight = next_q8_buffer(&device, {hidden}, {hidden});"
         )?;
+    } else if is_q4 {
+        // Fused Q+K+V weight: read all three consecutive Q4_0 matrices as one buffer
+        writeln!(
+            code,
+            "            let qkv_weight = next_q4_fused_buffer(&device, {qkv_rows}, {hidden});"
+        )?;
+        writeln!(
+            code,
+            "            let o_weight = next_q4_buffer(&device, {hidden}, {hidden});"
+        )?;
     } else {
         // Fused Q+K+V weight: read all three as a single contiguous f32 buffer
         writeln!(
@@ -1145,6 +1400,16 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         writeln!(
             code,
             "            let down_weight = next_q8_buffer(&device, {hidden}, {intermediate});"
+        )?;
+    } else if is_q4 {
+        // Fused gate+up weight: read both consecutive Q4_0 matrices as one buffer
+        writeln!(
+            code,
+            "            let gate_up_weight = next_q4_fused_buffer(&device, {gate_up_rows}, {hidden});"
+        )?;
+        writeln!(
+            code,
+            "            let down_weight = next_q4_buffer(&device, {hidden}, {intermediate});"
         )?;
     } else {
         // Fused gate+up weight: read both as a single contiguous f32 buffer
@@ -1181,6 +1446,11 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         writeln!(
             code,
             "        let lm_head_buf = next_q8_buffer(&device, {vocab}, {hidden});"
+        )?;
+    } else if is_q4 {
+        writeln!(
+            code,
+            "        let lm_head_buf = next_q4_buffer(&device, {vocab}, {hidden});"
         )?;
     } else {
         writeln!(
@@ -1288,6 +1558,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            queue,")?;
     writeln!(code, "            matmul_pipeline,")?;
     writeln!(code, "            matmul_q8_pipeline,")?;
+    writeln!(code, "            matmul_q4_pipeline,")?;
     writeln!(code, "            rms_norm_pipeline,")?;
     writeln!(code, "            rope_pipeline,")?;
     writeln!(code, "            softmax_pipeline,")?;
@@ -1360,6 +1631,8 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     // transitions. Copy operations use compute copy kernels instead of blits.
     let matmul_fn = if is_q8 {
         "dispatch_matmul_q8"
+    } else if is_q4 {
+        "dispatch_matmul_q4"
     } else {
         "dispatch_matmul"
     };
@@ -1804,6 +2077,50 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(
         code,
         "        enc.set_compute_pipeline_state(&self.matmul_q8_pipeline);"
+    )?;
+    writeln!(code, "        enc.set_buffer(0, Some(weight), 0);")?;
+    writeln!(code, "        enc.set_buffer(1, Some(input), 0);")?;
+    writeln!(code, "        enc.set_buffer(2, Some(output), 0);")?;
+    writeln!(
+        code,
+        "        enc.set_bytes(3, mem::size_of::<u32>() as u64, &r as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(4, mem::size_of::<u32>() as u64, &c as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        // 32 rows per threadgroup (8 simdgroups x 4 rows each = 256 threads)"
+    )?;
+    writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
+    writeln!(code, "        let num_tg = ((rows + 31) / 32) as u64;")?;
+    writeln!(code, "        let grid_size = MTLSize::new(num_tg, 1, 1);")?;
+    writeln!(
+        code,
+        "        enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
+
+    // dispatch_matmul_q4
+    writeln!(
+        code,
+        "    /// Dispatch Q4_0 quantized matrix-vector multiply: weight_q4 * input -> output."
+    )?;
+    writeln!(
+        code,
+        "    /// Weights are raw Q4_0 bytes (18 bytes per block of 32 elements)."
+    )?;
+    writeln!(
+        code,
+        "    fn dispatch_matmul_q4(&self, enc: &ComputeCommandEncoderRef, input: &Buffer, weight: &Buffer, output: &Buffer, rows: usize, cols: usize) {{"
+    )?;
+    writeln!(code, "        let r: u32 = rows as u32;")?;
+    writeln!(code, "        let c: u32 = cols as u32;")?;
+    writeln!(
+        code,
+        "        enc.set_compute_pipeline_state(&self.matmul_q4_pipeline);"
     )?;
     writeln!(code, "        enc.set_buffer(0, Some(weight), 0);")?;
     writeln!(code, "        enc.set_buffer(1, Some(input), 0);")?;
@@ -3194,6 +3511,207 @@ mod tests {
         assert!(
             shaders.contains("c.x"),
             "matmul_vec_q8 should access char4 components"
+        );
+    }
+
+    // ── Q4_0 tests ──────────────────────────────────────────────────────
+
+    fn minimal_q4_config() -> ModelConfig {
+        ModelConfig {
+            architecture: Architecture::Llama,
+            hidden_size: 64,
+            intermediate_size: 128,
+            num_layers: 2,
+            num_attention_heads: 4,
+            num_kv_heads: 4,
+            head_dim: 16,
+            vocab_size: 256,
+            max_seq_len: 512,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            dtype: DType::Q4_0,
+            sliding_window_size: None,
+            qkv_bias: false,
+        }
+    }
+
+    #[test]
+    fn generated_shaders_contain_q4_kernel() {
+        let shaders = generate_metal_shaders();
+
+        assert!(
+            shaders.contains("kernel void matmul_vec_q4"),
+            "shaders should contain matmul_vec_q4 kernel"
+        );
+        assert!(
+            shaders.contains("Q4_ROWS_PER_TG"),
+            "shaders should define Q4_ROWS_PER_TG constant"
+        );
+        assert!(
+            shaders.contains("Q4_ROWS_PER_SG"),
+            "shaders should define Q4_ROWS_PER_SG constant"
+        );
+    }
+
+    #[test]
+    fn generated_shaders_q4_uses_uchar4_nibble_unpacking() {
+        let shaders = generate_metal_shaders();
+
+        // Q4_0 kernel should use uchar4 for packed byte loads
+        assert!(
+            shaders.contains("uchar4"),
+            "matmul_vec_q4 should use uchar4 for packed byte loads"
+        );
+        // Should unpack nibbles with &0xF and >>4
+        assert!(
+            shaders.contains("&0xF"),
+            "matmul_vec_q4 should extract low nibble with &0xF"
+        );
+        assert!(
+            shaders.contains(">>4"),
+            "matmul_vec_q4 should extract high nibble with >>4"
+        );
+        // Should subtract 8 to convert unsigned to signed
+        assert!(
+            shaders.contains("-8)"),
+            "matmul_vec_q4 should subtract 8 for unsigned-to-signed conversion"
+        );
+        // Should use 18-byte block size
+        assert!(
+            shaders.contains("blk * 18"),
+            "matmul_vec_q4 should use 18-byte block stride"
+        );
+    }
+
+    #[test]
+    fn q4_model_has_matmul_q4_pipeline() {
+        let config = minimal_q4_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        assert!(
+            model_rs.contains("matmul_q4_pipeline: ComputePipelineState"),
+            "MetalModel should have matmul_q4_pipeline field"
+        );
+        assert!(
+            model_rs.contains("matmul_q4_pipeline,"),
+            "MetalModel Self should include matmul_q4_pipeline"
+        );
+    }
+
+    #[test]
+    fn q4_model_uses_dispatch_matmul_q4() {
+        let config = minimal_q4_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        assert!(
+            model_rs.contains("dispatch_matmul_q4"),
+            "Q4_0 model should use dispatch_matmul_q4 for projections"
+        );
+        assert!(
+            model_rs.contains("fn dispatch_matmul_q4"),
+            "model.rs should define dispatch_matmul_q4 method"
+        );
+    }
+
+    #[test]
+    fn q4_model_loads_raw_bytes_not_dequantized() {
+        let config = minimal_q4_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        // Should NOT contain dequantization code
+        assert!(
+            !model_rs.contains("f16_to_f32"),
+            "Q4_0 model should not dequantize weights to f32"
+        );
+
+        // Should load raw Q4_0 bytes directly
+        assert!(
+            model_rs.contains("total_raw as u64"),
+            "Q4_0 model should load raw bytes into Metal buffer"
+        );
+    }
+
+    #[test]
+    fn q4_model_norms_stay_f32() {
+        let config = minimal_q4_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        assert!(
+            model_rs.contains("let attn_norm = next_f32_buffer"),
+            "attn_norm should use f32 buffer even for Q4_0 models"
+        );
+        assert!(
+            model_rs.contains("let ffn_norm = next_f32_buffer"),
+            "ffn_norm should use f32 buffer even for Q4_0 models"
+        );
+        assert!(
+            model_rs.contains("let norm_buf = next_f32_buffer"),
+            "final norm should use f32 buffer even for Q4_0 models"
+        );
+    }
+
+    #[test]
+    fn q4_model_uses_fused_weight_loading() {
+        let config = minimal_q4_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        assert!(
+            model_rs.contains("let qkv_weight = next_q4_fused_buffer"),
+            "Q4_0 model should use next_q4_fused_buffer for fused QKV weights"
+        );
+        assert!(
+            model_rs.contains("let gate_up_weight = next_q4_fused_buffer"),
+            "Q4_0 model should use next_q4_fused_buffer for fused gate+up weights"
+        );
+        assert!(
+            model_rs.contains("let o_weight = next_q4_buffer"),
+            "Q4_0 model should use next_q4_buffer for O weight"
+        );
+        assert!(
+            model_rs.contains("let down_weight = next_q4_buffer"),
+            "Q4_0 model should use next_q4_buffer for down weight"
+        );
+    }
+
+    #[test]
+    fn q4_dispatch_helper_takes_compute_encoder_ref() {
+        let config = minimal_q4_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        assert!(
+            model_rs.contains("fn dispatch_matmul_q4(&self, enc: &ComputeCommandEncoderRef"),
+            "dispatch_matmul_q4 should take ComputeCommandEncoderRef"
+        );
+    }
+
+    #[test]
+    fn f32_model_does_not_use_q4_dispatch() {
+        let config = minimal_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        let forward_start = model_rs
+            .find("pub fn forward(&mut self, token_id: u32) -> Vec<f32>")
+            .unwrap();
+        let forward_body = &model_rs[forward_start..];
+        let forward_end = forward_body
+            .find("\n    fn dispatch_")
+            .unwrap_or(forward_body.len());
+        let forward_code = &forward_body[..forward_end];
+
+        assert!(
+            !forward_code.contains("dispatch_matmul_q4"),
+            "f32 model forward should not use dispatch_matmul_q4"
+        );
+    }
+
+    #[test]
+    fn q4_model_lm_head_uses_q4_buffer() {
+        let config = minimal_q4_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        assert!(
+            model_rs.contains("let lm_head_buf = next_q4_buffer"),
+            "Q4_0 model should use next_q4_buffer for lm_head"
         );
     }
 }
