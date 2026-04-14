@@ -18,6 +18,9 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/sauravpanda/forge-llm"
 homepage = "https://forgellm.dev"
+keywords = ["llm", "inference", "compiler", "gguf", "aot"]
+categories = ["science", "compilers"]
+readme = "README.md"
 
 [workspace.dependencies]
 # Internal crates
