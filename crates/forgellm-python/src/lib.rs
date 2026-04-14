@@ -5,12 +5,22 @@
 //! ```python
 //! import forgellm
 //!
-//! # AOT compilation: model + weights → standalone Rust project
+//! # AOT compilation: model + weights -> standalone Rust project
 //! forgellm.compile('smollm2.gguf', output_dir='./compiled', target='cpu')
+//! forgellm.compile('smollm2.gguf', output_dir='./compiled', target='metal')
 //!
 //! # Interpreter inference: load once, call generate() repeatedly
-//! model = forgellm.Model('smollm2.gguf')
+//! model = forgellm.Model('smollm2.gguf', device='cpu')
 //! print(model.generate('The meaning of life is', max_tokens=64))
+//!
+//! # Streaming
+//! for token in model.stream('Hello world', max_tokens=100):
+//!     print(token, end='', flush=True)
+//!
+//! # Chat API
+//! response = model.chat([
+//!     {"role": "user", "content": "What is 2+2?"}
+//! ], max_tokens=100)
 //! ```
 
 use std::path::Path;
@@ -18,17 +28,24 @@ use std::path::Path;
 use anyhow::{bail, Context};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 use forgellm_frontend::{gguf, graph_builder, ir::*, weight_loader};
-use forgellm_runtime::{interpreter, kv_cache::KVCache, sampling, tokenizer::Tokenizer};
+use forgellm_runtime::{
+    chat::{ChatMessage, ChatTemplate},
+    interpreter,
+    kv_cache::KVCache,
+    sampling,
+    tokenizer::Tokenizer,
+};
 
-// ─── Error conversion ────────────────────────────────────────────────────────
+// --- Error conversion --------------------------------------------------------
 
 fn to_py(e: anyhow::Error) -> PyErr {
     PyRuntimeError::new_err(format!("{e:#}"))
 }
 
-// ─── GGUF config extraction ───────────────────────────────────────────────────
+// --- GGUF config extraction --------------------------------------------------
 
 /// Extract a `ModelConfig` from a GGUF file by reading its metadata section.
 ///
@@ -113,7 +130,7 @@ fn config_from_gguf(path: &str) -> anyhow::Result<ModelConfig> {
     })
 }
 
-// ─── Tokenizer auto-detection ─────────────────────────────────────────────────
+// --- Tokenizer auto-detection ------------------------------------------------
 
 /// Search for `tokenizer.json` near the model file.
 ///
@@ -136,11 +153,11 @@ fn find_tokenizer(model_path: &str) -> Option<String> {
     None
 }
 
-// ─── compile() ───────────────────────────────────────────────────────────────
+// --- compile() ---------------------------------------------------------------
 
 /// Compile a GGUF model into a standalone Rust project.
 ///
-/// Runs the full AOT pipeline (parse → IR → optimize → codegen) and writes
+/// Runs the full AOT pipeline (parse -> IR -> optimize -> codegen) and writes
 /// a self-contained Rust project to *output_dir*.  The resulting project can
 /// be built with ``cargo build --release`` to produce a zero-dependency binary.
 ///
@@ -152,7 +169,7 @@ fn find_tokenizer(model_path: &str) -> Option<String> {
 ///     Directory where the generated Rust project will be written.
 ///     Created if it does not exist.
 /// target : str, optional
-///     Backend target. Currently only ``"cpu"`` is supported (default).
+///     Backend target: ``"cpu"`` (default) or ``"metal"`` (Apple Silicon GPU).
 ///
 /// Raises
 /// ------
@@ -164,15 +181,10 @@ fn find_tokenizer(model_path: &str) -> Option<String> {
 /// --------
 /// >>> import forgellm
 /// >>> forgellm.compile('smollm2-135m.gguf', output_dir='./compiled')
+/// >>> forgellm.compile('smollm2-135m.gguf', output_dir='./compiled', target='metal')
 #[pyfunction]
 #[pyo3(signature = (model_path, output_dir, target = "cpu"))]
 fn compile(model_path: &str, output_dir: &str, target: &str) -> PyResult<()> {
-    if target != "cpu" {
-        return Err(to_py(anyhow::anyhow!(
-            "unsupported target '{target}'; only 'cpu' is supported"
-        )));
-    }
-
     let config = config_from_gguf(model_path).map_err(to_py)?;
 
     let graph = graph_builder::build_graph(&config).map_err(|e| to_py(anyhow::anyhow!("{e}")))?;
@@ -188,20 +200,91 @@ fn compile(model_path: &str, output_dir: &str, target: &str) -> PyResult<()> {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "model".to_string());
 
-    forgellm_codegen_cpu::generate_project(&optimized, out, &model_name, false)
-        .map_err(|e| to_py(anyhow::anyhow!("{e}")))?;
+    match target {
+        "cpu" => {
+            forgellm_codegen_cpu::generate_project(&optimized, out, &model_name, false)
+                .map_err(|e| to_py(anyhow::anyhow!("{e}")))?;
+        }
+        "metal" => {
+            forgellm_codegen_metal::generate_metal_project(&optimized, out, &model_name)
+                .map_err(|e| to_py(anyhow::anyhow!("{e}")))?;
+        }
+        _ => {
+            return Err(to_py(anyhow::anyhow!(
+                "unsupported target '{target}'; supported targets: 'cpu', 'metal'"
+            )));
+        }
+    }
 
     Ok(())
 }
 
-// ─── Model class ─────────────────────────────────────────────────────────────
+// --- TokenIterator (for streaming) -------------------------------------------
+
+/// Iterator that yields generated tokens one at a time.
+///
+/// Created by :meth:`Model.stream`.  Each call to ``__next__`` runs one step
+/// of the autoregressive loop and returns the decoded token string.
+#[pyclass]
+struct TokenIterator {
+    graph: std::sync::Arc<Graph>,
+    weights: std::sync::Arc<weight_loader::ModelWeights>,
+    tokenizer: std::sync::Arc<Tokenizer>,
+    cache: KVCache,
+    next_token: u32,
+    pos: usize,
+    remaining: usize,
+    stop_ids: Vec<u32>,
+    sampling_config: sampling::SamplingConfig,
+    done: bool,
+}
+
+#[pymethods]
+impl TokenIterator {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self) -> PyResult<Option<String>> {
+        if self.done || self.remaining == 0 {
+            return Ok(None);
+        }
+
+        if self.stop_ids.contains(&self.next_token) {
+            self.done = true;
+            return Ok(None);
+        }
+
+        let token_text = self
+            .tokenizer
+            .decode(&[self.next_token])
+            .map_err(|e| to_py(anyhow::anyhow!("failed to decode token: {e}")))?;
+
+        let logits = interpreter::forward(
+            self.next_token,
+            self.pos,
+            &self.graph,
+            &self.weights,
+            &mut self.cache,
+        );
+        self.cache.advance();
+        self.next_token = sampling::sample(&logits, &self.sampling_config, (self.pos + 1) as u64);
+        self.pos += 1;
+        self.remaining -= 1;
+
+        Ok(Some(token_text))
+    }
+}
+
+// --- Model class -------------------------------------------------------------
 
 /// Interpreter-backed LLM loaded from a GGUF file.
 ///
-/// Loads the model weights into memory and provides a ``generate()`` method
-/// for text generation using the ForgeLLM interpreter (not an AOT binary).
-/// The interpreter is convenient for prototyping and correctness testing;
-/// for production throughput, compile with :func:`forgellm.compile` instead.
+/// Loads the model weights into memory and provides ``generate()``,
+/// ``stream()``, and ``chat()`` methods for text generation using the
+/// ForgeLLM interpreter (not an AOT binary).  The interpreter is convenient
+/// for prototyping and correctness testing; for production throughput,
+/// compile with :func:`forgellm.compile` instead.
 ///
 /// Parameters
 /// ----------
@@ -210,6 +293,11 @@ fn compile(model_path: &str, output_dir: &str, target: &str) -> PyResult<()> {
 /// tokenizer_path : str or None, optional
 ///     Path to ``tokenizer.json``.  If *None*, the file is auto-detected in
 ///     the same directory as the model (or its parent).
+/// device : str, optional
+///     Device for inference: ``"cpu"`` (default) or ``"metal"``.
+///     The ``"metal"`` device is currently accepted for forward-compatibility
+///     but inference runs on the CPU interpreter.  Use :func:`forgellm.compile`
+///     with ``target="metal"`` for true GPU inference.
 ///
 /// Attributes
 /// ----------
@@ -221,6 +309,8 @@ fn compile(model_path: &str, output_dir: &str, target: &str) -> PyResult<()> {
 ///     Hidden state dimensionality.
 /// vocab_size : int
 ///     Vocabulary size.
+/// device : str
+///     Device being used for inference.
 ///
 /// Examples
 /// --------
@@ -230,17 +320,28 @@ fn compile(model_path: &str, output_dir: &str, target: &str) -> PyResult<()> {
 /// >>> print(output)
 #[pyclass]
 pub struct Model {
-    graph: forgellm_frontend::ir::Graph,
-    weights: forgellm_frontend::weight_loader::ModelWeights,
-    tokenizer: Tokenizer,
+    graph: std::sync::Arc<Graph>,
+    weights: std::sync::Arc<weight_loader::ModelWeights>,
+    tokenizer: std::sync::Arc<Tokenizer>,
     config: ModelConfig,
+    device: String,
 }
 
 #[pymethods]
 impl Model {
     #[new]
-    #[pyo3(signature = (model_path, tokenizer_path = None))]
-    fn new(model_path: &str, tokenizer_path: Option<&str>) -> PyResult<Self> {
+    #[pyo3(signature = (model_path, tokenizer_path = None, device = "cpu"))]
+    fn new(model_path: &str, tokenizer_path: Option<&str>, device: &str) -> PyResult<Self> {
+        // Validate device
+        match device {
+            "cpu" | "metal" => {}
+            other => {
+                return Err(to_py(anyhow::anyhow!(
+                    "unsupported device '{other}'; supported devices: 'cpu', 'metal'"
+                )));
+            }
+        }
+
         // Load model configuration from GGUF metadata
         let config = config_from_gguf(model_path).map_err(to_py)?;
 
@@ -277,10 +378,11 @@ impl Model {
         })?;
 
         Ok(Self {
-            graph,
-            weights,
-            tokenizer,
+            graph: std::sync::Arc::new(graph),
+            weights: std::sync::Arc::new(weights),
+            tokenizer: std::sync::Arc::new(tokenizer),
             config,
+            device: device.to_string(),
         })
     }
 
@@ -378,6 +480,169 @@ impl Model {
             .map_err(|e| to_py(anyhow::anyhow!("failed to decode output: {e}")))
     }
 
+    /// Stream generated tokens one at a time.
+    ///
+    /// Returns a Python iterator that yields one decoded token string per
+    /// iteration.  This is useful for displaying output progressively.
+    ///
+    /// Parameters
+    /// ----------
+    /// prompt : str
+    ///     Input text.
+    /// max_tokens : int, optional
+    ///     Maximum number of new tokens to generate (default: ``64``).
+    /// temperature : float, optional
+    ///     Sampling temperature (default: ``0.7``).  Pass ``0.0`` for
+    ///     deterministic greedy decoding.
+    ///
+    /// Returns
+    /// -------
+    /// TokenIterator
+    ///     An iterator yielding ``str`` tokens.
+    ///
+    /// Examples
+    /// --------
+    /// >>> for token in model.stream('Hello world', max_tokens=100):
+    /// ...     print(token, end='', flush=True)
+    #[pyo3(signature = (prompt, max_tokens = 64, temperature = 0.7))]
+    fn stream(&self, prompt: &str, max_tokens: usize, temperature: f32) -> PyResult<TokenIterator> {
+        let prompt_tokens = self
+            .tokenizer
+            .encode(prompt)
+            .map_err(|e| to_py(anyhow::anyhow!("failed to encode prompt: {e}")))?;
+
+        if prompt_tokens.is_empty() {
+            return Ok(TokenIterator {
+                graph: self.graph.clone(),
+                weights: self.weights.clone(),
+                tokenizer: self.tokenizer.clone(),
+                cache: KVCache::with_capacity(
+                    self.config.num_layers,
+                    self.config.num_kv_heads,
+                    self.config.head_dim,
+                    self.config.max_seq_len,
+                ),
+                next_token: 0,
+                pos: 0,
+                remaining: 0,
+                stop_ids: vec![],
+                sampling_config: sampling::SamplingConfig::greedy(),
+                done: true,
+            });
+        }
+
+        let max_ctx = self.config.max_seq_len;
+        if prompt_tokens.len() >= max_ctx {
+            return Err(to_py(anyhow::anyhow!(
+                "prompt is {} tokens but model context is {}; shorten the prompt",
+                prompt_tokens.len(),
+                max_ctx,
+            )));
+        }
+
+        let sampling_config = if temperature == 0.0 {
+            sampling::SamplingConfig::greedy()
+        } else {
+            sampling::SamplingConfig {
+                temperature,
+                top_k: 50,
+                top_p: 0.9,
+                repetition_penalty: 1.1,
+            }
+        };
+
+        let mut cache = KVCache::with_capacity(
+            self.config.num_layers,
+            self.config.num_kv_heads,
+            self.config.head_dim,
+            max_ctx,
+        );
+
+        // Prefill: process the prompt tokens
+        let mut next_token = 0u32;
+        for (pos, &token_id) in prompt_tokens.iter().enumerate() {
+            let logits =
+                interpreter::forward(token_id, pos, &self.graph, &self.weights, &mut cache);
+            cache.advance();
+            next_token = sampling::sample(&logits, &sampling_config, pos as u64);
+        }
+
+        let budget = max_tokens.min(max_ctx - prompt_tokens.len());
+        let stop_ids = self.tokenizer.stop_token_ids();
+
+        Ok(TokenIterator {
+            graph: self.graph.clone(),
+            weights: self.weights.clone(),
+            tokenizer: self.tokenizer.clone(),
+            cache,
+            next_token,
+            pos: prompt_tokens.len(),
+            remaining: budget,
+            stop_ids,
+            sampling_config,
+            done: false,
+        })
+    }
+
+    /// Generate a response for a chat conversation.
+    ///
+    /// Applies the model's chat template to format the messages into a prompt,
+    /// then generates a response.  Supports multi-turn conversations.
+    ///
+    /// Parameters
+    /// ----------
+    /// messages : list of dict
+    ///     Conversation messages.  Each dict must have ``"role"`` (``"system"``,
+    ///     ``"user"``, or ``"assistant"``) and ``"content"`` keys.
+    /// max_tokens : int, optional
+    ///     Maximum number of new tokens to generate (default: ``64``).
+    /// temperature : float, optional
+    ///     Sampling temperature (default: ``0.7``).
+    ///
+    /// Returns
+    /// -------
+    /// str
+    ///     The assistant's response text.
+    ///
+    /// Examples
+    /// --------
+    /// >>> response = model.chat([
+    /// ...     {"role": "user", "content": "What is 2+2?"}
+    /// ... ], max_tokens=100)
+    /// >>> print(response)
+    #[pyo3(signature = (messages, max_tokens = 64, temperature = 0.7))]
+    fn chat(
+        &self,
+        messages: Vec<Bound<'_, PyDict>>,
+        max_tokens: usize,
+        temperature: f32,
+    ) -> PyResult<String> {
+        let chat_messages: Vec<ChatMessage> = messages
+            .iter()
+            .map(|msg| {
+                let role: String = msg
+                    .get_item("role")
+                    .map_err(|e| to_py(anyhow::anyhow!("missing 'role' key: {e}")))?
+                    .ok_or_else(|| to_py(anyhow::anyhow!("missing 'role' key in message")))?
+                    .extract()
+                    .map_err(|e| to_py(anyhow::anyhow!("'role' must be a string: {e}")))?;
+                let content: String = msg
+                    .get_item("content")
+                    .map_err(|e| to_py(anyhow::anyhow!("missing 'content' key: {e}")))?
+                    .ok_or_else(|| to_py(anyhow::anyhow!("missing 'content' key in message")))?
+                    .extract()
+                    .map_err(|e| to_py(anyhow::anyhow!("'content' must be a string: {e}")))?;
+                Ok(ChatMessage { role, content })
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+
+        let arch_name = self.config.architecture.to_string().to_lowercase();
+        let template = ChatTemplate::from_architecture(&arch_name);
+        let prompt = template.format(&chat_messages);
+
+        self.generate(&prompt, max_tokens, temperature)
+    }
+
     /// Architecture name (e.g. ``"Llama"``, ``"Mistral"``).
     #[getter]
     fn architecture(&self) -> String {
@@ -402,18 +667,25 @@ impl Model {
         self.config.vocab_size
     }
 
+    /// Device used for inference.
+    #[getter]
+    fn device(&self) -> &str {
+        &self.device
+    }
+
     fn __repr__(&self) -> String {
         format!(
-            "forgellm.Model(architecture='{}', layers={}, hidden={}, vocab={})",
+            "forgellm.Model(architecture='{}', layers={}, hidden={}, vocab={}, device='{}')",
             self.config.architecture,
             self.config.num_layers,
             self.config.hidden_size,
             self.config.vocab_size,
+            self.device,
         )
     }
 }
 
-// ─── Module registration ──────────────────────────────────────────────────────
+// --- Module registration -----------------------------------------------------
 
 /// ForgeLLM Python bindings.
 ///
@@ -422,6 +694,7 @@ impl Model {
 fn forgellm(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compile, m)?)?;
     m.add_class::<Model>()?;
+    m.add_class::<TokenIterator>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }
