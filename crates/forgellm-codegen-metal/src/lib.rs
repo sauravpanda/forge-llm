@@ -516,10 +516,18 @@ kernel void matmul_vec_q8(
         float sc2 = float(*(device const half*)(r2 + bb));
         float sc3 = float(*(device const half*)(r3 + bb));
 
-        device const packed_char4* d0 = (device const packed_char4*)(r0 + bb + 2);
-        device const packed_char4* d1 = (device const packed_char4*)(r1 + bb + 2);
-        device const packed_char4* d2 = (device const packed_char4*)(r2 + bb + 2);
-        device const packed_char4* d3 = (device const packed_char4*)(r3 + bb + 2);
+        // Wide 64-bit loads via packed_short4 (2-byte aligned — matches the
+        // Q8_0 block layout where the int8 data starts at offset +2 from a
+        // 34-byte block boundary). Each packed_short4 covers 8 int8 weights,
+        // so 4 loads per row per block vs the previous 8 char4 loads — a 2x
+        // reduction in memory transactions. Metal's char16/packed_char16 are
+        // reserved types and packed_*int4 require >=4-byte alignment which
+        // this layout does not provide, so packed_short4 is the widest valid
+        // vectorized load.
+        device const packed_short4* d0 = (device const packed_short4*)(r0 + bb + 2);
+        device const packed_short4* d1 = (device const packed_short4*)(r1 + bb + 2);
+        device const packed_short4* d2 = (device const packed_short4*)(r2 + bb + 2);
+        device const packed_short4* d3 = (device const packed_short4*)(r3 + bb + 2);
 
         // Load all 8 float4 vector values for this 32-element block from shared memory
         float4 v0 = *(threadgroup const float4*)(vec_tile + vb);
@@ -531,46 +539,46 @@ kernel void matmul_vec_q8(
         float4 v6 = *(threadgroup const float4*)(vec_tile + vb + 24);
         float4 v7 = *(threadgroup const float4*)(vec_tile + vb + 28);
 
-        // Fully unrolled block dot products — 4 rows x 8 char4 reads
-        float bd0=0, bd1=0, bd2=0, bd3=0;
-        char4 c;
+        // Helper: expand a packed_short4 into a float4 pair covering 8 int8 weights.
+        // char2(as_type<char2>(s)) yields (low_byte, high_byte) on little-endian.
+        #define Q8_UNPACK8(SHORT4, OUT_LO, OUT_HI) { \
+            short4 _s = short4(SHORT4); \
+            char2 _a = as_type<char2>(_s.x); \
+            char2 _b = as_type<char2>(_s.y); \
+            char2 _c = as_type<char2>(_s.z); \
+            char2 _d = as_type<char2>(_s.w); \
+            (OUT_LO) = float4(float(_a.x), float(_a.y), float(_b.x), float(_b.y)); \
+            (OUT_HI) = float4(float(_c.x), float(_c.y), float(_d.x), float(_d.y)); \
+        }
 
-        // Row 0
-        c=d0[0]; bd0+=float(c.x)*v0.x+float(c.y)*v0.y+float(c.z)*v0.z+float(c.w)*v0.w;
-        c=d0[1]; bd0+=float(c.x)*v1.x+float(c.y)*v1.y+float(c.z)*v1.z+float(c.w)*v1.w;
-        c=d0[2]; bd0+=float(c.x)*v2.x+float(c.y)*v2.y+float(c.z)*v2.z+float(c.w)*v2.w;
-        c=d0[3]; bd0+=float(c.x)*v3.x+float(c.y)*v3.y+float(c.z)*v3.z+float(c.w)*v3.w;
-        c=d0[4]; bd0+=float(c.x)*v4.x+float(c.y)*v4.y+float(c.z)*v4.z+float(c.w)*v4.w;
-        c=d0[5]; bd0+=float(c.x)*v5.x+float(c.y)*v5.y+float(c.z)*v5.z+float(c.w)*v5.w;
-        c=d0[6]; bd0+=float(c.x)*v6.x+float(c.y)*v6.y+float(c.z)*v6.z+float(c.w)*v6.w;
-        c=d0[7]; bd0+=float(c.x)*v7.x+float(c.y)*v7.y+float(c.z)*v7.z+float(c.w)*v7.w;
+        float4 f0, f1;
+        float bd0 = 0.0, bd1 = 0.0, bd2 = 0.0, bd3 = 0.0;
+
+        // Row 0: 4 short4 loads cover 32 int8 weights
+        Q8_UNPACK8(d0[0], f0, f1); bd0 += dot(f0, v0) + dot(f1, v1);
+        Q8_UNPACK8(d0[1], f0, f1); bd0 += dot(f0, v2) + dot(f1, v3);
+        Q8_UNPACK8(d0[2], f0, f1); bd0 += dot(f0, v4) + dot(f1, v5);
+        Q8_UNPACK8(d0[3], f0, f1); bd0 += dot(f0, v6) + dot(f1, v7);
+
         // Row 1
-        c=d1[0]; bd1+=float(c.x)*v0.x+float(c.y)*v0.y+float(c.z)*v0.z+float(c.w)*v0.w;
-        c=d1[1]; bd1+=float(c.x)*v1.x+float(c.y)*v1.y+float(c.z)*v1.z+float(c.w)*v1.w;
-        c=d1[2]; bd1+=float(c.x)*v2.x+float(c.y)*v2.y+float(c.z)*v2.z+float(c.w)*v2.w;
-        c=d1[3]; bd1+=float(c.x)*v3.x+float(c.y)*v3.y+float(c.z)*v3.z+float(c.w)*v3.w;
-        c=d1[4]; bd1+=float(c.x)*v4.x+float(c.y)*v4.y+float(c.z)*v4.z+float(c.w)*v4.w;
-        c=d1[5]; bd1+=float(c.x)*v5.x+float(c.y)*v5.y+float(c.z)*v5.z+float(c.w)*v5.w;
-        c=d1[6]; bd1+=float(c.x)*v6.x+float(c.y)*v6.y+float(c.z)*v6.z+float(c.w)*v6.w;
-        c=d1[7]; bd1+=float(c.x)*v7.x+float(c.y)*v7.y+float(c.z)*v7.z+float(c.w)*v7.w;
+        Q8_UNPACK8(d1[0], f0, f1); bd1 += dot(f0, v0) + dot(f1, v1);
+        Q8_UNPACK8(d1[1], f0, f1); bd1 += dot(f0, v2) + dot(f1, v3);
+        Q8_UNPACK8(d1[2], f0, f1); bd1 += dot(f0, v4) + dot(f1, v5);
+        Q8_UNPACK8(d1[3], f0, f1); bd1 += dot(f0, v6) + dot(f1, v7);
+
         // Row 2
-        c=d2[0]; bd2+=float(c.x)*v0.x+float(c.y)*v0.y+float(c.z)*v0.z+float(c.w)*v0.w;
-        c=d2[1]; bd2+=float(c.x)*v1.x+float(c.y)*v1.y+float(c.z)*v1.z+float(c.w)*v1.w;
-        c=d2[2]; bd2+=float(c.x)*v2.x+float(c.y)*v2.y+float(c.z)*v2.z+float(c.w)*v2.w;
-        c=d2[3]; bd2+=float(c.x)*v3.x+float(c.y)*v3.y+float(c.z)*v3.z+float(c.w)*v3.w;
-        c=d2[4]; bd2+=float(c.x)*v4.x+float(c.y)*v4.y+float(c.z)*v4.z+float(c.w)*v4.w;
-        c=d2[5]; bd2+=float(c.x)*v5.x+float(c.y)*v5.y+float(c.z)*v5.z+float(c.w)*v5.w;
-        c=d2[6]; bd2+=float(c.x)*v6.x+float(c.y)*v6.y+float(c.z)*v6.z+float(c.w)*v6.w;
-        c=d2[7]; bd2+=float(c.x)*v7.x+float(c.y)*v7.y+float(c.z)*v7.z+float(c.w)*v7.w;
+        Q8_UNPACK8(d2[0], f0, f1); bd2 += dot(f0, v0) + dot(f1, v1);
+        Q8_UNPACK8(d2[1], f0, f1); bd2 += dot(f0, v2) + dot(f1, v3);
+        Q8_UNPACK8(d2[2], f0, f1); bd2 += dot(f0, v4) + dot(f1, v5);
+        Q8_UNPACK8(d2[3], f0, f1); bd2 += dot(f0, v6) + dot(f1, v7);
+
         // Row 3
-        c=d3[0]; bd3+=float(c.x)*v0.x+float(c.y)*v0.y+float(c.z)*v0.z+float(c.w)*v0.w;
-        c=d3[1]; bd3+=float(c.x)*v1.x+float(c.y)*v1.y+float(c.z)*v1.z+float(c.w)*v1.w;
-        c=d3[2]; bd3+=float(c.x)*v2.x+float(c.y)*v2.y+float(c.z)*v2.z+float(c.w)*v2.w;
-        c=d3[3]; bd3+=float(c.x)*v3.x+float(c.y)*v3.y+float(c.z)*v3.z+float(c.w)*v3.w;
-        c=d3[4]; bd3+=float(c.x)*v4.x+float(c.y)*v4.y+float(c.z)*v4.z+float(c.w)*v4.w;
-        c=d3[5]; bd3+=float(c.x)*v5.x+float(c.y)*v5.y+float(c.z)*v5.z+float(c.w)*v5.w;
-        c=d3[6]; bd3+=float(c.x)*v6.x+float(c.y)*v6.y+float(c.z)*v6.z+float(c.w)*v6.w;
-        c=d3[7]; bd3+=float(c.x)*v7.x+float(c.y)*v7.y+float(c.z)*v7.z+float(c.w)*v7.w;
+        Q8_UNPACK8(d3[0], f0, f1); bd3 += dot(f0, v0) + dot(f1, v1);
+        Q8_UNPACK8(d3[1], f0, f1); bd3 += dot(f0, v2) + dot(f1, v3);
+        Q8_UNPACK8(d3[2], f0, f1); bd3 += dot(f0, v4) + dot(f1, v5);
+        Q8_UNPACK8(d3[3], f0, f1); bd3 += dot(f0, v6) + dot(f1, v7);
+
+        #undef Q8_UNPACK8
 
         sum0 += sc0 * bd0; sum1 += sc1 * bd1; sum2 += sc2 * bd2; sum3 += sc3 * bd3;
     }
@@ -1155,10 +1163,12 @@ kernel void matmul_vec_q8_batch(
         float sc2 = float(*(device const half*)(r2 + bb));
         float sc3 = float(*(device const half*)(r3 + bb));
 
-        device const packed_char4* d0 = (device const packed_char4*)(r0 + bb + 2);
-        device const packed_char4* d1 = (device const packed_char4*)(r1 + bb + 2);
-        device const packed_char4* d2 = (device const packed_char4*)(r2 + bb + 2);
-        device const packed_char4* d3 = (device const packed_char4*)(r3 + bb + 2);
+        // Wide 64-bit loads via packed_short4 (2-byte aligned): 4 loads per
+        // row per block vs 8 char4 loads — 2x reduction in memory transactions.
+        device const packed_short4* d0 = (device const packed_short4*)(r0 + bb + 2);
+        device const packed_short4* d1 = (device const packed_short4*)(r1 + bb + 2);
+        device const packed_short4* d2 = (device const packed_short4*)(r2 + bb + 2);
+        device const packed_short4* d3 = (device const packed_short4*)(r3 + bb + 2);
 
         float4 v0 = *(threadgroup const float4*)(vec_tile + vb);
         float4 v1 = *(threadgroup const float4*)(vec_tile + vb + 4);
@@ -1169,44 +1179,40 @@ kernel void matmul_vec_q8_batch(
         float4 v6 = *(threadgroup const float4*)(vec_tile + vb + 24);
         float4 v7 = *(threadgroup const float4*)(vec_tile + vb + 28);
 
-        float bd0=0, bd1=0, bd2=0, bd3=0;
-        char4 c;
+        #define Q8_UNPACK8(SHORT4, OUT_LO, OUT_HI) { \
+            short4 _s = short4(SHORT4); \
+            char2 _a = as_type<char2>(_s.x); \
+            char2 _b = as_type<char2>(_s.y); \
+            char2 _c = as_type<char2>(_s.z); \
+            char2 _d = as_type<char2>(_s.w); \
+            (OUT_LO) = float4(float(_a.x), float(_a.y), float(_b.x), float(_b.y)); \
+            (OUT_HI) = float4(float(_c.x), float(_c.y), float(_d.x), float(_d.y)); \
+        }
 
-        c=d0[0]; bd0+=float(c.x)*v0.x+float(c.y)*v0.y+float(c.z)*v0.z+float(c.w)*v0.w;
-        c=d0[1]; bd0+=float(c.x)*v1.x+float(c.y)*v1.y+float(c.z)*v1.z+float(c.w)*v1.w;
-        c=d0[2]; bd0+=float(c.x)*v2.x+float(c.y)*v2.y+float(c.z)*v2.z+float(c.w)*v2.w;
-        c=d0[3]; bd0+=float(c.x)*v3.x+float(c.y)*v3.y+float(c.z)*v3.z+float(c.w)*v3.w;
-        c=d0[4]; bd0+=float(c.x)*v4.x+float(c.y)*v4.y+float(c.z)*v4.z+float(c.w)*v4.w;
-        c=d0[5]; bd0+=float(c.x)*v5.x+float(c.y)*v5.y+float(c.z)*v5.z+float(c.w)*v5.w;
-        c=d0[6]; bd0+=float(c.x)*v6.x+float(c.y)*v6.y+float(c.z)*v6.z+float(c.w)*v6.w;
-        c=d0[7]; bd0+=float(c.x)*v7.x+float(c.y)*v7.y+float(c.z)*v7.z+float(c.w)*v7.w;
+        float4 f0, f1;
+        float bd0 = 0.0, bd1 = 0.0, bd2 = 0.0, bd3 = 0.0;
 
-        c=d1[0]; bd1+=float(c.x)*v0.x+float(c.y)*v0.y+float(c.z)*v0.z+float(c.w)*v0.w;
-        c=d1[1]; bd1+=float(c.x)*v1.x+float(c.y)*v1.y+float(c.z)*v1.z+float(c.w)*v1.w;
-        c=d1[2]; bd1+=float(c.x)*v2.x+float(c.y)*v2.y+float(c.z)*v2.z+float(c.w)*v2.w;
-        c=d1[3]; bd1+=float(c.x)*v3.x+float(c.y)*v3.y+float(c.z)*v3.z+float(c.w)*v3.w;
-        c=d1[4]; bd1+=float(c.x)*v4.x+float(c.y)*v4.y+float(c.z)*v4.z+float(c.w)*v4.w;
-        c=d1[5]; bd1+=float(c.x)*v5.x+float(c.y)*v5.y+float(c.z)*v5.z+float(c.w)*v5.w;
-        c=d1[6]; bd1+=float(c.x)*v6.x+float(c.y)*v6.y+float(c.z)*v6.z+float(c.w)*v6.w;
-        c=d1[7]; bd1+=float(c.x)*v7.x+float(c.y)*v7.y+float(c.z)*v7.z+float(c.w)*v7.w;
+        Q8_UNPACK8(d0[0], f0, f1); bd0 += dot(f0, v0) + dot(f1, v1);
+        Q8_UNPACK8(d0[1], f0, f1); bd0 += dot(f0, v2) + dot(f1, v3);
+        Q8_UNPACK8(d0[2], f0, f1); bd0 += dot(f0, v4) + dot(f1, v5);
+        Q8_UNPACK8(d0[3], f0, f1); bd0 += dot(f0, v6) + dot(f1, v7);
 
-        c=d2[0]; bd2+=float(c.x)*v0.x+float(c.y)*v0.y+float(c.z)*v0.z+float(c.w)*v0.w;
-        c=d2[1]; bd2+=float(c.x)*v1.x+float(c.y)*v1.y+float(c.z)*v1.z+float(c.w)*v1.w;
-        c=d2[2]; bd2+=float(c.x)*v2.x+float(c.y)*v2.y+float(c.z)*v2.z+float(c.w)*v2.w;
-        c=d2[3]; bd2+=float(c.x)*v3.x+float(c.y)*v3.y+float(c.z)*v3.z+float(c.w)*v3.w;
-        c=d2[4]; bd2+=float(c.x)*v4.x+float(c.y)*v4.y+float(c.z)*v4.z+float(c.w)*v4.w;
-        c=d2[5]; bd2+=float(c.x)*v5.x+float(c.y)*v5.y+float(c.z)*v5.z+float(c.w)*v5.w;
-        c=d2[6]; bd2+=float(c.x)*v6.x+float(c.y)*v6.y+float(c.z)*v6.z+float(c.w)*v6.w;
-        c=d2[7]; bd2+=float(c.x)*v7.x+float(c.y)*v7.y+float(c.z)*v7.z+float(c.w)*v7.w;
+        Q8_UNPACK8(d1[0], f0, f1); bd1 += dot(f0, v0) + dot(f1, v1);
+        Q8_UNPACK8(d1[1], f0, f1); bd1 += dot(f0, v2) + dot(f1, v3);
+        Q8_UNPACK8(d1[2], f0, f1); bd1 += dot(f0, v4) + dot(f1, v5);
+        Q8_UNPACK8(d1[3], f0, f1); bd1 += dot(f0, v6) + dot(f1, v7);
 
-        c=d3[0]; bd3+=float(c.x)*v0.x+float(c.y)*v0.y+float(c.z)*v0.z+float(c.w)*v0.w;
-        c=d3[1]; bd3+=float(c.x)*v1.x+float(c.y)*v1.y+float(c.z)*v1.z+float(c.w)*v1.w;
-        c=d3[2]; bd3+=float(c.x)*v2.x+float(c.y)*v2.y+float(c.z)*v2.z+float(c.w)*v2.w;
-        c=d3[3]; bd3+=float(c.x)*v3.x+float(c.y)*v3.y+float(c.z)*v3.z+float(c.w)*v3.w;
-        c=d3[4]; bd3+=float(c.x)*v4.x+float(c.y)*v4.y+float(c.z)*v4.z+float(c.w)*v4.w;
-        c=d3[5]; bd3+=float(c.x)*v5.x+float(c.y)*v5.y+float(c.z)*v5.z+float(c.w)*v5.w;
-        c=d3[6]; bd3+=float(c.x)*v6.x+float(c.y)*v6.y+float(c.z)*v6.z+float(c.w)*v6.w;
-        c=d3[7]; bd3+=float(c.x)*v7.x+float(c.y)*v7.y+float(c.z)*v7.z+float(c.w)*v7.w;
+        Q8_UNPACK8(d2[0], f0, f1); bd2 += dot(f0, v0) + dot(f1, v1);
+        Q8_UNPACK8(d2[1], f0, f1); bd2 += dot(f0, v2) + dot(f1, v3);
+        Q8_UNPACK8(d2[2], f0, f1); bd2 += dot(f0, v4) + dot(f1, v5);
+        Q8_UNPACK8(d2[3], f0, f1); bd2 += dot(f0, v6) + dot(f1, v7);
+
+        Q8_UNPACK8(d3[0], f0, f1); bd3 += dot(f0, v0) + dot(f1, v1);
+        Q8_UNPACK8(d3[1], f0, f1); bd3 += dot(f0, v2) + dot(f1, v3);
+        Q8_UNPACK8(d3[2], f0, f1); bd3 += dot(f0, v4) + dot(f1, v5);
+        Q8_UNPACK8(d3[3], f0, f1); bd3 += dot(f0, v6) + dot(f1, v7);
+
+        #undef Q8_UNPACK8
 
         sum0 += sc0 * bd0; sum1 += sc1 * bd1; sum2 += sc2 * bd2; sum3 += sc3 * bd3;
     }
@@ -5374,8 +5380,12 @@ mod tests {
             "matmul_vec_q8 should accept raw Q8_0 bytes"
         );
         assert!(
-            shaders.contains("char4"),
-            "matmul_vec_q8 should use char4 vectorized loads for int8 data"
+            shaders.contains("packed_short4"),
+            "matmul_vec_q8 should use packed_short4 wide 64-bit loads for int8 data"
+        );
+        assert!(
+            shaders.contains("as_type<char2>"),
+            "matmul_vec_q8 should bitcast short lanes to char2"
         );
         assert!(
             shaders.contains("device const half*"),
@@ -5617,20 +5627,24 @@ mod tests {
     }
 
     #[test]
-    fn generated_shaders_q8_uses_char4_vectorized_loads() {
+    fn generated_shaders_q8_uses_wide_vectorized_loads() {
         let shaders = generate_metal_shaders(&minimal_config());
 
         assert!(
-            shaders.contains("char4"),
-            "matmul_vec_q8 should use char4 vectorized loads"
+            shaders.contains("packed_short4"),
+            "matmul_vec_q8 should use packed_short4 wide 64-bit loads"
         );
         assert!(
             shaders.contains("d0[0]"),
-            "matmul_vec_q8 should index char4 pointer for vectorized reads"
+            "matmul_vec_q8 should index the wide pointer for row 0"
         );
         assert!(
-            shaders.contains("c.x"),
-            "matmul_vec_q8 should access char4 components"
+            shaders.contains("as_type<char2>"),
+            "matmul_vec_q8 should bitcast short lanes to char2"
+        );
+        assert!(
+            shaders.contains("dot("),
+            "matmul_vec_q8 should use dot() intrinsic for fma accumulation"
         );
     }
 
