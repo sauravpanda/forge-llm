@@ -477,12 +477,35 @@ fn dequant_q4_1(data: &[u8], numel: usize) -> Vec<f32> {
     output
 }
 
+/// Unpack 6-bit scale and min values from the 12-byte packed K-quant scale format.
+///
+/// The 12 bytes encode 8 scales and 8 mins, each 6 bits wide:
+/// - Bytes 0..3: low 6 bits of scales[0..3]
+/// - Bytes 4..7: low 6 bits of mins[0..3]
+/// - Bytes 8..11: high 2 bits of scales[4..7] combined with low 4 bits, and
+///   high 2 bits of mins[4..7] combined with low 4 bits
+///
+/// Matches GGML `get_scale_min_k4`.
+fn get_scale_min_k4(j: usize, scales: &[u8]) -> (u8, u8) {
+    if j < 4 {
+        let sc = scales[j] & 63;
+        let m = scales[j + 4] & 63;
+        (sc, m)
+    } else {
+        let sc = (scales[j + 4] & 0x0F) | ((scales[j - 4] >> 6) << 4);
+        let m = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+        (sc, m)
+    }
+}
+
 /// Q6_K dequantization.
 /// Block layout (210 bytes per 256 elements):
-///   - 128 bytes: quantized low bits (6-bit values packed)
-///   - 64 bytes: quantized high bits
-///   - 16 bytes: scales (int8)
-///   - 2 bytes: super-block scale (f16)
+///   - 128 bytes ql: lower 4 bits of 6-bit quantized values
+///   - 64 bytes qh: upper 2 bits of 6-bit quantized values
+///   - 16 bytes scales: per-16-element int8 scales
+///   - 2 bytes d: super-block scale (f16)
+///
+/// Matches GGML `dequantize_row_q6_K`.
 fn dequant_q6_k(data: &[u8], numel: usize) -> Vec<f32> {
     let mut output = vec![0.0f32; numel];
     let block_size = 256;
@@ -495,24 +518,49 @@ fn dequant_q6_k(data: &[u8], numel: usize) -> Vec<f32> {
             break;
         }
 
-        let ql = &data[bs..bs + 128]; // low 4 bits of 6-bit values
-        let qh = &data[bs + 128..bs + 192]; // high 2 bits
-        let scales = &data[bs + 192..bs + 208]; // per-16 scales
+        let ql = &data[bs..bs + 128];
+        let qh = &data[bs + 128..bs + 192];
+        let scales = &data[bs + 192..bs + 208];
         let d_bits = u16::from_le_bytes([data[bs + 208], data[bs + 209]]);
         let d = f16_to_f32(d_bits);
 
-        for (group, &sc_byte) in scales.iter().enumerate().take(16) {
-            let sc = sc_byte as i8;
-            for j in 0..16 {
-                let idx = group * 16 + j;
-                if block_idx * block_size + idx >= numel {
-                    break;
+        let out_base = block_idx * block_size;
+
+        // Process in two 128-element chunks, matching GGML reference.
+        // Each chunk processes 32 iterations, producing 4 output values each.
+        for n_off in (0..block_size).step_by(128) {
+            let ql_off = n_off / 2; // ql advances by 64 per 128-element chunk
+            let qh_off = n_off / 4; // qh advances by 32 per 128-element chunk
+            let sc_off = n_off / 16; // scales advance by 8 per 128-element chunk
+
+            for l in 0..32 {
+                let is = l / 16; // sub-group index within this chunk (0 or 1)
+
+                let q1 = ((ql[ql_off + l] & 0x0F) | ((qh[qh_off + l] & 3) << 4)) as i32 - 32;
+                let q2 =
+                    ((ql[ql_off + l + 32] & 0x0F) | (((qh[qh_off + l] >> 2) & 3) << 4)) as i32 - 32;
+                let q3 = ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i32 - 32;
+                let q4 =
+                    ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4)) as i32 - 32;
+
+                let sc1 = scales[sc_off + is] as i8;
+                let sc2 = scales[sc_off + is + 2] as i8;
+                let sc3 = scales[sc_off + is + 4] as i8;
+                let sc4 = scales[sc_off + is + 6] as i8;
+
+                let out_idx = out_base + n_off + l;
+                if out_idx < numel {
+                    output[out_idx] = d * sc1 as f32 * q1 as f32;
                 }
-                // Extract 6-bit value: 4 low bits from ql, 2 high bits from qh
-                let ql_val = (ql[idx / 2] >> ((idx % 2) * 4)) & 0x0F;
-                let qh_val = (qh[idx / 4] >> ((idx % 4) * 2)) & 0x03;
-                let q = ((qh_val as i32) << 4 | ql_val as i32) - 32;
-                output[block_idx * block_size + idx] = d * sc as f32 * q as f32;
+                if out_idx + 32 < numel {
+                    output[out_idx + 32] = d * sc2 as f32 * q2 as f32;
+                }
+                if out_idx + 64 < numel {
+                    output[out_idx + 64] = d * sc3 as f32 * q3 as f32;
+                }
+                if out_idx + 96 < numel {
+                    output[out_idx + 96] = d * sc4 as f32 * q4 as f32;
+                }
             }
         }
     }
@@ -521,7 +569,17 @@ fn dequant_q6_k(data: &[u8], numel: usize) -> Vec<f32> {
 }
 
 /// Q5_K dequantization.
-/// Block layout (176 bytes per 256 elements).
+/// Block layout (176 bytes per 256 elements):
+///   - 2 bytes d: super-block scale (f16)
+///   - 2 bytes dmin: super-block min (f16)
+///   - 12 bytes scales: 6-bit packed scales and mins for 8 sub-blocks
+///   - 32 bytes qh: high bit (5th bit) for each of 256 elements
+///   - 128 bytes qs: low 4 bits for each of 256 elements
+///
+/// Dequantization: value = d * scale_j * q5 - dmin * min_j
+/// where q5 is the 5-bit unsigned value (4 low bits from qs + 1 high bit from qh).
+///
+/// Matches GGML `dequantize_row_q5_K`.
 fn dequant_q5_k(data: &[u8], numel: usize) -> Vec<f32> {
     let mut output = vec![0.0f32; numel];
     let block_size = 256;
@@ -539,43 +597,50 @@ fn dequant_q5_k(data: &[u8], numel: usize) -> Vec<f32> {
         let d = f16_to_f32(d_bits);
         let dmin = f16_to_f32(dmin_bits);
 
-        // Simplified: treat as Q4_K-like with extra bit
-        // For correct output, we'd need the full K-quant unpacking
-        // This is an approximation that gives reasonable results
         let scales = &data[bs + 4..bs + 16];
-        let qs = &data[bs + 16..bs + 16 + 128];
-        let qh = &data[bs + 144..bs + 176];
+        let qh = &data[bs + 16..bs + 48];
+        let qs = &data[bs + 48..bs + 176];
 
-        for j in 0..block_size {
-            if block_idx * block_size + j >= numel {
-                break;
+        let out_base = block_idx * block_size;
+
+        // Process in 64-element chunks matching GGML reference.
+        // Each chunk uses two sub-blocks of 32 elements:
+        //   first 32: low nibble of qs[l], qh bit at mask u1
+        //   next 32:  high nibble of qs[l], qh bit at mask u2
+        let mut ql_off = 0usize;
+        let mut is = 0usize;
+        let mut u1: u8 = 1;
+        let mut u2: u8 = 2;
+        for chunk in 0..4 {
+            let (sc1, m1) = get_scale_min_k4(is, scales);
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+            let d1 = d * sc1 as f32;
+            let m1 = dmin * m1 as f32;
+            let d2 = d * sc2 as f32;
+            let m2 = dmin * m2 as f32;
+
+            for l in 0..32 {
+                let out_idx = out_base + chunk * 64 + l;
+                if out_idx >= numel {
+                    break;
+                }
+                let q_lo = (qs[ql_off + l] & 0x0F) as u32;
+                let qh_bit = if qh[l] & u1 != 0 { 16u32 } else { 0u32 };
+                output[out_idx] = d1 * (q_lo + qh_bit) as f32 - m1;
             }
-            let group = j / 32;
-            let sc_idx = group;
-            let sc = if sc_idx < scales.len() {
-                (scales[sc_idx / 2] >> ((sc_idx % 2) * 4)) & 0x0F
-            } else {
-                0
-            };
-            let m = if sc_idx < scales.len() {
-                (scales[(sc_idx + 8) / 2] >> (((sc_idx + 8) % 2) * 4)) & 0x0F
-            } else {
-                0
-            };
-
-            let byte_idx = j / 2;
-            let q4 = if byte_idx < qs.len() {
-                (qs[byte_idx] >> ((j % 2) * 4)) & 0x0F
-            } else {
-                0
-            };
-            let qh_bit = if j / 8 < qh.len() {
-                (qh[j / 8] >> (j % 8)) & 1
-            } else {
-                0
-            };
-            let q = (q4 as u32 | ((qh_bit as u32) << 4)) as f32;
-            output[block_idx * block_size + j] = d * sc as f32 * q - dmin * m as f32;
+            for l in 0..32 {
+                let out_idx = out_base + chunk * 64 + 32 + l;
+                if out_idx >= numel {
+                    break;
+                }
+                let q_hi = (qs[ql_off + l] >> 4) as u32;
+                let qh_bit = if qh[l] & u2 != 0 { 16u32 } else { 0u32 };
+                output[out_idx] = d2 * (q_hi + qh_bit) as f32 - m2;
+            }
+            ql_off += 32;
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
         }
     }
 
@@ -583,7 +648,13 @@ fn dequant_q5_k(data: &[u8], numel: usize) -> Vec<f32> {
 }
 
 /// Q4_K dequantization.
-/// Block layout (144 bytes per 256 elements).
+/// Block layout (144 bytes per 256 elements):
+///   - 2 bytes d: super-block scale (f16)
+///   - 2 bytes dmin: super-block min (f16)
+///   - 12 bytes scales: 6-bit packed scales and mins for 8 sub-blocks
+///   - 128 bytes qs: 4-bit quantized values (256 elements, 2 per byte)
+///
+/// Matches GGML `dequantize_row_q4_K`.
 fn dequant_q4_k(data: &[u8], numel: usize) -> Vec<f32> {
     let mut output = vec![0.0f32; numel];
     let block_size = 256;
@@ -604,21 +675,38 @@ fn dequant_q4_k(data: &[u8], numel: usize) -> Vec<f32> {
         let scales = &data[bs + 4..bs + 16];
         let qs = &data[bs + 16..bs + 144];
 
-        for j in 0..block_size {
-            if block_idx * block_size + j >= numel {
-                break;
-            }
-            let group = j / 32;
-            let sc = (scales[group / 2] >> ((group % 2) * 4)) & 0x0F;
-            let m = (scales[(group + 8) / 2] >> (((group + 8) % 2) * 4)) & 0x0F;
+        let out_base = block_idx * block_size;
 
-            let byte_idx = j / 2;
-            let q = if byte_idx < qs.len() {
-                (qs[byte_idx] >> ((j % 2) * 4)) & 0x0F
-            } else {
-                0
-            };
-            output[block_idx * block_size + j] = d * sc as f32 * q as f32 - dmin * m as f32;
+        // Process in 64-element chunks matching GGML reference.
+        // Each chunk has two 32-element sub-blocks:
+        //   first 32: low nibble of qs[l]
+        //   next 32:  high nibble of qs[l]
+        let mut q_off = 0usize;
+        let mut is = 0usize;
+        for chunk in 0..4 {
+            let (sc1, m1) = get_scale_min_k4(is, scales);
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+            let d1 = d * sc1 as f32;
+            let m1 = dmin * m1 as f32;
+            let d2 = d * sc2 as f32;
+            let m2 = dmin * m2 as f32;
+
+            for l in 0..32 {
+                let out_idx = out_base + chunk * 64 + l;
+                if out_idx >= numel {
+                    break;
+                }
+                output[out_idx] = d1 * (qs[q_off + l] & 0x0F) as f32 - m1;
+            }
+            for l in 0..32 {
+                let out_idx = out_base + chunk * 64 + 32 + l;
+                if out_idx >= numel {
+                    break;
+                }
+                output[out_idx] = d2 * (qs[q_off + l] >> 4) as f32 - m2;
+            }
+            q_off += 32;
+            is += 2;
         }
     }
 
@@ -1101,5 +1189,284 @@ mod tests {
         for &v in &output {
             assert_eq!(v, 0.0);
         }
+    }
+
+    #[test]
+    fn get_scale_min_k4_low_groups() {
+        // For groups 0..3, scale = scales[j] & 63, min = scales[j+4] & 63.
+        let mut scales = [0u8; 12];
+        scales[0] = 10; // scale for group 0
+        scales[4] = 20; // min for group 0
+        scales[1] = 30; // scale for group 1
+        scales[5] = 40; // min for group 1
+        scales[3] = 63; // scale for group 3 (max 6-bit value)
+        scales[7] = 63; // min for group 3
+
+        let (sc, m) = get_scale_min_k4(0, &scales);
+        assert_eq!(sc, 10);
+        assert_eq!(m, 20);
+
+        let (sc, m) = get_scale_min_k4(1, &scales);
+        assert_eq!(sc, 30);
+        assert_eq!(m, 40);
+
+        let (sc, m) = get_scale_min_k4(3, &scales);
+        assert_eq!(sc, 63);
+        assert_eq!(m, 63);
+    }
+
+    #[test]
+    fn get_scale_min_k4_high_groups() {
+        // For groups 4..7: scale = (scales[j+4] & 0xF) | ((scales[j-4] >> 6) << 4)
+        //                   min   = (scales[j+4] >> 4) | ((scales[j] >> 6) << 4)
+        let mut scales = [0u8; 12];
+        // Group 4: j=4, scale from scales[8] low nibble + scales[0] top 2 bits
+        //          min from scales[8] high nibble + scales[4] top 2 bits
+        scales[8] = 0xA5; // low nibble=5 (for scale), high nibble=0xA=10 (for min)
+        scales[0] = 0xC0; // top 2 bits = 3 -> scale high bits = 3 << 4 = 48
+        scales[4] = 0x80; // top 2 bits = 2 -> min high bits = 2 << 4 = 32
+
+        let (sc, m) = get_scale_min_k4(4, &scales);
+        assert_eq!(sc, 5 | (3 << 4)); // 5 + 48 = 53
+        assert_eq!(m, 10 | (2 << 4)); // 10 + 32 = 42
+    }
+
+    #[test]
+    fn dequant_q4_k_basic() {
+        // Build a Q4_K block (144 bytes for 256 elements).
+        // d=1.0, dmin=0.0, all scales=1, all mins=0, all qs=0.
+        // Expected: d * 1 * 0 - 0 * 0 = 0.0 for all elements.
+        let mut block = vec![0u8; 144];
+        let d_f16: u16 = 0x3C00; // 1.0
+        let dmin_f16: u16 = 0x0000; // 0.0
+        block[0..2].copy_from_slice(&d_f16.to_le_bytes());
+        block[2..4].copy_from_slice(&dmin_f16.to_le_bytes());
+        // Set all 8 scales to 1 (6-bit value 1 in the packed format).
+        // Groups 0..3: scales[j] = 1
+        block[4] = 1;
+        block[5] = 1;
+        block[6] = 1;
+        block[7] = 1;
+        // Groups 0..3 mins: scales[j+4] = 0 (already zero)
+        // Groups 4..7: scales[j+4] low nibble = 1
+        block[12] = 0x01;
+        block[13] = 0x01;
+        block[14] = 0x01;
+        block[15] = 0x01;
+        // qs at offset 16..144, all zeros (q=0).
+
+        let result = dequant_q4_k(&block, 256);
+        assert_eq!(result.len(), 256);
+        for (i, &val) in result.iter().enumerate() {
+            assert!(val.abs() < 1e-6, "element {i}: expected 0.0, got {val}");
+        }
+    }
+
+    #[test]
+    fn dequant_q4_k_with_values() {
+        // Build a Q4_K block where the first 32 elements use low nibble.
+        // d=2.0, dmin=1.0, group 0 scale=3, group 0 min=2.
+        // qs[0..31] low nibble = 5 → value = 2.0 * 3 * 5 - 1.0 * 2 = 30 - 2 = 28.
+        let mut block = vec![0u8; 144];
+        let d_f16: u16 = 0x4000; // 2.0
+        let dmin_f16: u16 = 0x3C00; // 1.0
+        block[0..2].copy_from_slice(&d_f16.to_le_bytes());
+        block[2..4].copy_from_slice(&dmin_f16.to_le_bytes());
+        // Group 0: scales[0] = 3 (6-bit), mins (scales[4]) = 2
+        block[4] = 3;
+        block[8] = 2;
+        // qs at offset 16. First 32 elements use low nibble of qs[0..31].
+        for i in 0..32 {
+            block[16 + i] = 0x05; // low nibble = 5, high nibble = 0
+        }
+
+        let result = dequant_q4_k(&block, 256);
+        // First 32 elements: d * sc * q - dmin * m = 2.0 * 3 * 5 - 1.0 * 2 = 28.0
+        for i in 0..32 {
+            assert!(
+                (result[i] - 28.0).abs() < 1e-4,
+                "element {i}: expected 28.0, got {}",
+                result[i]
+            );
+        }
+    }
+
+    #[test]
+    fn dequant_q5_k_basic_zeros() {
+        // Build a Q5_K block (176 bytes) with all zeros.
+        // d=1.0, dmin=0.0, scales all 1, qh=0, qs=0.
+        // Expected: d * 1 * 0 - 0 * 0 = 0.0
+        let mut block = vec![0u8; 176];
+        let d_f16: u16 = 0x3C00; // 1.0
+        let dmin_f16: u16 = 0x0000; // 0.0
+        block[0..2].copy_from_slice(&d_f16.to_le_bytes());
+        block[2..4].copy_from_slice(&dmin_f16.to_le_bytes());
+        // Set scales for groups 0..3 to 1
+        block[4] = 1;
+        block[5] = 1;
+        block[6] = 1;
+        block[7] = 1;
+        // Groups 4..7: scales[j+4] low nibble = 1
+        block[12] = 0x01;
+        block[13] = 0x01;
+        block[14] = 0x01;
+        block[15] = 0x01;
+
+        let result = dequant_q5_k(&block, 256);
+        assert_eq!(result.len(), 256);
+        for (i, &val) in result.iter().enumerate() {
+            assert!(val.abs() < 1e-6, "element {i}: expected 0.0, got {val}");
+        }
+    }
+
+    #[test]
+    fn dequant_q5_k_with_high_bit() {
+        // Test that the 5th bit from qh is correctly incorporated.
+        // Build a Q5_K block. d=1.0, dmin=0.0, group 0 scale=1.
+        // Set qs[0] low nibble = 3 and qh bit for element 0 = 1.
+        // q5 value = 3 + 16 = 19. Output = 1.0 * 1 * 19 = 19.0.
+        let mut block = vec![0u8; 176];
+        let d_f16: u16 = 0x3C00; // 1.0
+        block[0..2].copy_from_slice(&d_f16.to_le_bytes());
+        // dmin = 0
+        block[2..4].copy_from_slice(&0x0000u16.to_le_bytes());
+        // Group 0 scale = 1
+        block[4] = 1;
+        // qh at offset 16..48. Set bit 0 of qh[0] (u1=1 for first chunk, element 0).
+        block[16] = 0x01; // qh[0] bit 0 set
+                          // qs at offset 48..176. qs[0] low nibble = 3.
+        block[48] = 0x03;
+
+        let result = dequant_q5_k(&block, 256);
+        // Element 0: d * scale * (3 + 16) = 1.0 * 1 * 19 = 19.0
+        assert!(
+            (result[0] - 19.0).abs() < 1e-4,
+            "element 0: expected 19.0, got {}",
+            result[0]
+        );
+    }
+
+    #[test]
+    fn dequant_q5_k_high_nibble_with_qh() {
+        // Test the high nibble path (elements 32..63 in first chunk).
+        // d=1.0, dmin=0.0, group 1 scale=2.
+        // qs[0] high nibble = 7, qh[0] bit 1 = 1 (u2=2 for first chunk).
+        // q5 value = 7 + 16 = 23. Output = 1.0 * 2 * 23 = 46.0.
+        let mut block = vec![0u8; 176];
+        let d_f16: u16 = 0x3C00; // 1.0
+        block[0..2].copy_from_slice(&d_f16.to_le_bytes());
+        block[2..4].copy_from_slice(&0x0000u16.to_le_bytes());
+        // Group 1 scale = 2 (scales[1] for groups < 4)
+        block[5] = 2;
+        // qh at offset 16..48. Set bit 1 of qh[0] (u2=2 for first chunk, element 32).
+        block[16] = 0x02;
+        // qs at offset 48..176. qs[0] high nibble = 7.
+        block[48] = 0x70;
+
+        let result = dequant_q5_k(&block, 256);
+        // Element 32: d * scale * (7 + 16) = 1.0 * 2 * 23 = 46.0
+        assert!(
+            (result[32] - 46.0).abs() < 1e-4,
+            "element 32: expected 46.0, got {}",
+            result[32]
+        );
+    }
+
+    #[test]
+    fn dequant_q6_k_basic_zeros() {
+        // Build a Q6_K block (210 bytes) with all zeros.
+        // d=1.0, all scales=1, all ql/qh=0.
+        // q6 = 0 - 32 = -32. Output = 1.0 * 1 * (-32) = -32.0.
+        let mut block = vec![0u8; 210];
+        let d_f16: u16 = 0x3C00; // 1.0
+        block[208..210].copy_from_slice(&d_f16.to_le_bytes());
+        // scales at offset 192..208 (int8). Set all to 1.
+        for i in 192..208 {
+            block[i] = 1;
+        }
+
+        let result = dequant_q6_k(&block, 256);
+        assert_eq!(result.len(), 256);
+        // All q6 values are 0, so q = 0 - 32 = -32. Output = 1.0 * 1 * -32 = -32.
+        for (i, &val) in result.iter().enumerate() {
+            assert!(
+                (val - (-32.0)).abs() < 1e-4,
+                "element {i}: expected -32.0, got {val}"
+            );
+        }
+    }
+
+    #[test]
+    fn dequant_q6_k_with_values() {
+        // Build a Q6_K block. d=0.5, scale[0]=2.
+        // Element 0: ql[0] low nibble = 0xA = 10, qh[0] bits 0-1 = 2.
+        // q6 = (10 | (2 << 4)) - 32 = (10 | 32) - 32 = 42 - 32 = 10.
+        // Output = 0.5 * 2 * 10 = 10.0.
+        let mut block = vec![0u8; 210];
+        let d_f16: u16 = 0x3800; // 0.5
+        block[208..210].copy_from_slice(&d_f16.to_le_bytes());
+        // scales at offset 192..208. scale[0] = 2 (as int8).
+        block[192] = 2;
+        // ql at offset 0..128. ql[0] = 0xAA (low nibble = 0xA for q1, value doesn't matter for q3 high nibble).
+        block[0] = 0x0A; // low nibble = 10, high nibble = 0
+                         // qh at offset 128..192. qh[0] bits 0-1 = 2.
+        block[128] = 0x02;
+
+        let result = dequant_q6_k(&block, 256);
+        // Element 0 (q1): (0xA | ((0x02 & 3) << 4)) - 32 = (10 | 32) - 32 = 10
+        // Output = 0.5 * 2 * 10 = 10.0
+        assert!(
+            (result[0] - 10.0).abs() < 1e-4,
+            "element 0: expected 10.0, got {}",
+            result[0]
+        );
+    }
+
+    #[test]
+    fn dequant_q6_k_four_interleaved_values() {
+        // Verify all four interleaved values (q1, q2, q3, q4) from one iteration.
+        // d=1.0, all scales=1.
+        // l=0, first 128-element chunk.
+        let mut block = vec![0u8; 210];
+        let d_f16: u16 = 0x3C00; // 1.0
+        block[208..210].copy_from_slice(&d_f16.to_le_bytes());
+        // All scales = 1 (int8)
+        for i in 192..208 {
+            block[i] = 1;
+        }
+        // ql[0] = 0x31 → low nibble = 1 (for q1), high nibble = 3 (for q3)
+        block[0] = 0x31;
+        // ql[32] = 0x52 → low nibble = 2 (for q2), high nibble = 5 (for q4)
+        block[32] = 0x52;
+        // qh[0] = 0b_11_10_01_00 = 0xE4
+        //   bits 0-1 = 0 (for q1), bits 2-3 = 1 (for q2),
+        //   bits 4-5 = 2 (for q3), bits 6-7 = 3 (for q4)
+        block[128] = 0xE4;
+
+        let result = dequant_q6_k(&block, 256);
+        // q1 = (1 | (0 << 4)) - 32 = 1 - 32 = -31 → output = 1.0 * 1 * -31 = -31.0
+        assert!(
+            (result[0] - (-31.0)).abs() < 1e-4,
+            "q1 at [0]: expected -31.0, got {}",
+            result[0]
+        );
+        // q2 = (2 | (1 << 4)) - 32 = 18 - 32 = -14 → output = 1.0 * 1 * -14 = -14.0
+        assert!(
+            (result[32] - (-14.0)).abs() < 1e-4,
+            "q2 at [32]: expected -14.0, got {}",
+            result[32]
+        );
+        // q3 = (3 | (2 << 4)) - 32 = 35 - 32 = 3 → output = 1.0 * 1 * 3 = 3.0
+        assert!(
+            (result[64] - 3.0).abs() < 1e-4,
+            "q3 at [64]: expected 3.0, got {}",
+            result[64]
+        );
+        // q4 = (5 | (3 << 4)) - 32 = 53 - 32 = 21 → output = 1.0 * 1 * 21 = 21.0
+        assert!(
+            (result[96] - 21.0).abs() < 1e-4,
+            "q4 at [96]: expected 21.0, got {}",
+            result[96]
+        );
     }
 }
