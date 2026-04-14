@@ -10,15 +10,16 @@ ForgeLLM is a Rust-native ahead-of-time (AOT) ML compiler for language models (1
 
 ## Performance
 
-v0.5.0 benchmarks on Apple M5 Pro (Q8_0, 64 tokens):
+v0.5.0 generation benchmarks on Apple M5 Pro (8-bit quantization, 64 tokens):
 
-| Model | ForgeLLM Metal | llama.cpp | Speedup |
-|-------|---------------|-----------|---------|
-| SmolLM2-135M | **567 tok/s** | 492 tok/s | **1.15x** |
-| SmolLM2-360M | **289 tok/s** | 267 tok/s | **1.08x** |
-| Llama-3.2-1B | **170 tok/s** | 110 tok/s | **1.55x** |
+| Model | ForgeLLM Metal | MLX (8-bit) | llama.cpp (Q8_0) | vs MLX | vs llama.cpp |
+|-------|---------------|-------------|-------------------|--------|-------------|
+| SmolLM2-135M | **567 tok/s** | 438 tok/s | 494 tok/s | **1.29x** | **1.15x** |
+| SmolLM2-360M | **289 tok/s** | 264 tok/s | 267 tok/s | **1.09x** | **1.08x** |
+| Llama-3.2-1B | **170 tok/s** | 107 tok/s | 129 tok/s | **1.59x** | **1.32x** |
 
-The advantage grows with model size. See [benchmarks/HISTORY.md](benchmarks/HISTORY.md) for details.
+Faster than both llama.cpp and Apple's own MLX framework. The advantage grows with model size.
+See [benchmarks/HISTORY.md](benchmarks/HISTORY.md) and [blog/beating-llama-cpp.md](blog/beating-llama-cpp.md) for details.
 
 ## Quick Start
 

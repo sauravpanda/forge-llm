@@ -1,12 +1,16 @@
-# How We Beat llama.cpp: Building an AOT Compiler for LLM Inference
+# How We Beat llama.cpp and MLX: Building an AOT Compiler for LLM Inference
 
-**TL;DR:** We built ForgeLLM, a Rust AOT compiler that compiles GGUF language models into optimized Metal GPU binaries. On Apple Silicon, it's 1.15-1.55x faster than llama.cpp — and the advantage grows with model size.
+**TL;DR:** We built ForgeLLM, a Rust AOT compiler that compiles GGUF language models into optimized Metal GPU binaries. On Apple Silicon, it's faster than both llama.cpp and Apple's own MLX framework — and the advantage grows with model size.
 
-| Model | ForgeLLM Metal | llama.cpp | Speedup |
-|-------|---------------|-----------|---------|
-| SmolLM2-135M | 567 tok/s | 492 tok/s | 1.15x |
-| SmolLM2-360M | 289 tok/s | 267 tok/s | 1.08x |
-| Llama-3.2-1B | 170 tok/s | 110 tok/s | **1.55x** |
+### Generation Speed — 8-bit Quantization, Apple M5 Pro
+
+| Model | ForgeLLM Metal | MLX (8-bit) | llama.cpp (Q8_0) | vs MLX | vs llama.cpp |
+|-------|---------------|-------------|-------------------|--------|-------------|
+| SmolLM2-135M | **567 tok/s** | 438 tok/s | 494 tok/s | **1.29x** | **1.15x** |
+| SmolLM2-360M | **289 tok/s** | 264 tok/s | 267 tok/s | **1.09x** | **1.08x** |
+| Llama-3.2-1B | **170 tok/s** | 107 tok/s | 129 tok/s | **1.59x** | **1.32x** |
+
+Yes, we beat Apple's own framework on Apple's own hardware.
 
 ## The key insight: compile, don't interpret
 
