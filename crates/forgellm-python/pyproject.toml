@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "forgellm"
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 description = "Python bindings for ForgeLLM — AOT compiler for small LLMs"
 license = {text = "MIT"}
 classifiers = [
