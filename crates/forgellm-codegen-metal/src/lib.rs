@@ -1436,26 +1436,125 @@ kernel void attention_batch(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Step 3: scores * V with 4-way unrolling
-    uint seq_len4 = seq_len & ~3u;
+    // Step 3: scores * V using float4 vectorized loads
+    // With head_dim=64, processing 4 dims per thread means 16 threads cover all dims.
+    // This is much better than the scalar version where only 64 of 256 threads are active.
     uint v_stride = num_kv_heads * head_dim;
-    for (uint d = tid; d < head_dim; d += 256) {
-        float acc = 0.0;
+    uint head_dim4 = head_dim / 4;
+    for (uint d4 = tid; d4 < head_dim4; d4 += 256) {
+        uint d = d4 * 4;
+        float4 acc = float4(0.0);
         uint v_base = kv_head * head_dim + d;
+        uint seq_len4 = seq_len & ~3u;
         for (uint s = 0; s < seq_len4; s += 4) {
             float sc0 = scores[s];
             float sc1 = scores[s + 1];
             float sc2 = scores[s + 2];
             float sc3 = scores[s + 3];
-            acc += sc0 * v_cache[s * v_stride + v_base]
-                 + sc1 * v_cache[(s+1) * v_stride + v_base]
-                 + sc2 * v_cache[(s+2) * v_stride + v_base]
-                 + sc3 * v_cache[(s+3) * v_stride + v_base];
+            acc += sc0 * *(device const float4*)(v_cache + s * v_stride + v_base)
+                 + sc1 * *(device const float4*)(v_cache + (s+1) * v_stride + v_base)
+                 + sc2 * *(device const float4*)(v_cache + (s+2) * v_stride + v_base)
+                 + sc3 * *(device const float4*)(v_cache + (s+3) * v_stride + v_base);
         }
         for (uint s = seq_len4; s < seq_len; s++) {
+            acc += scores[s] * *(device const float4*)(v_cache + s * v_stride + v_base);
+        }
+        *(device float4*)(output_batch + out_off + d) = acc;
+    }
+    // Handle remaining dimensions not divisible by 4 (scalar fallback)
+    for (uint d = head_dim4 * 4 + tid; d < head_dim; d += 256) {
+        float acc = 0.0;
+        uint v_base = kv_head * head_dim + d;
+        for (uint s = 0; s < seq_len; s++) {
             acc += scores[s] * v_cache[s * v_stride + v_base];
         }
         output_batch[out_off + d] = acc;
+    }
+}
+
+// ── rope_qk_batch ─────────────────────────────────────────────────────
+// Fused RoPE for both Q and K in a single dispatch, saving one kernel
+// launch + memory barrier per layer. Both Q and K live in the same
+// qkv_data buffer at different offsets within each token's row.
+// Q: offset 0, num_q_heads heads. K: offset num_q_heads*head_dim, num_kv_heads heads.
+kernel void rope_qk_batch(
+    device float* qkv_data           [[buffer(0)]],  // [M, qkv_stride]
+    constant uint& M                 [[buffer(1)]],   // num tokens
+    constant uint& base_pos          [[buffer(2)]],   // starting position
+    constant uint& num_q_heads       [[buffer(3)]],
+    constant uint& num_kv_heads      [[buffer(4)]],
+    constant uint& head_dim          [[buffer(5)]],
+    constant uint& qkv_stride        [[buffer(6)]],   // floats per row
+    constant float& theta            [[buffer(7)]],
+    uint id [[thread_position_in_grid]])
+{
+    uint half_dim = head_dim / 2;
+    uint total_pairs = (num_q_heads + num_kv_heads) * half_dim;
+    uint token = id / total_pairs;
+    uint pair = id % total_pairs;
+    if (token >= M) return;
+
+    uint pos = base_pos + token;
+    uint q_pairs = num_q_heads * half_dim;
+
+    uint h, i, offset;
+    if (pair < q_pairs) {
+        // Q head
+        h = pair / half_dim;
+        i = pair % half_dim;
+        offset = token * qkv_stride + h * head_dim + i * 2;
+    } else {
+        // K head
+        uint kp = pair - q_pairs;
+        h = kp / half_dim;
+        i = kp % half_dim;
+        uint k_start = num_q_heads * head_dim;
+        offset = token * qkv_stride + k_start + h * head_dim + i * 2;
+    }
+
+    float freq = 1.0f / pow(theta, 2.0f * float(i) / float(head_dim));
+    float angle = float(pos) * freq;
+    float cos_val = cos(angle);
+    float sin_val = sin(angle);
+
+    float x0 = qkv_data[offset];
+    float x1 = qkv_data[offset + 1];
+    qkv_data[offset]     = x0 * cos_val - x1 * sin_val;
+    qkv_data[offset + 1] = x0 * sin_val + x1 * cos_val;
+}
+
+// ── copy_kv_both_batch ────────────────────────────────────────────────
+// Fused K+V cache copy in a single dispatch: copies both K and V from
+// the strided batch QKV buffer to their respective KV cache buffers.
+// Saves one kernel launch + memory barrier per layer vs two copy_kv_batch calls.
+kernel void copy_kv_both_batch(
+    device const float* src    [[buffer(0)]],  // batch QKV buffer [M, qkv_stride]
+    device float* k_dst        [[buffer(1)]],  // K cache [max_seq, kv_dim]
+    device float* v_dst        [[buffer(2)]],  // V cache [max_seq, kv_dim]
+    constant uint& M           [[buffer(3)]],  // num tokens in batch
+    constant uint& kv_dim      [[buffer(4)]],  // floats per KV vector
+    constant uint& base_pos    [[buffer(5)]],  // starting position in cache
+    constant uint& src_stride  [[buffer(6)]],  // floats per row in src (qkv_stride)
+    constant uint& k_offset    [[buffer(7)]],  // float offset of K within each src row
+    constant uint& v_offset    [[buffer(8)]],  // float offset of V within each src row
+    uint id [[thread_position_in_grid]])
+{
+    // Total elements = M * kv_dim * 2 (K + V)
+    uint total_kv = M * kv_dim;
+    if (id >= total_kv * 2) return;
+
+    uint is_v = id / total_kv;        // 0 = K, 1 = V
+    uint local_id = id % total_kv;
+    uint token = local_id / kv_dim;
+    uint d = local_id % kv_dim;
+
+    uint dst_off = (base_pos + token) * kv_dim + d;
+    uint src_off = token * src_stride + (is_v ? v_offset : k_offset) + d;
+
+    if (is_v) {
+        v_dst[dst_off] = src[src_off];
+    } else {
+        k_dst[dst_off] = src[src_off];
     }
 }
 "#
@@ -1605,6 +1704,11 @@ fn emit_metal_model_struct(
     )?;
     writeln!(code, "    attention_batch_pipeline: ComputePipelineState,")?;
     writeln!(code, "    copy_kv_batch_pipeline: ComputePipelineState,")?;
+    writeln!(code, "    rope_qk_batch_pipeline: ComputePipelineState,")?;
+    writeln!(
+        code,
+        "    copy_kv_both_batch_pipeline: ComputePipelineState,"
+    )?;
     writeln!(code)?;
     writeln!(code, "    // ── Weight buffers (Metal shared memory) ──")?;
     writeln!(
@@ -1812,6 +1916,8 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         ("copy_embedding_batch_pipeline", "copy_embedding_batch"),
         ("attention_batch_pipeline", "attention_batch"),
         ("copy_kv_batch_pipeline", "copy_kv_batch"),
+        ("rope_qk_batch_pipeline", "rope_qk_batch"),
+        ("copy_kv_both_batch_pipeline", "copy_kv_both_batch"),
     ] {
         writeln!(
             code,
@@ -2312,6 +2418,8 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            copy_embedding_batch_pipeline,")?;
     writeln!(code, "            attention_batch_pipeline,")?;
     writeln!(code, "            copy_kv_batch_pipeline,")?;
+    writeln!(code, "            rope_qk_batch_pipeline,")?;
+    writeln!(code, "            copy_kv_both_batch_pipeline,")?;
     writeln!(code, "            embed_buf,")?;
     writeln!(code, "            layers,")?;
     writeln!(code, "            norm_buf,")?;
@@ -2691,33 +2799,27 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     )?;
     writeln!(code)?;
 
-    // Batch RoPE on Q and K portions
-    writeln!(code, "                // Batch RoPE on Q portion")?;
-    writeln!(
-        code,
-        "                self.dispatch_rope_batch(&enc, &self.batch_qkv_buf, 0, {num_heads}, {head_dim}, m, {qkv_rows});"
-    )?;
-    writeln!(code, "                // Batch RoPE on K portion")?;
+    // Fused RoPE on Q+K portions in a single dispatch
     let k_float_offset = hidden;
     writeln!(
         code,
-        "                self.dispatch_rope_batch(&enc, &self.batch_qkv_buf, {k_float_offset}, {num_kv_heads}, {head_dim}, m, {qkv_rows});"
+        "                // Fused RoPE on Q+K in one dispatch (saves 1 dispatch + barrier per layer)"
+    )?;
+    writeln!(
+        code,
+        "                self.dispatch_rope_qk_batch(&enc, &self.batch_qkv_buf, m, start_pos, {qkv_rows});"
     )?;
     writeln!(code)?;
 
-    // Batched KV cache update: copy K and V from batch_qkv_buf to KV caches
+    // Fused KV cache update: copy both K and V in a single dispatch
     let v_float_offset = hidden + kv_dim;
     writeln!(
         code,
-        "                // Batched KV cache update: copy all K and V vectors to cache at once"
+        "                // Fused KV cache update: copy K+V in one dispatch (saves 1 dispatch + barrier per layer)"
     )?;
     writeln!(
         code,
-        "                self.dispatch_copy_kv_batch(&enc, &self.batch_qkv_buf, &self.k_cache[layer], m, {kv_dim}, start_pos, {qkv_rows}, {k_float_offset});"
-    )?;
-    writeln!(
-        code,
-        "                self.dispatch_copy_kv_batch(&enc, &self.batch_qkv_buf, &self.v_cache[layer], m, {kv_dim}, start_pos, {qkv_rows}, {v_float_offset});"
+        "                self.dispatch_copy_kv_both_batch(&enc, &self.batch_qkv_buf, &self.k_cache[layer], &self.v_cache[layer], m, {kv_dim}, start_pos, {qkv_rows}, {k_float_offset}, {v_float_offset});"
     )?;
     writeln!(code)?;
 
@@ -4078,6 +4180,143 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(
         code,
         "        let grid_size = MTLSize::new((num_tokens * NUM_HEADS) as u64, 1, 1);"
+    )?;
+    writeln!(
+        code,
+        "        enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
+
+    // dispatch_rope_qk_batch — fused Q+K RoPE in a single dispatch
+    writeln!(
+        code,
+        "    /// Dispatch fused RoPE for both Q and K heads in one kernel launch."
+    )?;
+    writeln!(
+        code,
+        "    /// Saves one dispatch + barrier per layer vs separate Q and K RoPE calls."
+    )?;
+    writeln!(
+        code,
+        "    fn dispatch_rope_qk_batch(&self, enc: &ComputeCommandEncoderRef, buf: &Buffer, num_tokens: usize, base_pos: usize, qkv_stride: usize) {{"
+    )?;
+    writeln!(code, "        let m_val: u32 = num_tokens as u32;")?;
+    writeln!(code, "        let bp: u32 = base_pos as u32;")?;
+    writeln!(code, "        let nq: u32 = NUM_HEADS as u32;")?;
+    writeln!(code, "        let nkv: u32 = NUM_KV_HEADS as u32;")?;
+    writeln!(code, "        let hd: u32 = HEAD_DIM as u32;")?;
+    writeln!(code, "        let qs: u32 = qkv_stride as u32;")?;
+    writeln!(code, "        let theta: f32 = ROPE_THETA;")?;
+    writeln!(
+        code,
+        "        enc.set_compute_pipeline_state(&self.rope_qk_batch_pipeline);"
+    )?;
+    writeln!(code, "        enc.set_buffer(0, Some(buf), 0);")?;
+    writeln!(
+        code,
+        "        enc.set_bytes(1, mem::size_of::<u32>() as u64, &m_val as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(2, mem::size_of::<u32>() as u64, &bp as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(3, mem::size_of::<u32>() as u64, &nq as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(4, mem::size_of::<u32>() as u64, &nkv as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(5, mem::size_of::<u32>() as u64, &hd as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(6, mem::size_of::<u32>() as u64, &qs as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(7, mem::size_of::<f32>() as u64, &theta as *const f32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        let total_pairs = num_tokens * (NUM_HEADS + NUM_KV_HEADS) * (HEAD_DIM / 2);"
+    )?;
+    writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
+    writeln!(
+        code,
+        "        let grid_size = MTLSize::new(((total_pairs + 255) / 256) as u64, 1, 1);"
+    )?;
+    writeln!(
+        code,
+        "        enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
+
+    // dispatch_copy_kv_both_batch — fused K+V cache copy in a single dispatch
+    writeln!(
+        code,
+        "    /// Dispatch fused K+V cache copy in one kernel launch."
+    )?;
+    writeln!(
+        code,
+        "    /// Saves one dispatch + barrier per layer vs separate K and V copy calls."
+    )?;
+    writeln!(
+        code,
+        "    fn dispatch_copy_kv_both_batch(&self, enc: &ComputeCommandEncoderRef, src: &Buffer, k_dst: &Buffer, v_dst: &Buffer, num_tokens: usize, kv_dim: usize, base_pos: usize, src_stride: usize, k_offset: usize, v_offset: usize) {{"
+    )?;
+    writeln!(code, "        let m_val: u32 = num_tokens as u32;")?;
+    writeln!(code, "        let kv: u32 = kv_dim as u32;")?;
+    writeln!(code, "        let bp: u32 = base_pos as u32;")?;
+    writeln!(code, "        let ss: u32 = src_stride as u32;")?;
+    writeln!(code, "        let ko: u32 = k_offset as u32;")?;
+    writeln!(code, "        let vo: u32 = v_offset as u32;")?;
+    writeln!(
+        code,
+        "        enc.set_compute_pipeline_state(&self.copy_kv_both_batch_pipeline);"
+    )?;
+    writeln!(code, "        enc.set_buffer(0, Some(src), 0);")?;
+    writeln!(code, "        enc.set_buffer(1, Some(k_dst), 0);")?;
+    writeln!(code, "        enc.set_buffer(2, Some(v_dst), 0);")?;
+    writeln!(
+        code,
+        "        enc.set_bytes(3, mem::size_of::<u32>() as u64, &m_val as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(4, mem::size_of::<u32>() as u64, &kv as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(5, mem::size_of::<u32>() as u64, &bp as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(6, mem::size_of::<u32>() as u64, &ss as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(7, mem::size_of::<u32>() as u64, &ko as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(8, mem::size_of::<u32>() as u64, &vo as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        let total = num_tokens * kv_dim * 2;  // K + V"
+    )?;
+    writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
+    writeln!(
+        code,
+        "        let grid_size = MTLSize::new(((total + 255) / 256) as u64, 1, 1);"
     )?;
     writeln!(
         code,
@@ -5913,10 +6152,15 @@ mod tests {
             batch_code.contains("dispatch_attention_batch"),
             "forward_prefill_batch should use dispatch_attention_batch"
         );
-        // Should use batched KV cache copy
+        // Should use fused KV cache copy (both K and V in one dispatch)
         assert!(
-            batch_code.contains("dispatch_copy_kv_batch"),
-            "forward_prefill_batch should use dispatch_copy_kv_batch"
+            batch_code.contains("dispatch_copy_kv_both_batch"),
+            "forward_prefill_batch should use dispatch_copy_kv_both_batch"
+        );
+        // Should use fused RoPE Q+K dispatch
+        assert!(
+            batch_code.contains("dispatch_rope_qk_batch"),
+            "forward_prefill_batch should use dispatch_rope_qk_batch"
         );
     }
 
