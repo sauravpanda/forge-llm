@@ -345,14 +345,22 @@ fn save_kv_cache(path: &str, cache: &model::KVCache) {{
     let kv = {kv_size};
     let mut data: Vec<u8> = Vec::new();
     data.extend_from_slice(&(cache.len as u64).to_le_bytes());
+    // Save int8 K/V data
     for layer in &cache.k {{
-        for &val in &layer[..cache.len * kv] {{ data.extend_from_slice(&val.to_le_bytes()); }}
+        for &val in &layer[..cache.len * kv] {{ data.push(val as u8); }}
     }}
     for layer in &cache.v {{
-        for &val in &layer[..cache.len * kv] {{ data.extend_from_slice(&val.to_le_bytes()); }}
+        for &val in &layer[..cache.len * kv] {{ data.push(val as u8); }}
+    }}
+    // Save per-token scales
+    for layer in &cache.k_scales {{
+        for &val in &layer[..cache.len] {{ data.extend_from_slice(&val.to_le_bytes()); }}
+    }}
+    for layer in &cache.v_scales {{
+        for &val in &layer[..cache.len] {{ data.extend_from_slice(&val.to_le_bytes()); }}
     }}
     std::fs::write(path, &data).expect("failed to save cache");
-    eprintln!("KV cache saved ({{}} positions)", cache.len);
+    eprintln!("KV cache saved ({{}} positions, int8)", cache.len);
 }}
 
 fn load_kv_cache(path: &str, cache: &mut model::KVCache) {{
@@ -360,14 +368,22 @@ fn load_kv_cache(path: &str, cache: &mut model::KVCache) {{
     let data = std::fs::read(path).expect("failed to read cache");
     let len = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
     let mut off = 8;
+    // Load int8 K/V data
     for layer in &mut cache.k {{
-        for i in 0..len * kv {{ layer[i] = f32::from_le_bytes(data[off..off+4].try_into().unwrap()); off += 4; }}
+        for i in 0..len * kv {{ layer[i] = data[off] as i8; off += 1; }}
     }}
     for layer in &mut cache.v {{
-        for i in 0..len * kv {{ layer[i] = f32::from_le_bytes(data[off..off+4].try_into().unwrap()); off += 4; }}
+        for i in 0..len * kv {{ layer[i] = data[off] as i8; off += 1; }}
+    }}
+    // Load per-token scales
+    for layer in &mut cache.k_scales {{
+        for i in 0..len {{ layer[i] = f32::from_le_bytes(data[off..off+4].try_into().unwrap()); off += 4; }}
+    }}
+    for layer in &mut cache.v_scales {{
+        for i in 0..len {{ layer[i] = f32::from_le_bytes(data[off..off+4].try_into().unwrap()); off += 4; }}
     }}
     cache.len = len;
-    eprintln!("KV cache loaded ({{}} positions)", len);
+    eprintln!("KV cache loaded ({{}} positions, int8)", len);
 }}
 
 fn argmax(logits: &[f32]) -> u32 {{
@@ -459,9 +475,11 @@ fn main() {{
         // Each forward pass does ~2*params multiply-add operations
         let flops_per_token = 2 * total_params;
         println!("  FLOPs/token:  {{:.2}} GFLOP", (flops_per_token as f64) / 1e9);
-        // Compute KV cache size without allocating
-        let kv_bytes = model::NUM_LAYERS * model::MAX_SEQ_LEN * model::NUM_KV_HEADS * model::HEAD_DIM * 4 * 2;
-        println!("  KV cache:     {{:.1}} MB (max_seq_len={{}})", (kv_bytes as f64) / 1e6, model::MAX_SEQ_LEN);
+        // Compute KV cache size: int8 K+V data + f32 per-token scales
+        let kv_data_bytes = model::NUM_LAYERS * model::MAX_SEQ_LEN * model::NUM_KV_HEADS * model::HEAD_DIM * 1 * 2;
+        let kv_scale_bytes = model::NUM_LAYERS * model::MAX_SEQ_LEN * 4 * 2;
+        let kv_bytes = kv_data_bytes + kv_scale_bytes;
+        println!("  KV cache:     {{:.1}} MB (int8, max_seq_len={{}})", (kv_bytes as f64) / 1e6, model::MAX_SEQ_LEN);
         println!("  Compiled by:  ForgeLLM (https://forgellm.dev)");
         return;
     }}
@@ -723,14 +741,22 @@ fn save_kv_cache(path: &str, cache: &model::KVCache) {{
     let kv = {kv_size};
     let mut data: Vec<u8> = Vec::new();
     data.extend_from_slice(&(cache.len as u64).to_le_bytes());
+    // Save int8 K/V data
     for layer in &cache.k {{
-        for &val in &layer[..cache.len * kv] {{ data.extend_from_slice(&val.to_le_bytes()); }}
+        for &val in &layer[..cache.len * kv] {{ data.push(val as u8); }}
     }}
     for layer in &cache.v {{
-        for &val in &layer[..cache.len * kv] {{ data.extend_from_slice(&val.to_le_bytes()); }}
+        for &val in &layer[..cache.len * kv] {{ data.push(val as u8); }}
+    }}
+    // Save per-token scales
+    for layer in &cache.k_scales {{
+        for &val in &layer[..cache.len] {{ data.extend_from_slice(&val.to_le_bytes()); }}
+    }}
+    for layer in &cache.v_scales {{
+        for &val in &layer[..cache.len] {{ data.extend_from_slice(&val.to_le_bytes()); }}
     }}
     std::fs::write(path, &data).expect("failed to save cache");
-    eprintln!("KV cache saved ({{}} positions)", cache.len);
+    eprintln!("KV cache saved ({{}} positions, int8)", cache.len);
 }}
 
 fn load_kv_cache(path: &str, cache: &mut model::KVCache) {{
@@ -738,14 +764,22 @@ fn load_kv_cache(path: &str, cache: &mut model::KVCache) {{
     let data = std::fs::read(path).expect("failed to read cache");
     let len = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
     let mut off = 8;
+    // Load int8 K/V data
     for layer in &mut cache.k {{
-        for i in 0..len * kv {{ layer[i] = f32::from_le_bytes(data[off..off+4].try_into().unwrap()); off += 4; }}
+        for i in 0..len * kv {{ layer[i] = data[off] as i8; off += 1; }}
     }}
     for layer in &mut cache.v {{
-        for i in 0..len * kv {{ layer[i] = f32::from_le_bytes(data[off..off+4].try_into().unwrap()); off += 4; }}
+        for i in 0..len * kv {{ layer[i] = data[off] as i8; off += 1; }}
+    }}
+    // Load per-token scales
+    for layer in &mut cache.k_scales {{
+        for i in 0..len {{ layer[i] = f32::from_le_bytes(data[off..off+4].try_into().unwrap()); off += 4; }}
+    }}
+    for layer in &mut cache.v_scales {{
+        for i in 0..len {{ layer[i] = f32::from_le_bytes(data[off..off+4].try_into().unwrap()); off += 4; }}
     }}
     cache.len = len;
-    eprintln!("KV cache loaded ({{}} positions)", len);
+    eprintln!("KV cache loaded ({{}} positions, int8)", len);
 }}
 
 fn argmax(logits: &[f32]) -> u32 {{
@@ -806,8 +840,11 @@ fn main() {{
         println!("  Head dim:     {head_dim}");
         println!("  Intermediate: {inter}");
         println!("  Weights:      {{:.1}} MB (embedded)", WEIGHTS_BYTES.len() as f64 / 1e6);
-        let kv_bytes = model::NUM_LAYERS * model::MAX_SEQ_LEN * model::NUM_KV_HEADS * model::HEAD_DIM * 4 * 2;
-        println!("  KV cache:     {{:.1}} MB (max_seq_len={{}})", (kv_bytes as f64) / 1e6, model::MAX_SEQ_LEN);
+        // Compute KV cache size: int8 K+V data + f32 per-token scales
+        let kv_data_bytes = model::NUM_LAYERS * model::MAX_SEQ_LEN * model::NUM_KV_HEADS * model::HEAD_DIM * 1 * 2;
+        let kv_scale_bytes = model::NUM_LAYERS * model::MAX_SEQ_LEN * 4 * 2;
+        let kv_bytes = kv_data_bytes + kv_scale_bytes;
+        println!("  KV cache:     {{:.1}} MB (int8, max_seq_len={{}})", (kv_bytes as f64) / 1e6, model::MAX_SEQ_LEN);
         println!("  Compiled by:  ForgeLLM (https://forgellm.dev)");
         return;
     }}

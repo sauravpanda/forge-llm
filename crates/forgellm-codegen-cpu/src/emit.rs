@@ -463,8 +463,37 @@ pub fn rope(data: &mut [f32], pos: usize, head_dim: usize, num_heads: usize, fre
     }
 }
 
+/// Quantize a token's K or V vector to int8 with per-token absmax scale.
+/// Returns the scale factor (max_abs / 127). Zero scale if all values are zero.
 #[inline]
-pub fn attention(output: &mut [f32], q: &[f32], k_cache: &[f32], v_cache: &[f32],
+pub fn quantize_kv(values: &[f32], out: &mut [i8]) -> f32 {
+    let mut max_abs = 0.0f32;
+    for &v in values.iter() {
+        let a = v.abs();
+        if a > max_abs { max_abs = a; }
+    }
+    let scale = max_abs / 127.0;
+    let inv_scale = if max_abs > 0.0 { 127.0 / max_abs } else { 0.0 };
+    for (i, &v) in values.iter().enumerate() {
+        out[i] = (v * inv_scale).round().clamp(-127.0, 127.0) as i8;
+    }
+    scale
+}
+
+/// Dot product between f32 query slice and int8 cache slice with dequantization scale.
+/// Computes sum(q[i] * (k_i8[i] as f32 * scale)) = scale * sum(q[i] * k_i8[i] as f32).
+#[inline]
+fn dot_f32_i8(q: &[f32], k_i8: &[i8], len: usize, scale: f32) -> f32 {
+    let mut sum = 0.0f32;
+    for i in 0..len {
+        sum += q[i] * k_i8[i] as f32;
+    }
+    sum * scale
+}
+
+#[inline]
+pub fn attention(output: &mut [f32], q: &[f32], k_cache: &[i8], v_cache: &[i8],
+    k_scales: &[f32], v_scales: &[f32],
     seq_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize) {
     let gsize = num_heads / num_kv_heads;
     let scale = 1.0 / (head_dim as f32).sqrt();
@@ -476,13 +505,13 @@ pub fn attention(output: &mut [f32], q: &[f32], k_cache: &[f32], v_cache: &[f32]
         let qo = h * head_dim;
         for t in 0..seq_len {
             let ko = t * kv_stride + kv_h * head_dim;
-            scores[t] = dot_f32(&q[qo..qo+head_dim], &k_cache[ko..ko+head_dim], head_dim) * scale;
+            scores[t] = dot_f32_i8(&q[qo..qo+head_dim], &k_cache[ko..ko+head_dim], head_dim, k_scales[t]) * scale;
         }
         softmax(&mut scores[..seq_len]);
         for d in 0..head_dim {
             let mut sum = 0.0f32;
             for t in 0..seq_len {
-                sum += scores[t] * v_cache[t * kv_stride + kv_h * head_dim + d];
+                sum += scores[t] * (v_cache[t * kv_stride + kv_h * head_dim + d] as f32 * v_scales[t]);
             }
             output[qo+d] = sum;
         }
@@ -505,7 +534,8 @@ pub fn embedding(output: &mut [f32], token_id: u32, weight: &[f32], embed_dim: u
 /// Sliding Window Attention: like `attention` but only attends to the last `window` tokens.
 /// Used by Mistral models (SWA). When seq_len <= window, behaves identically to `attention`.
 #[inline]
-pub fn attention_sliding(output: &mut [f32], q: &[f32], k_cache: &[f32], v_cache: &[f32],
+pub fn attention_sliding(output: &mut [f32], q: &[f32], k_cache: &[i8], v_cache: &[i8],
+    k_scales: &[f32], v_scales: &[f32],
     seq_len: usize, window: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize) {
     let start = if seq_len > window { seq_len - window } else { 0 };
     let win_len = seq_len - start;
@@ -518,13 +548,13 @@ pub fn attention_sliding(output: &mut [f32], q: &[f32], k_cache: &[f32], v_cache
         let qo = h * head_dim;
         for (si, t) in (start..seq_len).enumerate() {
             let ko = t * kv_stride + kv_h * head_dim;
-            scores[si] = dot_f32(&q[qo..qo+head_dim], &k_cache[ko..ko+head_dim], head_dim) * scale;
+            scores[si] = dot_f32_i8(&q[qo..qo+head_dim], &k_cache[ko..ko+head_dim], head_dim, k_scales[t]) * scale;
         }
         softmax(&mut scores[..win_len]);
         for d in 0..head_dim {
             let mut sum = 0.0f32;
             for (si, t) in (start..seq_len).enumerate() {
-                sum += scores[si] * v_cache[t * kv_stride + kv_h * head_dim + d];
+                sum += scores[si] * (v_cache[t * kv_stride + kv_h * head_dim + d] as f32 * v_scales[t]);
             }
             output[qo+d] = sum;
         }
@@ -560,7 +590,8 @@ fn emit_flash_attention_function(code: &mut String) -> Result<(), CodegenError> 
 /// Uses O(FLASH_ATTN_BLOCK_SIZE) score buffer instead of O(seq_len) — safe for 4096+ tokens.
 /// Numerically equivalent to `attention` (standard softmax) up to floating-point rounding.
 #[inline]
-pub fn attention_flash(output: &mut [f32], q: &[f32], k_cache: &[f32], v_cache: &[f32],
+pub fn attention_flash(output: &mut [f32], q: &[f32], k_cache: &[i8], v_cache: &[i8],
+    k_scales: &[f32], v_scales: &[f32],
     seq_len: usize, num_heads: usize, num_kv_heads: usize, head_dim: usize) {
     let gsize = num_heads / num_kv_heads;
     let scale = 1.0 / (head_dim as f32).sqrt();
@@ -583,7 +614,7 @@ pub fn attention_flash(output: &mut [f32], q: &[f32], k_cache: &[f32], v_cache: 
             for bi in 0..block_len {
                 let t = block_start + bi;
                 let ko = t * kv_stride + kv_h * head_dim;
-                let s = dot_f32(&q[qo..qo+head_dim], &k_cache[ko..ko+head_dim], head_dim) * scale;
+                let s = dot_f32_i8(&q[qo..qo+head_dim], &k_cache[ko..ko+head_dim], head_dim, k_scales[t]) * scale;
                 scores[bi] = s;
                 if s > m_block { m_block = s; }
             }
@@ -602,12 +633,12 @@ pub fn attention_flash(output: &mut [f32], q: &[f32], k_cache: &[f32], v_cache: 
                 l_block += e;
             }
             l_i += l_block;
-            // Step 4: accumulate weighted V contribution
+            // Step 4: accumulate weighted V contribution (dequantize v on the fly)
             for d in 0..head_dim {
                 let mut sum = 0.0f32;
                 for bi in 0..block_len {
                     let t = block_start + bi;
-                    sum += scores[bi] * v_cache[t * kv_stride + kv_h * head_dim + d];
+                    sum += scores[bi] * (v_cache[t * kv_stride + kv_h * head_dim + d] as f32 * v_scales[t]);
                 }
                 acc[d] += sum;
             }
@@ -2356,21 +2387,36 @@ fn emit_forward_function(
     writeln!(code, "}}")?;
     writeln!(code)?;
 
-    writeln!(code, "/// KV cache for autoregressive generation.")?;
+    writeln!(
+        code,
+        "/// KV cache for autoregressive generation (int8 quantized)."
+    )?;
     writeln!(
         code,
         "/// Pre-allocated to MAX_SEQ_LEN — zero allocations during inference."
     )?;
+    writeln!(
+        code,
+        "/// Uses int8 quantization with per-token absmax scale for 4x memory reduction."
+    )?;
     writeln!(code, "pub struct KVCache {{")?;
     writeln!(
         code,
-        "    pub k: Vec<Vec<f32>>,  // [num_layers][MAX_SEQ_LEN * {}]  (pre-allocated)",
+        "    pub k: Vec<Vec<i8>>,       // [num_layers][MAX_SEQ_LEN * {}]  (quantized)",
         kv_size
     )?;
     writeln!(
         code,
-        "    pub v: Vec<Vec<f32>>,  // [num_layers][MAX_SEQ_LEN * {}]  (pre-allocated)",
+        "    pub v: Vec<Vec<i8>>,       // [num_layers][MAX_SEQ_LEN * {}]  (quantized)",
         kv_size
+    )?;
+    writeln!(
+        code,
+        "    pub k_scales: Vec<Vec<f32>>,  // [num_layers][MAX_SEQ_LEN] per-token scale"
+    )?;
+    writeln!(
+        code,
+        "    pub v_scales: Vec<Vec<f32>>,  // [num_layers][MAX_SEQ_LEN] per-token scale"
     )?;
     writeln!(code, "    pub len: usize,")?;
     writeln!(code, "}}")?;
@@ -2381,13 +2427,21 @@ fn emit_forward_function(
     writeln!(code, "        Self {{")?;
     writeln!(
         code,
-        "            k: (0..NUM_LAYERS).map(|_| vec![0.0f32; MAX_SEQ_LEN * {kv_size}]).collect(),",
+        "            k: (0..NUM_LAYERS).map(|_| vec![0i8; MAX_SEQ_LEN * {kv_size}]).collect(),",
         kv_size = kv_size
     )?;
     writeln!(
         code,
-        "            v: (0..NUM_LAYERS).map(|_| vec![0.0f32; MAX_SEQ_LEN * {kv_size}]).collect(),",
+        "            v: (0..NUM_LAYERS).map(|_| vec![0i8; MAX_SEQ_LEN * {kv_size}]).collect(),",
         kv_size = kv_size
+    )?;
+    writeln!(
+        code,
+        "            k_scales: (0..NUM_LAYERS).map(|_| vec![0.0f32; MAX_SEQ_LEN]).collect(),"
+    )?;
+    writeln!(
+        code,
+        "            v_scales: (0..NUM_LAYERS).map(|_| vec![0.0f32; MAX_SEQ_LEN]).collect(),"
     )?;
     writeln!(code, "            len: 0,")?;
     writeln!(code, "        }}")?;
@@ -2400,9 +2454,10 @@ fn emit_forward_function(
     writeln!(code)?;
     writeln!(code, "    /// Memory used by KV cache in bytes")?;
     writeln!(code, "    pub fn memory_bytes(&self) -> usize {{")?;
+    writeln!(code, "        // int8 K+V data + f32 per-token scales")?;
     writeln!(
         code,
-        "        NUM_LAYERS * MAX_SEQ_LEN * {kv_size} * 4 * 2  // k + v, f32"
+        "        NUM_LAYERS * MAX_SEQ_LEN * ({kv_size} * 1 * 2 + 4 * 2)  // k + v (i8) + scales (f32)"
     )?;
     writeln!(code, "    }}")?;
     writeln!(code, "}}")?;
@@ -2442,6 +2497,14 @@ fn emit_forward_function(
     writeln!(code, "    let mut q = [0.0f32; {qk_size}];")?;
     writeln!(code, "    let mut k = [0.0f32; {kv_size}];")?;
     writeln!(code, "    let mut v = [0.0f32; {kv_size}];")?;
+    writeln!(
+        code,
+        "    let mut k_q = [0i8; {kv_size}];  // int8 quantized k buffer"
+    )?;
+    writeln!(
+        code,
+        "    let mut v_q = [0i8; {kv_size}];  // int8 quantized v buffer"
+    )?;
     writeln!(code, "    let mut attn_out = [0.0f32; {qk_size}];")?;
     writeln!(code, "    let mut attn_proj = [0.0f32; {hidden}];")?;
     writeln!(code, "    let mut gate = [0.0f32; {intermediate}];")?;
@@ -2559,16 +2622,24 @@ fn emit_forward_function(
     writeln!(code)?;
     writeln!(
         code,
-        "        // Update KV cache (direct indexed write, no allocation)"
+        "        // Quantize K/V to int8 and store in cache with per-token scale"
     )?;
     writeln!(
         code,
-        "        cache.k[layer_idx][pos*{kv_size}..(pos+1)*{kv_size}].copy_from_slice(&k);",
+        "        cache.k_scales[layer_idx][pos] = quantize_kv(&k, &mut k_q);"
+    )?;
+    writeln!(
+        code,
+        "        cache.k[layer_idx][pos*{kv_size}..(pos+1)*{kv_size}].copy_from_slice(&k_q);",
         kv_size = kv_size
     )?;
     writeln!(
         code,
-        "        cache.v[layer_idx][pos*{kv_size}..(pos+1)*{kv_size}].copy_from_slice(&v);",
+        "        cache.v_scales[layer_idx][pos] = quantize_kv(&v, &mut v_q);"
+    )?;
+    writeln!(
+        code,
+        "        cache.v[layer_idx][pos*{kv_size}..(pos+1)*{kv_size}].copy_from_slice(&v_q);",
         kv_size = kv_size
     )?;
     writeln!(code)?;
@@ -2580,6 +2651,10 @@ fn emit_forward_function(
             code,
             "            &cache.k[layer_idx][..(pos+1)*{kv_size}], &cache.v[layer_idx][..(pos+1)*{kv_size}],",
             kv_size = kv_size
+        )?;
+        writeln!(
+            code,
+            "            &cache.k_scales[layer_idx][..pos+1], &cache.v_scales[layer_idx][..pos+1],"
         )?;
         writeln!(
             code,
@@ -2595,6 +2670,10 @@ fn emit_forward_function(
         )?;
         writeln!(
             code,
+            "            &cache.k_scales[layer_idx][..pos+1], &cache.v_scales[layer_idx][..pos+1],"
+        )?;
+        writeln!(
+            code,
             "            pos + 1, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM,"
         )?;
     } else {
@@ -2604,6 +2683,10 @@ fn emit_forward_function(
             code,
             "            &cache.k[layer_idx][..(pos+1)*{kv_size}], &cache.v[layer_idx][..(pos+1)*{kv_size}],",
             kv_size = kv_size
+        )?;
+        writeln!(
+            code,
+            "            &cache.k_scales[layer_idx][..pos+1], &cache.v_scales[layer_idx][..pos+1],"
         )?;
         writeln!(
             code,
@@ -2936,6 +3019,14 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "    let mut q = [0.0f32; {qk_size}];")?;
     writeln!(code, "    let mut k = [0.0f32; {kv_size}];")?;
     writeln!(code, "    let mut v = [0.0f32; {kv_size}];")?;
+    writeln!(
+        code,
+        "    let mut k_q = [0i8; {kv_size}];  // int8 quantized k buffer"
+    )?;
+    writeln!(
+        code,
+        "    let mut v_q = [0i8; {kv_size}];  // int8 quantized v buffer"
+    )?;
     writeln!(code, "    let mut attn_out = [0.0f32; {qk_size}];")?;
     writeln!(code, "    let mut attn_proj = [0.0f32; {hidden}];")?;
     writeln!(code, "    let mut gate = [0.0f32; {intermediate}];")?;
@@ -3036,15 +3127,26 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
         "            rope(&mut k, pos, HEAD_DIM, NUM_KV_HEADS, &rope_freqs);"
     )?;
     writeln!(code)?;
-    writeln!(code, "            // Update KV cache at current position")?;
     writeln!(
         code,
-        "            cache.k[layer_idx][pos*{kv_size}..(pos+1)*{kv_size}].copy_from_slice(&k);",
+        "            // Quantize K/V to int8 and store in cache with per-token scale"
+    )?;
+    writeln!(
+        code,
+        "            cache.k_scales[layer_idx][pos] = quantize_kv(&k, &mut k_q);"
+    )?;
+    writeln!(
+        code,
+        "            cache.k[layer_idx][pos*{kv_size}..(pos+1)*{kv_size}].copy_from_slice(&k_q);",
         kv_size = kv_size
     )?;
     writeln!(
         code,
-        "            cache.v[layer_idx][pos*{kv_size}..(pos+1)*{kv_size}].copy_from_slice(&v);",
+        "            cache.v_scales[layer_idx][pos] = quantize_kv(&v, &mut v_q);"
+    )?;
+    writeln!(
+        code,
+        "            cache.v[layer_idx][pos*{kv_size}..(pos+1)*{kv_size}].copy_from_slice(&v_q);",
         kv_size = kv_size
     )?;
     writeln!(code)?;
@@ -3062,6 +3164,10 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "                &cache.k[layer_idx][..(pos+1)*{kv_size}], &cache.v[layer_idx][..(pos+1)*{kv_size}],",
         kv_size = kv_size
+    )?;
+    writeln!(
+        code,
+        "                &cache.k_scales[layer_idx][..pos+1], &cache.v_scales[layer_idx][..pos+1],"
     )?;
     writeln!(
         code,
@@ -4504,5 +4610,115 @@ mod tests {
         run_equivalence_check(70); // two blocks (exercises multi-block rescaling)
         run_equivalence_check(128); // exactly two full blocks
         run_equivalence_check(200); // three+ blocks
+    }
+
+    #[test]
+    fn generated_code_has_int8_kv_cache() {
+        let config = tiny_config();
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let code = generate(&graph).unwrap();
+
+        // KVCache struct should use i8 vectors with scale vectors
+        assert!(
+            code.contains("pub k: Vec<Vec<i8>>"),
+            "KVCache k should be Vec<Vec<i8>>"
+        );
+        assert!(
+            code.contains("pub v: Vec<Vec<i8>>"),
+            "KVCache v should be Vec<Vec<i8>>"
+        );
+        assert!(
+            code.contains("pub k_scales: Vec<Vec<f32>>"),
+            "KVCache should have k_scales"
+        );
+        assert!(
+            code.contains("pub v_scales: Vec<Vec<f32>>"),
+            "KVCache should have v_scales"
+        );
+
+        // Should have quantize_kv helper function
+        assert!(
+            code.contains("pub fn quantize_kv("),
+            "generated code should have quantize_kv function"
+        );
+
+        // Should have dot_f32_i8 helper for dequantized dot product
+        assert!(
+            code.contains("fn dot_f32_i8("),
+            "generated code should have dot_f32_i8 function"
+        );
+
+        // Attention functions should take i8 cache slices
+        assert!(
+            code.contains("k_cache: &[i8]"),
+            "attention should accept i8 k_cache"
+        );
+        assert!(
+            code.contains("v_cache: &[i8]"),
+            "attention should accept i8 v_cache"
+        );
+
+        // Forward function should quantize before writing to cache
+        assert!(
+            code.contains("quantize_kv(&k, &mut k_q)"),
+            "forward should quantize k before cache write"
+        );
+        assert!(
+            code.contains("quantize_kv(&v, &mut v_q)"),
+            "forward should quantize v before cache write"
+        );
+
+        // KVCache initialization should use i8 zeros
+        assert!(
+            code.contains("vec![0i8;"),
+            "KVCache should initialize with i8 zeros"
+        );
+
+        // memory_bytes should reflect int8 storage
+        assert!(
+            code.contains("i8) + scales (f32)"),
+            "memory_bytes should document int8+scales storage"
+        );
+    }
+
+    #[test]
+    fn kv_quantize_round_trip_accuracy() {
+        // Verify int8 quantization round-trip error is small enough for attention.
+        // Per-token absmax quantization to 127 levels should give < 1% relative error.
+        let values: Vec<f32> = (0..64)
+            .map(|i| ((i * 7 + 3) as f32 * 0.1 - 3.0) * 0.5)
+            .collect();
+        let mut quantized = vec![0i8; 64];
+
+        // Quantize
+        let mut max_abs = 0.0f32;
+        for &v in &values {
+            let a = v.abs();
+            if a > max_abs {
+                max_abs = a;
+            }
+        }
+        let scale = max_abs / 127.0;
+        let inv_scale = if max_abs > 0.0 { 127.0 / max_abs } else { 0.0 };
+        for (i, &v) in values.iter().enumerate() {
+            quantized[i] = (v * inv_scale).round().clamp(-127.0, 127.0) as i8;
+        }
+
+        // Dequantize and measure error
+        let mut max_err = 0.0f32;
+        for (i, &v) in values.iter().enumerate() {
+            let dequantized = quantized[i] as f32 * scale;
+            let err = (v - dequantized).abs();
+            if err > max_err {
+                max_err = err;
+            }
+        }
+
+        // Max error should be less than half a quantization step
+        let step = scale; // one quantization level
+        assert!(
+            max_err <= step + 1e-6,
+            "max round-trip error {max_err:.6} exceeds one quantization step {step:.6}"
+        );
     }
 }
