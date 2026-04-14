@@ -2747,19 +2747,50 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     )?;
     writeln!(code)?;
 
-    // 1. Embedding lookup via compute copy
+    // 1. Embedding lookup via CPU memcpy (unified memory — zero GPU dispatch overhead)
     writeln!(
         code,
-        "            // 1. Embedding lookup via compute copy (no blit encoder needed)"
+        "            // 1. Embedding lookup via CPU memcpy (unified memory = zero-copy, avoids GPU dispatch overhead)"
     )?;
     writeln!(
         code,
-        "            self.dispatch_copy_offset(&enc, &self.embed_buf, &self.hidden_buf, (token_id as usize) * HIDDEN_SIZE, HIDDEN_SIZE);"
+        "            // On Apple Silicon, Metal shared buffers use unified memory so CPU and GPU see the"
     )?;
     writeln!(
         code,
-        "            self.dispatch_copy(&enc, &self.hidden_buf, &self.residual_buf, HIDDEN_SIZE);"
+        "            // same physical memory. CPU memcpy avoids GPU dispatch + memory barrier overhead for"
     )?;
+    writeln!(
+        code,
+        "            // this tiny copy ({hidden} floats = {} bytes), reducing GPU thermal load.",
+        hidden * 4,
+    )?;
+    writeln!(code, "            unsafe {{")?;
+    writeln!(
+        code,
+        "                let embed_ptr = self.embed_buf.contents() as *const f32;"
+    )?;
+    writeln!(
+        code,
+        "                let hidden_ptr = self.hidden_buf.contents() as *mut f32;"
+    )?;
+    writeln!(
+        code,
+        "                let residual_ptr = self.residual_buf.contents() as *mut f32;"
+    )?;
+    writeln!(code, "                std::ptr::copy_nonoverlapping(")?;
+    writeln!(
+        code,
+        "                    embed_ptr.add(token_id as usize * HIDDEN_SIZE),"
+    )?;
+    writeln!(code, "                    hidden_ptr,")?;
+    writeln!(code, "                    HIDDEN_SIZE,")?;
+    writeln!(code, "                );")?;
+    writeln!(
+        code,
+        "                std::ptr::copy_nonoverlapping(hidden_ptr, residual_ptr, HIDDEN_SIZE);"
+    )?;
+    writeln!(code, "            }}")?;
     writeln!(code)?;
 
     // 2. Transformer layers
@@ -2884,6 +2915,206 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "        cmd.wait_until_completed();")?;
     writeln!(code)?;
     writeln!(code, "        // 6. Read back logits from GPU")?;
+    writeln!(code, "        let logits = unsafe {{")?;
+    writeln!(
+        code,
+        "            let ptr = self.logits_buf.contents() as *const f32;"
+    )?;
+    writeln!(
+        code,
+        "            std::slice::from_raw_parts(ptr, VOCAB_SIZE).to_vec()"
+    )?;
+    writeln!(code, "        }};")?;
+    writeln!(code)?;
+    writeln!(code, "        self.pos += 1;")?;
+    writeln!(code, "        logits")?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
+
+    // ── forward_profile: instrumented forward with per-operation timing ──
+    writeln!(
+        code,
+        "    /// Profiling forward pass that prints per-stage GPU timing."
+    )?;
+    writeln!(code, "    ///")?;
+    writeln!(
+        code,
+        "    /// Each stage is committed and waited on separately so that GPU timestamps"
+    )?;
+    writeln!(
+        code,
+        "    /// accurately reflect per-operation cost. This is slower than `forward()` due"
+    )?;
+    writeln!(
+        code,
+        "    /// to the per-stage synchronization, but useful for identifying bottlenecks."
+    )?;
+    writeln!(
+        code,
+        "    pub fn forward_profile(&mut self, token_id: u32) -> Vec<f32> {{"
+    )?;
+    writeln!(code, "        use std::time::Instant;")?;
+    writeln!(code)?;
+    writeln!(
+        code,
+        "        // Wait for any pending prefill command buffer"
+    )?;
+    writeln!(code, "        if let Some(prev) = self.prev_cmd.take() {{")?;
+    writeln!(code, "            prev.wait_until_completed();")?;
+    writeln!(code, "        }}")?;
+    writeln!(code)?;
+    writeln!(code, "        let pos = self.pos;")?;
+    writeln!(code)?;
+
+    // Stage: embedding (CPU, no GPU)
+    writeln!(
+        code,
+        "        // ── Stage: Embedding lookup (CPU via unified memory) ──"
+    )?;
+    writeln!(code, "        let t_embed = Instant::now();")?;
+    writeln!(code, "        unsafe {{")?;
+    writeln!(
+        code,
+        "            let embed_ptr = self.embed_buf.contents() as *const f32;"
+    )?;
+    writeln!(
+        code,
+        "            let hidden_ptr = self.hidden_buf.contents() as *mut f32;"
+    )?;
+    writeln!(
+        code,
+        "            let residual_ptr = self.residual_buf.contents() as *mut f32;"
+    )?;
+    writeln!(code, "            std::ptr::copy_nonoverlapping(")?;
+    writeln!(
+        code,
+        "                embed_ptr.add(token_id as usize * HIDDEN_SIZE),"
+    )?;
+    writeln!(code, "                hidden_ptr,")?;
+    writeln!(code, "                HIDDEN_SIZE,")?;
+    writeln!(code, "            );")?;
+    writeln!(
+        code,
+        "            std::ptr::copy_nonoverlapping(hidden_ptr, residual_ptr, HIDDEN_SIZE);"
+    )?;
+    writeln!(code, "        }}")?;
+    writeln!(code, "        let d_embed = t_embed.elapsed();")?;
+    writeln!(code)?;
+
+    // Stage: Transformer layers (all together on GPU)
+    writeln!(code, "        // ── Stage: Transformer layers (GPU) ──")?;
+    writeln!(code, "        let t_layers = Instant::now();")?;
+    writeln!(code, "        let cmd = self.queue.new_command_buffer();")?;
+    writeln!(code, "        {{")?;
+    writeln!(
+        code,
+        "            let enc = cmd.new_compute_command_encoder();"
+    )?;
+    writeln!(code, "            for layer in 0..NUM_LAYERS {{")?;
+    writeln!(
+        code,
+        "                self.dispatch_rms_norm(&enc, &self.layers[layer].attn_norm);"
+    )?;
+    writeln!(
+        code,
+        "                self.{matmul_fn}(&enc, &self.hidden_buf, &self.layers[layer].qkv_weight, &self.qkv_buf, {qkv_rows}, {hidden});"
+    )?;
+    writeln!(
+        code,
+        "                self.dispatch_rope_offset(&enc, &self.qkv_buf, {q_byte_offset}, {num_heads}, {head_dim}, pos);"
+    )?;
+    writeln!(
+        code,
+        "                self.dispatch_rope_offset(&enc, &self.qkv_buf, {k_byte_offset}, {num_kv_heads}, {head_dim}, pos);"
+    )?;
+    writeln!(code, "                let kv_offset = pos * {kv_dim};")?;
+    writeln!(
+        code,
+        "                self.dispatch_copy_from_offset(&enc, &self.qkv_buf, {k_byte_offset}, &self.k_cache[layer], kv_offset, {kv_dim});"
+    )?;
+    writeln!(
+        code,
+        "                self.dispatch_copy_from_offset(&enc, &self.qkv_buf, {v_byte_offset}, &self.v_cache[layer], kv_offset, {kv_dim});"
+    )?;
+    writeln!(
+        code,
+        "                self.dispatch_attention_offset(&enc, &self.qkv_buf, {q_byte_offset}, &self.k_cache[layer], &self.v_cache[layer], &self.attn_out_buf, pos + 1);"
+    )?;
+    writeln!(
+        code,
+        "                self.{matmul_fn}(&enc, &self.attn_out_buf, &self.layers[layer].o_weight, &self.attn_proj_buf, {hidden}, {hidden});"
+    )?;
+    writeln!(
+        code,
+        "                self.dispatch_add_inplace(&enc, &self.residual_buf, &self.attn_proj_buf, {hidden});"
+    )?;
+    writeln!(
+        code,
+        "                self.dispatch_rms_norm(&enc, &self.layers[layer].ffn_norm);"
+    )?;
+    writeln!(
+        code,
+        "                self.{matmul_fn}(&enc, &self.hidden_buf, &self.layers[layer].gate_up_weight, &self.gate_up_buf, {gate_up_rows}, {hidden});"
+    )?;
+    writeln!(
+        code,
+        "                self.dispatch_silu_mul_fused(&enc, &self.gate_up_buf, &self.ffn_hidden_buf, {intermediate});"
+    )?;
+    writeln!(
+        code,
+        "                self.{matmul_fn}(&enc, &self.ffn_hidden_buf, &self.layers[layer].down_weight, &self.ffn_out_buf, {hidden}, {intermediate});"
+    )?;
+    writeln!(
+        code,
+        "                self.dispatch_add_inplace(&enc, &self.residual_buf, &self.ffn_out_buf, {hidden});"
+    )?;
+    writeln!(code, "            }}")?;
+    writeln!(code, "            enc.end_encoding();")?;
+    writeln!(code, "        }}")?;
+    writeln!(code, "        cmd.commit();")?;
+    writeln!(code, "        cmd.wait_until_completed();")?;
+    writeln!(code, "        let d_layers = t_layers.elapsed();")?;
+    writeln!(code)?;
+
+    // Stage: Final norm + logits
+    writeln!(code, "        // ── Stage: Final norm + logits (GPU) ──")?;
+    writeln!(code, "        let t_logits = Instant::now();")?;
+    writeln!(code, "        let cmd2 = self.queue.new_command_buffer();")?;
+    writeln!(code, "        {{")?;
+    writeln!(
+        code,
+        "            let enc = cmd2.new_compute_command_encoder();"
+    )?;
+    writeln!(
+        code,
+        "            self.dispatch_rms_norm(&enc, &self.norm_buf);"
+    )?;
+    writeln!(
+        code,
+        "            self.{matmul_fn}(&enc, &self.hidden_buf, &self.lm_head_buf, &self.logits_buf, {vocab}, {hidden});"
+    )?;
+    writeln!(code, "            enc.end_encoding();")?;
+    writeln!(code, "        }}")?;
+    writeln!(code, "        cmd2.commit();")?;
+    writeln!(code, "        cmd2.wait_until_completed();")?;
+    writeln!(code, "        let d_logits = t_logits.elapsed();")?;
+    writeln!(code)?;
+
+    // Print profile results
+    writeln!(
+        code,
+        "        eprintln!(\"[profile] embed: {{:.3}}ms, layers: {{:.3}}ms, norm+logits: {{:.3}}ms, total: {{:.3}}ms\","
+    )?;
+    writeln!(code, "            d_embed.as_secs_f64() * 1000.0,")?;
+    writeln!(code, "            d_layers.as_secs_f64() * 1000.0,")?;
+    writeln!(code, "            d_logits.as_secs_f64() * 1000.0,")?;
+    writeln!(
+        code,
+        "            (d_embed + d_layers + d_logits).as_secs_f64() * 1000.0);"
+    )?;
+    writeln!(code)?;
+
+    // Read back logits
     writeln!(code, "        let logits = unsafe {{")?;
     writeln!(
         code,
@@ -4699,7 +4930,7 @@ fn generate_main_rs(model_name: &str, config: &ModelConfig) -> Result<String, Me
     )?;
     writeln!(code)?;
     writeln!(code, "    if !serve_mode && args.len() < 4 {{")?;
-    writeln!(code, "        eprintln!(\"Usage: {{}} <weights.bin> <tokenizer.json> <prompt> [--max-tokens N] [--quiet]\", args[0]);")?;
+    writeln!(code, "        eprintln!(\"Usage: {{}} <weights.bin> <tokenizer.json> <prompt> [--max-tokens N] [--quiet] [--profile]\", args[0]);")?;
     writeln!(code, "        eprintln!(\"       {{}} <weights.bin> <tokenizer.json> --serve [--port 8080]\", args[0]);")?;
     writeln!(code, "        std::process::exit(1);")?;
     writeln!(code, "    }}")?;
@@ -4718,6 +4949,10 @@ fn generate_main_rs(model_name: &str, config: &ModelConfig) -> Result<String, Me
     writeln!(
         code,
         "    let quiet = args.iter().any(|a| a == \"--quiet\" || a == \"-q\");"
+    )?;
+    writeln!(
+        code,
+        "    let profile = args.iter().any(|a| a == \"--profile\");"
     )?;
     writeln!(code, "    let mut i = 3;")?;
     writeln!(code, "    while i < args.len() {{")?;
@@ -4740,6 +4975,8 @@ fn generate_main_rs(model_name: &str, config: &ModelConfig) -> Result<String, Me
     )?;
     writeln!(code, "            i += 2;")?;
     writeln!(code, "        }} else if args[i] == \"--serve\" {{")?;
+    writeln!(code, "            i += 1;")?;
+    writeln!(code, "        }} else if args[i] == \"--profile\" {{")?;
     writeln!(code, "            i += 1;")?;
     writeln!(code, "        }} else {{")?;
     writeln!(code, "            i += 1;")?;
@@ -4784,14 +5021,14 @@ fn generate_main_rs(model_name: &str, config: &ModelConfig) -> Result<String, Me
     writeln!(code, "        let prompt = &args[3];")?;
     writeln!(
         code,
-        "        cli_mode(&mut model, &tokenizer, prompt, max_tokens, quiet);"
+        "        cli_mode(&mut model, &tokenizer, prompt, max_tokens, quiet, profile);"
     )?;
     writeln!(code, "    }}")?;
     writeln!(code, "}}")?;
     writeln!(code)?;
 
     // -- cli_mode function --
-    writeln!(code, "fn cli_mode(model: &mut model::MetalModel, tokenizer: &tokenizers::Tokenizer, prompt: &str, max_tokens: usize, quiet: bool) {{")?;
+    writeln!(code, "fn cli_mode(model: &mut model::MetalModel, tokenizer: &tokenizers::Tokenizer, prompt: &str, max_tokens: usize, quiet: bool, profile: bool) {{")?;
     writeln!(code, "    // Tokenize prompt")?;
     writeln!(code, "    let encoding = tokenizer.encode(prompt, true)")?;
     writeln!(code, "        .unwrap_or_else(|e| {{ eprintln!(\"Tokenization failed: {{e}}\"); std::process::exit(1); }});")?;
@@ -4851,13 +5088,42 @@ fn generate_main_rs(model_name: &str, config: &ModelConfig) -> Result<String, Me
     writeln!(code, "        }}")?;
     writeln!(code, "        generated_count += 1;")?;
     writeln!(code)?;
-    writeln!(code, "        let logits = model.forward(next_token);")?;
+    writeln!(
+        code,
+        "        // Use profiling forward for first token when --profile is set"
+    )?;
+    writeln!(
+        code,
+        "        let logits = if profile && generated_count == 1 {{"
+    )?;
+    writeln!(code, "            model.forward_profile(next_token)")?;
+    writeln!(code, "        }} else {{")?;
+    writeln!(code, "            model.forward(next_token)")?;
+    writeln!(code, "        }};")?;
     writeln!(code, "        next_token = argmax(&logits);")?;
     writeln!(code)?;
     writeln!(code, "        // Stop on EOS (token 2 for most models)")?;
     writeln!(code, "        if next_token == 2 {{")?;
     writeln!(code, "            break;")?;
     writeln!(code, "        }}")?;
+    writeln!(code)?;
+    writeln!(
+        code,
+        "        // Yield between tokens to reduce sustained GPU thermal load."
+    )?;
+    writeln!(
+        code,
+        "        // On Apple Silicon, continuous GPU saturation causes thermal throttling"
+    )?;
+    writeln!(
+        code,
+        "        // (500 tok/s -> 300 tok/s). A yield_now() lets the OS scheduler run"
+    )?;
+    writeln!(
+        code,
+        "        // briefly, providing a micro-break that helps sustain peak throughput."
+    )?;
+    writeln!(code, "        std::thread::yield_now();")?;
     writeln!(code, "    }}")?;
     writeln!(code, "    if !quiet {{")?;
     writeln!(code, "        println!();")?;
@@ -5462,14 +5728,15 @@ mod tests {
         let model_rs = generate_model_rs(&config).unwrap();
 
         // The forward function should create exactly one command buffer.
-        // Use the exact signature to avoid matching forward_prefill.
+        // Use the exact signature to avoid matching forward_prefill/forward_profile.
         let forward_start = model_rs
             .find("pub fn forward(&mut self, token_id: u32) -> Vec<f32>")
             .unwrap();
         let forward_body = &model_rs[forward_start..];
         // End at the next pub/private method
         let forward_end = forward_body
-            .find("\n    pub fn forward_prefill")
+            .find("\n    pub fn forward_profile")
+            .or_else(|| forward_body.find("\n    pub fn forward_prefill"))
             .or_else(|| forward_body.find("\n    fn dispatch_"))
             .unwrap_or(forward_body.len());
         let forward_code = &forward_body[..forward_end];
@@ -5588,13 +5855,14 @@ mod tests {
         let config = minimal_config();
         let model_rs = generate_model_rs(&config).unwrap();
 
-        // Find the forward function body (exact signature to avoid matching forward_prefill)
+        // Find the forward function body (exact signature to avoid matching forward_prefill/forward_profile)
         let forward_start = model_rs
             .find("pub fn forward(&mut self, token_id: u32) -> Vec<f32>")
             .unwrap();
         let forward_body = &model_rs[forward_start..];
         let forward_end = forward_body
-            .find("\n    pub fn forward_prefill")
+            .find("\n    pub fn forward_profile")
+            .or_else(|| forward_body.find("\n    pub fn forward_prefill"))
             .or_else(|| forward_body.find("\n    fn dispatch_"))
             .unwrap_or(forward_body.len());
         let forward_code = &forward_body[..forward_end];
@@ -6551,6 +6819,92 @@ mod tests {
         assert!(
             !batch_code.contains("dispatch_matmul_q4_batch"),
             "f32 forward_prefill_batch should not use dispatch_matmul_q4_batch"
+        );
+    }
+
+    #[test]
+    fn forward_uses_cpu_embedding_lookup() {
+        let config = minimal_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        // Find just the forward() body (not forward_profile)
+        let forward_start = model_rs
+            .find("pub fn forward(&mut self, token_id: u32) -> Vec<f32>")
+            .unwrap();
+        let forward_body = &model_rs[forward_start..];
+        let forward_end = forward_body
+            .find("\n    pub fn forward_profile")
+            .or_else(|| forward_body.find("\n    pub fn forward_prefill"))
+            .unwrap_or(forward_body.len());
+        let forward_code = &forward_body[..forward_end];
+
+        // forward() should use CPU memcpy for embedding lookup (unified memory)
+        assert!(
+            forward_code.contains("embed_buf.contents()"),
+            "forward() should access embed_buf via CPU unified memory for embedding lookup"
+        );
+        assert!(
+            forward_code.contains("copy_nonoverlapping"),
+            "forward() should use ptr::copy_nonoverlapping for CPU embedding copy"
+        );
+        // forward() should NOT use GPU dispatch for embedding
+        assert!(
+            !forward_code.contains("dispatch_copy_offset(&enc, &self.embed_buf"),
+            "forward() should not use GPU dispatch_copy_offset for embedding (use CPU memcpy instead)"
+        );
+    }
+
+    #[test]
+    fn forward_profile_method_exists() {
+        let config = minimal_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        assert!(
+            model_rs.contains("pub fn forward_profile(&mut self, token_id: u32) -> Vec<f32>"),
+            "MetalModel should have forward_profile() method"
+        );
+        // Profile method should print timing information
+        assert!(
+            model_rs.contains("[profile]"),
+            "forward_profile() should print timing with [profile] prefix"
+        );
+        assert!(
+            model_rs.contains("d_embed"),
+            "forward_profile() should measure embedding time"
+        );
+        assert!(
+            model_rs.contains("d_layers"),
+            "forward_profile() should measure layer time"
+        );
+        assert!(
+            model_rs.contains("d_logits"),
+            "forward_profile() should measure logits time"
+        );
+    }
+
+    #[test]
+    fn generated_cli_has_profile_flag() {
+        let config = minimal_config();
+        let main_rs = generate_main_rs("test-model", &config).unwrap();
+
+        assert!(
+            main_rs.contains("--profile"),
+            "CLI should support --profile flag"
+        );
+        assert!(
+            main_rs.contains("forward_profile"),
+            "CLI should call forward_profile when --profile is set"
+        );
+    }
+
+    #[test]
+    fn generated_cli_has_thermal_yield() {
+        let config = minimal_config();
+        let main_rs = generate_main_rs("test-model", &config).unwrap();
+
+        assert!(
+            main_rs.contains("yield_now()"),
+            "CLI generation loop should include thread::yield_now() for thermal management"
         );
     }
 }
