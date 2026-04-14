@@ -18,5 +18,5 @@ forgellm-optimizer = { workspace = true }
 forgellm-codegen-cpu   = { workspace = true }
 forgellm-codegen-metal = { workspace = true }
 forgellm-runtime   = { workspace = true }
-pyo3 = { version = "0.21", features = ["extension-module"] }
+pyo3 = { version = "0.24", features = ["extension-module"] }
 anyhow = { workspace = true }
