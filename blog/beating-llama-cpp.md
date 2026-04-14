@@ -156,4 +156,104 @@ ForgeLLM is open source under the MIT license. Contributions welcome.
 
 ---
 
+## The honest competitive landscape
+
+We beat llama.cpp. But llama.cpp isn't the only game in town. Here's how ForgeLLM fits into the broader ecosystem — including who could beat us.
+
+### The inference engine spectrum
+
+```
+More flexible                                              More optimized
+     |                                                            |
+  PyTorch   →   vLLM   →   llama.cpp   →   MLC-LLM   →   ForgeLLM
+  (eager)     (batched)    (runtime)      (compiler)      (AOT compiler)
+```
+
+Each step right trades flexibility for speed. ForgeLLM is the furthest right — maximum optimization, minimum flexibility.
+
+### Comparison across all dimensions
+
+| | PyTorch | vLLM | llama.cpp | MLC-LLM | MLX | ForgeLLM |
+|---|---|---|---|---|---|---|
+| **Approach** | Eager/JIT | Runtime + PagedAttn | Runtime interpreter | TVM AOT compiler | Apple framework | Rust AOT compiler |
+| **Training** | Yes | No | No | No | Yes | No |
+| **Apple Metal** | Limited | No | Yes | Yes | Yes (native) | Yes |
+| **NVIDIA CUDA** | Yes | Yes | Yes (cuBLAS) | Yes | No | **No** |
+| **Quantization** | Varies | AWQ/GPTQ | GGUF (Q2-Q8) | TVM quant | 4/8-bit | GGUF Q4/Q8 |
+| **Batching** | Yes | Yes (paged) | Limited | Yes | Yes | **No (single stream)** |
+| **Multi-GPU** | Yes | Yes | Partial | Yes | No | **No** |
+| **Neural Engine** | No | No | No | No | **Yes** | **No** |
+| **Dependencies** | Python + CUDA | Python + CUDA | C++ lib | Python + TVM | Python + Metal | **None** |
+| **Output** | Python script | Server process | C++ app | Compiled lib | Python script | **Self-contained binary** |
+| **Dynamic shapes** | Yes | Yes | Yes | Limited | Yes | **No (baked in)** |
+| **Model swap** | Hot swap | Hot swap | Hot swap | Recompile | Hot swap | **Recompile** |
+| **Compile time** | 0 | 0 | 0 | Minutes | 0 | **30 seconds** |
+| **Lines to deploy** | 20+ pip | Docker | Single binary | pip + compile | pip | `cargo build` |
+
+### Who could beat us (and where)
+
+**MLC-LLM (Apache TVM) — most directly comparable**
+
+MLC-LLM takes the same compiler approach: read model weights, generate target-specific code, compile to native binary. They have:
+- 4+ years of TVM compiler infrastructure
+- Auto-tuning for kernel optimization (we hand-tune)
+- CUDA, Vulkan, Metal, WebGPU, OpenCL backends
+- More mature quantization support
+
+MLC-LLM is the project we should benchmark against next. They're the real competition in the "compiled LLM inference" space. Our advantage is simpler toolchain (Rust + cargo, no Python/TVM dependency) and inspectable output.
+
+**MLX (Apple) — platform advantage**
+
+Apple's own ML framework has access to private APIs and hardware features:
+- Can target the Apple Neural Engine (ANE) — 15+ TOPS on M-series
+- Deep Metal integration with undocumented optimizations
+- Unified memory management that third parties can't replicate
+- If ANE is used, potentially 5-10x faster than any GPU-only approach
+
+We can never access the Neural Engine. This is Apple's unfair advantage.
+
+**TensorRT-LLM / vLLM (NVIDIA) — different hardware**
+
+On NVIDIA GPUs with tensor cores, FP8 support, and PagedAttention, these engines would crush any Apple Silicon approach. We don't have a CUDA backend and likely won't build one — the NVIDIA ecosystem is well-served already.
+
+**llama.cpp (continued development) — closing the gap**
+
+llama.cpp has a massive contributor community and continues improving. Our llama.cpp benchmark advantage could narrow over time as they optimize their Metal backend. Their v0.10+ releases may close the gap we measured against v0.9.11.
+
+### Where ForgeLLM wins
+
+1. **Zero-dependency deployment** — No Python, no runtime, no shared libraries. Output is a Rust project that compiles to a static binary. Deploy to any machine with `scp`.
+
+2. **Inspectable generated code** — The output is readable Rust and Metal Shading Language. You can see every matmul, every attention computation, every memory allocation. Debug by reading the code, not by attaching to a runtime.
+
+3. **Embeddable as a library** — Generated code is a Rust library crate. Import it into your own application with `use my_model::MetalModel;`. No FFI, no IPC, no server process.
+
+4. **Deterministic behavior** — Same input always produces the same output. No runtime graph optimization that might change between versions. The binary IS the model.
+
+5. **Small model excellence** — For models under 3B parameters on Apple Silicon, we're the fastest option that doesn't require Apple's private APIs. This is the edge/mobile/embedded sweet spot.
+
+### Where ForgeLLM loses
+
+1. **No CUDA** — If you have an NVIDIA GPU, use TensorRT-LLM or vLLM.
+2. **No batching** — If you need to serve multiple concurrent users, use vLLM.
+3. **No training** — If you need to fine-tune, use PyTorch.
+4. **No Neural Engine** — If you want maximum Apple Silicon throughput, MLX/CoreML can access hardware we can't.
+5. **Recompile per model** — If you swap models frequently, an interpreter is more practical.
+6. **Limited model support** — We support 6 architectures. llama.cpp supports 20+.
+
+### The bottom line
+
+ForgeLLM occupies a specific niche: **compiled, self-contained, zero-dependency LLM inference on Apple Silicon**. In that niche, we're competitive with or faster than everything else. Outside that niche, other tools are better choices.
+
+The compiler approach is the right one for:
+- Edge devices with fixed models
+- Embedded systems where Python isn't available
+- Applications that need LLM inference as a library, not a server
+- Situations where you want to audit exactly what the inference code does
+- Apple Silicon deployment where you want Metal GPU without MLX/CoreML
+
+We're not trying to replace llama.cpp or vLLM for everyone. We're building the best tool for the "compile once, deploy anywhere, inspect everything" use case.
+
+---
+
 *Benchmarks run on Apple M5 Pro, Q8_0 quantization, 64-token generation. llama.cpp v0.9.11 (build 15f786e65) with default Metal backend. ForgeLLM v0.5.0.*
