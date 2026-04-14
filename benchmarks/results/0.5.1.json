@@ -1,0 +1,26 @@
+{
+  "version": "0.5.1",
+  "date": "2026-04-14T23:01:52Z",
+  "system": {
+    "os": "Darwin",
+    "arch": "arm64",
+    "cpu": "Apple M5 Pro",
+    "cores": "18"
+  },
+  "model": {
+    "name": "SmolLM2-135M-Instruct",
+    "quant": "Q8_0",
+    "params": "135M"
+  },
+  "benchmarks": {
+    "aot": {
+      "generate_tok_s_best": 90.4,
+      "generate_tok_s_avg": 88.1,
+      "num_tokens": 64,
+      "runs": 3,
+      "build_time_s": 33,
+      "total_compile_time_s": 36,
+      "binary_size_mb": 2.9
+    }
+  }
+}

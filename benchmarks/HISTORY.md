@@ -114,3 +114,4 @@ Results are saved to `benchmarks/results/<version>.json` and appended to this fi
 | v0.4.0 | 2026-04-13 | 128.8 | 219.2 (best: 221.8) | 29s | 2.8 MB | Darwin arm64 18c |
 | v0.4.0 | 2026-04-13 | - | 188.7 (best: 192.1) | 31s | 2.8 MB | Darwin arm64 18c |
 | v0.4.0 | 2026-04-14 | - | 143.7 (best: 196.0) | 33s | 2.8 MB | Darwin arm64 18c |
+| v0.5.1 | 2026-04-14 | - | 88.1 (best: 90.4) | 33s | 2.9 MB | Darwin arm64 18c |
