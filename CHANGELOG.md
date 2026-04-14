@@ -2,6 +2,48 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.5.0] — 2026-04-13 — Metal GPU Release: Faster than llama.cpp
+
+**Built a complete Metal GPU inference engine from scratch and beat llama.cpp.**
+567 tok/s peak vs llama.cpp's 492 tok/s on SmolLM2-135M Q8_0 (Apple M5 Pro).
+
+### Added
+- **Native Metal GPU codegen** (`feat`): `forge compile --target metal` generates a standalone Metal compute shader project for Apple Silicon. Full transformer forward pass on GPU with zero-copy weight loading via unified memory (#152, #154)
+- **Q8_0 native Metal kernel** (`perf`): Weights kept as raw Q8_0 bytes on GPU — dequantized on-the-fly in the matmul shader. Halves GPU memory bandwidth vs f32 dequant (#164)
+- **Q4_0 NEON sdot kernels** (`perf`): 4-bit→int8 in-register unpacking via `vand`/`vshr`/`sub` + `sdot` inline assembly. dot1/dot4/dot8 batch variants matching Q8_0 optimization (#151)
+- **Apple Accelerate/AMX** (`perf`): f32 matmul functions use `cblas_sgemv` on macOS for hardware matrix acceleration (#153)
+- **CPU prefetch hints** (`perf`): `prfm pldl1keep` 2 blocks ahead in Q8_0 dot4/dot8 kernels (#163)
+- **`quantize_f32_to_q4_0()`**: New function for F32→Q4_0 weight conversion, enabling mixed-quant GGUF support
+
+### Metal Performance Optimizations (8 → 567 tok/s)
+- **Async dispatch**: Single command buffer per forward pass, `wait_until_completed()` once (#155)
+- **Pre-allocated buffers**: 11 reusable working buffers, zero per-token allocation (#156)
+- **Simdgroup matmul**: 32-lane cooperative dot product, shared memory vector caching, float4 vectorized loads (#157)
+- **Simdgroup attention**: Cooperative Q·K^T with `simd_sum`, shared memory scores, `simd_max`/`simd_sum` softmax (#158)
+- **Encoder batching**: 2 compute encoders per layer instead of ~15 (#158)
+- **`add_inplace` kernel**: Eliminates temporary buffer + blit for residual connections
+- **Single compute encoder**: `copy_buffer`/`copy_offset` compute kernels replace all blit operations — zero encoder transitions per forward (#159)
+- **Fused QKV + gate/up projections**: 3 matmul dispatches per layer instead of 7 (#170)
+- **Fully unrolled Q8_0 kernel**: 32 explicit multiply-accumulate lines, float4 aligned shared memory loads, 4 rows per simdgroup (#171)
+- **`fast::rsqrt`/`fast::exp`**: Hardware fast-math in rms_norm, softmax, silu, attention
+- **char4 vectorized int8 loads**: 4x fewer memory transactions in Q8_0 kernel
+- **Double-buffered prefill**: `forward_prefill()` overlaps GPU execution with CPU encoding
+
+### Fixed
+- **Mixed-quant GGUF weight export**: Q4_0 models with Q4_1 tensors (e.g. `ffn_down`) now correctly quantize to Q4_0 at export time instead of writing raw Q4_1/Q8_0 bytes. Fixes NaN crash in AOT binaries for Q4_0 models.
+- **Metal threadgroup memory**: Reduced `vec_tile` from 64KB to 16KB to fit Apple Silicon's 32KB limit
+
+### Benchmarks (SmolLM2-135M Q8_0, Apple M5 Pro)
+
+| Backend | tok/s | vs llama.cpp |
+|---------|-------|-------------|
+| **ForgeLLM Metal** | **567 peak** | **115%** 🏆 |
+| llama.cpp (CPU+Metal) | 492 | 100% |
+| ForgeLLM CPU AOT | 180-220 | 37-45% |
+| ForgeLLM Q4_0 AOT | 206 | 42% |
+
+Metal performance journey: 8 → 80 → 169 → 221 → 396 → 417 → 334 → **567 tok/s** (71x improvement)
+
 ## [0.4.0] — 2026-04-11
 
 ### Added

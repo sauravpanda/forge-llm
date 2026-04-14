@@ -1,6 +1,6 @@
 {
   "version": "0.4.0",
-  "date": "2026-04-13T21:33:55Z",
+  "date": "2026-04-14T00:03:20Z",
   "system": {
     "os": "Darwin",
     "arch": "arm64",
@@ -13,18 +13,13 @@
     "params": "135M"
   },
   "benchmarks": {
-    "interpreter": {
-      "generate_tok_s": 128.8,
-      "num_tokens": 64,
-      "runs": 3
-    }
-,    "aot": {
-      "generate_tok_s_best": 221.8,
-      "generate_tok_s_avg": 219.2,
+    "aot": {
+      "generate_tok_s_best": 196.0,
+      "generate_tok_s_avg": 143.7,
       "num_tokens": 64,
       "runs": 3,
-      "build_time_s": 29,
-      "total_compile_time_s": 31,
+      "build_time_s": 33,
+      "total_compile_time_s": 36,
       "binary_size_mb": 2.8
     }
   }
