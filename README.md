@@ -19,6 +19,7 @@ Benchmarks on Apple M5 Pro, 8-bit quantization, 64-token generation.
 | SmolLM2-135M | **496 tok/s** | 414 tok/s | 481 tok/s | **1.20x** | **1.03x** |
 | SmolLM2-360M | **289 tok/s** | 264 tok/s | 267 tok/s | **1.09x** | **1.08x** |
 | Llama-3.2-1B | **178 tok/s** | 111 tok/s | 130 tok/s | **1.60x** | **1.37x** |
+| Llama-3.2-3B | **70.4 tok/s** | 42.2 tok/s | 67.8 tok/s | **1.67x** | **1.04x** |
 
 ### Prefill Speed (tok/s, long prompt)
 
@@ -27,6 +28,16 @@ Benchmarks on Apple M5 Pro, 8-bit quantization, 64-token generation.
 | SmolLM2-135M (~130 tok) | **3,173** | 1,507 | 2,812 |
 | SmolLM2-135M (~1250 tok) | **9,335** | — | — |
 | Llama-3.2-1B (~325 tok) | 475 | **2,718** | 556 |
+
+### Deploy Size
+
+| Model | Binary | Weights | Total |
+|-------|--------|---------|-------|
+| SmolLM2-135M | 3.7 MB | 244 MB | 248 MB |
+| Llama-3.2-1B | 3.7 MB | 2.2 GB | 2.2 GB |
+| Llama-3.2-3B | 3.7 MB | 4.6 GB | 4.9 GB |
+
+Binary size is constant across all models. Compare: llama.cpp ~15 MB, MLX ~500 MB Python runtime.
 
 **We beat MLX and llama.cpp on generation across all model sizes, and on prefill for small-to-medium models.** For very large models (1B+), MLX's Apple Accelerate BLAS leads on prefill — closing that gap requires hardware matrix multiply instructions (`simdgroup_multiply_accumulate`).
 
