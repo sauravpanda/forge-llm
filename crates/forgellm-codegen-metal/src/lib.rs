@@ -1229,6 +1229,232 @@ kernel void matmul_vec_q8_batch(
     }
 }
 
+// ── matmul_q8_gemm_batch ───────────────────────────────────────────────
+// True GEMM-style Q8_0 kernel that reuses weight reads across a token tile.
+// Each threadgroup covers 32 rows and TOKENS_PER_TG consecutive tokens, so
+// the Q8_0 weight blocks are fetched once from device memory and reused for
+// every token in the tile (1/TOKENS_PER_TG the weight bandwidth of the
+// per-token dispatch).
+//
+// Grid: (ceil(rows/32), ceil(M/TOKENS_PER_TG)) threadgroups.
+// Each TG: 8 simdgroups * 4 rows = 32 rows; each simdgroup reduces over blocks
+// with simd_sum.  Token vectors are read directly from device memory inside
+// the block loop (not cached in shared memory) so intermediate_size up to
+// 8192 fits without spilling threadgroup memory.
+constant constexpr uint TOKENS_PER_TG_Q8 = 4;
+
+kernel void matmul_q8_gemm_batch(
+    device const uchar* matrix   [[buffer(0)]],  // Q8_0 raw bytes [rows, cols]
+    device const float* inputs   [[buffer(1)]],  // [M, cols] input batch
+    device float* outputs        [[buffer(2)]],  // [M, rows] output batch
+    constant uint& num_tokens    [[buffer(3)]],  // M
+    constant uint& rows          [[buffer(4)]],
+    constant uint& cols          [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]])
+{
+    uint row_base = tgid.x * Q8_ROWS_PER_TG + simd_id * Q8_ROWS_PER_SG;
+    uint tok_base = tgid.y * TOKENS_PER_TG_Q8;
+    if (row_base >= rows || tok_base >= num_tokens) return;
+
+    // How many tokens in this tile are valid?
+    uint tok_count = min(uint(TOKENS_PER_TG_Q8), num_tokens - tok_base);
+
+    uint blocks_per_row = cols / 32;
+    uint row_bytes = blocks_per_row * 34;
+
+    device const uchar* r0 = matrix + row_base * row_bytes;
+    device const uchar* r1 = matrix + (row_base + 1) * row_bytes;
+    device const uchar* r2 = matrix + (row_base + 2) * row_bytes;
+    device const uchar* r3 = matrix + (row_base + 3) * row_bytes;
+
+    // Accumulators: 4 tokens × 4 rows per simdgroup.
+    float s00 = 0, s01 = 0, s02 = 0, s03 = 0;
+    float s10 = 0, s11 = 0, s12 = 0, s13 = 0;
+    float s20 = 0, s21 = 0, s22 = 0, s23 = 0;
+    float s30 = 0, s31 = 0, s32 = 0, s33 = 0;
+
+    for (uint blk = simd_lane; blk < blocks_per_row; blk += 32) {
+        uint bb = blk * 34;
+        uint vb = blk * 32;
+
+        // ── Load weight data ONCE per block (reused across all tokens) ──
+        float sc0 = float(*(device const half*)(r0 + bb));
+        float sc1 = float(*(device const half*)(r1 + bb));
+        float sc2 = float(*(device const half*)(r2 + bb));
+        float sc3 = float(*(device const half*)(r3 + bb));
+
+        device const packed_short4* d0 = (device const packed_short4*)(r0 + bb + 2);
+        device const packed_short4* d1 = (device const packed_short4*)(r1 + bb + 2);
+        device const packed_short4* d2 = (device const packed_short4*)(r2 + bb + 2);
+        device const packed_short4* d3 = (device const packed_short4*)(r3 + bb + 2);
+
+        #define Q8_UNPACK8(SHORT4, OUT_LO, OUT_HI) { \
+            short4 _s = short4(SHORT4); \
+            char2 _a = as_type<char2>(_s.x); \
+            char2 _b = as_type<char2>(_s.y); \
+            char2 _c = as_type<char2>(_s.z); \
+            char2 _d = as_type<char2>(_s.w); \
+            (OUT_LO) = float4(float(_a.x), float(_a.y), float(_b.x), float(_b.y)); \
+            (OUT_HI) = float4(float(_c.x), float(_c.y), float(_d.x), float(_d.y)); \
+        }
+
+        // Unpack all 4 rows × 8 float4 weights (scaled).  These live in
+        // registers for the duration of the block and are dotted against
+        // every token's vector tile.
+        float4 w0_0, w0_1, w0_2, w0_3, w0_4, w0_5, w0_6, w0_7;
+        float4 w1_0, w1_1, w1_2, w1_3, w1_4, w1_5, w1_6, w1_7;
+        float4 w2_0, w2_1, w2_2, w2_3, w2_4, w2_5, w2_6, w2_7;
+        float4 w3_0, w3_1, w3_2, w3_3, w3_4, w3_5, w3_6, w3_7;
+
+        Q8_UNPACK8(d0[0], w0_0, w0_1);
+        Q8_UNPACK8(d0[1], w0_2, w0_3);
+        Q8_UNPACK8(d0[2], w0_4, w0_5);
+        Q8_UNPACK8(d0[3], w0_6, w0_7);
+
+        Q8_UNPACK8(d1[0], w1_0, w1_1);
+        Q8_UNPACK8(d1[1], w1_2, w1_3);
+        Q8_UNPACK8(d1[2], w1_4, w1_5);
+        Q8_UNPACK8(d1[3], w1_6, w1_7);
+
+        Q8_UNPACK8(d2[0], w2_0, w2_1);
+        Q8_UNPACK8(d2[1], w2_2, w2_3);
+        Q8_UNPACK8(d2[2], w2_4, w2_5);
+        Q8_UNPACK8(d2[3], w2_6, w2_7);
+
+        Q8_UNPACK8(d3[0], w3_0, w3_1);
+        Q8_UNPACK8(d3[1], w3_2, w3_3);
+        Q8_UNPACK8(d3[2], w3_4, w3_5);
+        Q8_UNPACK8(d3[3], w3_6, w3_7);
+
+        #undef Q8_UNPACK8
+
+        // ── For each token, read vector and accumulate against shared weights ──
+        // Token 0 (always valid: tok_count >= 1).
+        {
+            device const float* a0 = inputs + (tok_base + 0) * cols + vb;
+            float4 v0 = *(device const float4*)(a0);
+            float4 v1 = *(device const float4*)(a0 + 4);
+            float4 v2 = *(device const float4*)(a0 + 8);
+            float4 v3 = *(device const float4*)(a0 + 12);
+            float4 v4 = *(device const float4*)(a0 + 16);
+            float4 v5 = *(device const float4*)(a0 + 20);
+            float4 v6 = *(device const float4*)(a0 + 24);
+            float4 v7 = *(device const float4*)(a0 + 28);
+            float bd0 = dot(w0_0,v0)+dot(w0_1,v1)+dot(w0_2,v2)+dot(w0_3,v3)
+                      + dot(w0_4,v4)+dot(w0_5,v5)+dot(w0_6,v6)+dot(w0_7,v7);
+            float bd1 = dot(w1_0,v0)+dot(w1_1,v1)+dot(w1_2,v2)+dot(w1_3,v3)
+                      + dot(w1_4,v4)+dot(w1_5,v5)+dot(w1_6,v6)+dot(w1_7,v7);
+            float bd2 = dot(w2_0,v0)+dot(w2_1,v1)+dot(w2_2,v2)+dot(w2_3,v3)
+                      + dot(w2_4,v4)+dot(w2_5,v5)+dot(w2_6,v6)+dot(w2_7,v7);
+            float bd3 = dot(w3_0,v0)+dot(w3_1,v1)+dot(w3_2,v2)+dot(w3_3,v3)
+                      + dot(w3_4,v4)+dot(w3_5,v5)+dot(w3_6,v6)+dot(w3_7,v7);
+            s00 += sc0 * bd0; s01 += sc1 * bd1; s02 += sc2 * bd2; s03 += sc3 * bd3;
+        }
+        // Token 1
+        if (tok_count > 1) {
+            device const float* a1 = inputs + (tok_base + 1) * cols + vb;
+            float4 v0 = *(device const float4*)(a1);
+            float4 v1 = *(device const float4*)(a1 + 4);
+            float4 v2 = *(device const float4*)(a1 + 8);
+            float4 v3 = *(device const float4*)(a1 + 12);
+            float4 v4 = *(device const float4*)(a1 + 16);
+            float4 v5 = *(device const float4*)(a1 + 20);
+            float4 v6 = *(device const float4*)(a1 + 24);
+            float4 v7 = *(device const float4*)(a1 + 28);
+            float bd0 = dot(w0_0,v0)+dot(w0_1,v1)+dot(w0_2,v2)+dot(w0_3,v3)
+                      + dot(w0_4,v4)+dot(w0_5,v5)+dot(w0_6,v6)+dot(w0_7,v7);
+            float bd1 = dot(w1_0,v0)+dot(w1_1,v1)+dot(w1_2,v2)+dot(w1_3,v3)
+                      + dot(w1_4,v4)+dot(w1_5,v5)+dot(w1_6,v6)+dot(w1_7,v7);
+            float bd2 = dot(w2_0,v0)+dot(w2_1,v1)+dot(w2_2,v2)+dot(w2_3,v3)
+                      + dot(w2_4,v4)+dot(w2_5,v5)+dot(w2_6,v6)+dot(w2_7,v7);
+            float bd3 = dot(w3_0,v0)+dot(w3_1,v1)+dot(w3_2,v2)+dot(w3_3,v3)
+                      + dot(w3_4,v4)+dot(w3_5,v5)+dot(w3_6,v6)+dot(w3_7,v7);
+            s10 += sc0 * bd0; s11 += sc1 * bd1; s12 += sc2 * bd2; s13 += sc3 * bd3;
+        }
+        // Token 2
+        if (tok_count > 2) {
+            device const float* a2 = inputs + (tok_base + 2) * cols + vb;
+            float4 v0 = *(device const float4*)(a2);
+            float4 v1 = *(device const float4*)(a2 + 4);
+            float4 v2 = *(device const float4*)(a2 + 8);
+            float4 v3 = *(device const float4*)(a2 + 12);
+            float4 v4 = *(device const float4*)(a2 + 16);
+            float4 v5 = *(device const float4*)(a2 + 20);
+            float4 v6 = *(device const float4*)(a2 + 24);
+            float4 v7 = *(device const float4*)(a2 + 28);
+            float bd0 = dot(w0_0,v0)+dot(w0_1,v1)+dot(w0_2,v2)+dot(w0_3,v3)
+                      + dot(w0_4,v4)+dot(w0_5,v5)+dot(w0_6,v6)+dot(w0_7,v7);
+            float bd1 = dot(w1_0,v0)+dot(w1_1,v1)+dot(w1_2,v2)+dot(w1_3,v3)
+                      + dot(w1_4,v4)+dot(w1_5,v5)+dot(w1_6,v6)+dot(w1_7,v7);
+            float bd2 = dot(w2_0,v0)+dot(w2_1,v1)+dot(w2_2,v2)+dot(w2_3,v3)
+                      + dot(w2_4,v4)+dot(w2_5,v5)+dot(w2_6,v6)+dot(w2_7,v7);
+            float bd3 = dot(w3_0,v0)+dot(w3_1,v1)+dot(w3_2,v2)+dot(w3_3,v3)
+                      + dot(w3_4,v4)+dot(w3_5,v5)+dot(w3_6,v6)+dot(w3_7,v7);
+            s20 += sc0 * bd0; s21 += sc1 * bd1; s22 += sc2 * bd2; s23 += sc3 * bd3;
+        }
+        // Token 3
+        if (tok_count > 3) {
+            device const float* a3 = inputs + (tok_base + 3) * cols + vb;
+            float4 v0 = *(device const float4*)(a3);
+            float4 v1 = *(device const float4*)(a3 + 4);
+            float4 v2 = *(device const float4*)(a3 + 8);
+            float4 v3 = *(device const float4*)(a3 + 12);
+            float4 v4 = *(device const float4*)(a3 + 16);
+            float4 v5 = *(device const float4*)(a3 + 20);
+            float4 v6 = *(device const float4*)(a3 + 24);
+            float4 v7 = *(device const float4*)(a3 + 28);
+            float bd0 = dot(w0_0,v0)+dot(w0_1,v1)+dot(w0_2,v2)+dot(w0_3,v3)
+                      + dot(w0_4,v4)+dot(w0_5,v5)+dot(w0_6,v6)+dot(w0_7,v7);
+            float bd1 = dot(w1_0,v0)+dot(w1_1,v1)+dot(w1_2,v2)+dot(w1_3,v3)
+                      + dot(w1_4,v4)+dot(w1_5,v5)+dot(w1_6,v6)+dot(w1_7,v7);
+            float bd2 = dot(w2_0,v0)+dot(w2_1,v1)+dot(w2_2,v2)+dot(w2_3,v3)
+                      + dot(w2_4,v4)+dot(w2_5,v5)+dot(w2_6,v6)+dot(w2_7,v7);
+            float bd3 = dot(w3_0,v0)+dot(w3_1,v1)+dot(w3_2,v2)+dot(w3_3,v3)
+                      + dot(w3_4,v4)+dot(w3_5,v5)+dot(w3_6,v6)+dot(w3_7,v7);
+            s30 += sc0 * bd0; s31 += sc1 * bd1; s32 += sc2 * bd2; s33 += sc3 * bd3;
+        }
+    }
+
+    // simdgroup reduction
+    s00 = simd_sum(s00); s01 = simd_sum(s01); s02 = simd_sum(s02); s03 = simd_sum(s03);
+    s10 = simd_sum(s10); s11 = simd_sum(s11); s12 = simd_sum(s12); s13 = simd_sum(s13);
+    s20 = simd_sum(s20); s21 = simd_sum(s21); s22 = simd_sum(s22); s23 = simd_sum(s23);
+    s30 = simd_sum(s30); s31 = simd_sum(s31); s32 = simd_sum(s32); s33 = simd_sum(s33);
+
+    if (simd_lane == 0) {
+        device float* o0 = outputs + (tok_base + 0) * rows;
+        if (row_base     < rows) o0[row_base]     = s00;
+        if (row_base + 1 < rows) o0[row_base + 1] = s01;
+        if (row_base + 2 < rows) o0[row_base + 2] = s02;
+        if (row_base + 3 < rows) o0[row_base + 3] = s03;
+
+        if (tok_count > 1) {
+            device float* o1 = outputs + (tok_base + 1) * rows;
+            if (row_base     < rows) o1[row_base]     = s10;
+            if (row_base + 1 < rows) o1[row_base + 1] = s11;
+            if (row_base + 2 < rows) o1[row_base + 2] = s12;
+            if (row_base + 3 < rows) o1[row_base + 3] = s13;
+        }
+        if (tok_count > 2) {
+            device float* o2 = outputs + (tok_base + 2) * rows;
+            if (row_base     < rows) o2[row_base]     = s20;
+            if (row_base + 1 < rows) o2[row_base + 1] = s21;
+            if (row_base + 2 < rows) o2[row_base + 2] = s22;
+            if (row_base + 3 < rows) o2[row_base + 3] = s23;
+        }
+        if (tok_count > 3) {
+            device float* o3 = outputs + (tok_base + 3) * rows;
+            if (row_base     < rows) o3[row_base]     = s30;
+            if (row_base + 1 < rows) o3[row_base + 1] = s31;
+            if (row_base + 2 < rows) o3[row_base + 2] = s32;
+            if (row_base + 3 < rows) o3[row_base + 3] = s33;
+        }
+    }
+}
+
 // ── matmul_vec_q4_batch ────────────────────────────────────────────────
 // Batched Q4_0 matrix-vector multiply for M input vectors.
 // Grid: ceil(rows/Q4_ROWS_PER_TG) * M threadgroups.
@@ -1693,6 +1919,10 @@ fn emit_metal_model_struct(
     writeln!(code, "    // ── Batched prefill pipelines ──")?;
     writeln!(code, "    matmul_batch_pipeline: ComputePipelineState,")?;
     writeln!(code, "    matmul_q8_batch_pipeline: ComputePipelineState,")?;
+    writeln!(
+        code,
+        "    matmul_q8_gemm_batch_pipeline: ComputePipelineState,"
+    )?;
     writeln!(code, "    matmul_q4_batch_pipeline: ComputePipelineState,")?;
     writeln!(code, "    rms_norm_batch_pipeline: ComputePipelineState,")?;
     writeln!(code, "    rope_batch_pipeline: ComputePipelineState,")?;
@@ -1914,6 +2144,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         ("copy_offset_pipeline", "copy_offset"),
         ("matmul_batch_pipeline", "matmul_vec_batch"),
         ("matmul_q8_batch_pipeline", "matmul_vec_q8_batch"),
+        ("matmul_q8_gemm_batch_pipeline", "matmul_q8_gemm_batch"),
         ("matmul_q4_batch_pipeline", "matmul_vec_q4_batch"),
         ("rms_norm_batch_pipeline", "rms_norm_batch"),
         ("rope_batch_pipeline", "rope_batch"),
@@ -2416,6 +2647,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            copy_offset_pipeline,")?;
     writeln!(code, "            matmul_batch_pipeline,")?;
     writeln!(code, "            matmul_q8_batch_pipeline,")?;
+    writeln!(code, "            matmul_q8_gemm_batch_pipeline,")?;
     writeln!(code, "            matmul_q4_batch_pipeline,")?;
     writeln!(code, "            rms_norm_batch_pipeline,")?;
     writeln!(code, "            rope_batch_pipeline,")?;
@@ -3718,6 +3950,15 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "    /// Dispatch batched Q8_0 matmul: [M, cols] x [rows, cols]^T -> [M, rows]."
     )?;
+    writeln!(code, "    ///")?;
+    writeln!(
+        code,
+        "    /// Selects between a per-token mat-vec kernel (M < 4) and a GEMM-style"
+    )?;
+    writeln!(
+        code,
+        "    /// kernel that reuses weight reads across a tile of 4 tokens (M >= 4)."
+    )?;
     writeln!(
         code,
         "    fn dispatch_matmul_q8_batch(&self, enc: &ComputeCommandEncoderRef, input: &Buffer, weight: &Buffer, output: &Buffer, num_tokens: usize, rows: usize, cols: usize) {{"
@@ -3727,34 +3968,84 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "        let c: u32 = cols as u32;")?;
     writeln!(
         code,
-        "        enc.set_compute_pipeline_state(&self.matmul_q8_batch_pipeline);"
+        "        // Tile size must match TOKENS_PER_TG_Q8 in shaders."
     )?;
-    writeln!(code, "        enc.set_buffer(0, Some(weight), 0);")?;
-    writeln!(code, "        enc.set_buffer(1, Some(input), 0);")?;
-    writeln!(code, "        enc.set_buffer(2, Some(output), 0);")?;
+    writeln!(code, "        const TOKENS_PER_TG_Q8: usize = 4;")?;
+    writeln!(code, "        if num_tokens >= TOKENS_PER_TG_Q8 {{")?;
     writeln!(
         code,
-        "        enc.set_bytes(3, mem::size_of::<u32>() as u64, &nt as *const u32 as *const _);"
+        "            enc.set_compute_pipeline_state(&self.matmul_q8_gemm_batch_pipeline);"
+    )?;
+    writeln!(code, "            enc.set_buffer(0, Some(weight), 0);")?;
+    writeln!(code, "            enc.set_buffer(1, Some(input), 0);")?;
+    writeln!(code, "            enc.set_buffer(2, Some(output), 0);")?;
+    writeln!(
+        code,
+        "            enc.set_bytes(3, mem::size_of::<u32>() as u64, &nt as *const u32 as *const _);"
     )?;
     writeln!(
         code,
-        "        enc.set_bytes(4, mem::size_of::<u32>() as u64, &r as *const u32 as *const _);"
+        "            enc.set_bytes(4, mem::size_of::<u32>() as u64, &r as *const u32 as *const _);"
     )?;
     writeln!(
         code,
-        "        enc.set_bytes(5, mem::size_of::<u32>() as u64, &c as *const u32 as *const _);"
+        "            enc.set_bytes(5, mem::size_of::<u32>() as u64, &c as *const u32 as *const _);"
     )?;
     writeln!(
         code,
-        "        let row_tgs = (rows + 31) / 32;  // 32 rows per threadgroup for Q8"
+        "            let row_tgs = (rows + 31) / 32;  // 32 rows per threadgroup for Q8"
     )?;
-    writeln!(code, "        let num_tg = (row_tgs * num_tokens) as u64;")?;
-    writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
-    writeln!(code, "        let grid_size = MTLSize::new(num_tg, 1, 1);")?;
     writeln!(
         code,
-        "        enc.dispatch_thread_groups(grid_size, tg_size);"
+        "            let tok_tgs = (num_tokens + TOKENS_PER_TG_Q8 - 1) / TOKENS_PER_TG_Q8;"
     )?;
+    writeln!(code, "            let tg_size = MTLSize::new(256, 1, 1);")?;
+    writeln!(
+        code,
+        "            let grid_size = MTLSize::new(row_tgs as u64, tok_tgs as u64, 1);"
+    )?;
+    writeln!(
+        code,
+        "            enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(code, "        }} else {{")?;
+    writeln!(
+        code,
+        "            enc.set_compute_pipeline_state(&self.matmul_q8_batch_pipeline);"
+    )?;
+    writeln!(code, "            enc.set_buffer(0, Some(weight), 0);")?;
+    writeln!(code, "            enc.set_buffer(1, Some(input), 0);")?;
+    writeln!(code, "            enc.set_buffer(2, Some(output), 0);")?;
+    writeln!(
+        code,
+        "            enc.set_bytes(3, mem::size_of::<u32>() as u64, &nt as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "            enc.set_bytes(4, mem::size_of::<u32>() as u64, &r as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "            enc.set_bytes(5, mem::size_of::<u32>() as u64, &c as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "            let row_tgs = (rows + 31) / 32;  // 32 rows per threadgroup for Q8"
+    )?;
+    writeln!(
+        code,
+        "            let num_tg = (row_tgs * num_tokens) as u64;"
+    )?;
+    writeln!(code, "            let tg_size = MTLSize::new(256, 1, 1);")?;
+    writeln!(
+        code,
+        "            let grid_size = MTLSize::new(num_tg, 1, 1);"
+    )?;
+    writeln!(
+        code,
+        "            enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(code, "        }}")?;
     writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
@@ -6037,6 +6328,10 @@ mod tests {
             "shaders should contain matmul_vec_q8_batch kernel"
         );
         assert!(
+            shaders.contains("kernel void matmul_q8_gemm_batch"),
+            "shaders should contain matmul_q8_gemm_batch kernel (weight-reuse GEMM)"
+        );
+        assert!(
             shaders.contains("kernel void matmul_vec_q4_batch"),
             "shaders should contain matmul_vec_q4_batch kernel"
         );
@@ -6066,6 +6361,7 @@ mod tests {
         for pipeline in &[
             "matmul_batch_pipeline",
             "matmul_q8_batch_pipeline",
+            "matmul_q8_gemm_batch_pipeline",
             "matmul_q4_batch_pipeline",
             "rms_norm_batch_pipeline",
             "rope_batch_pipeline",
