@@ -10,15 +10,26 @@ ForgeLLM is a Rust-native ahead-of-time (AOT) ML compiler for language models (1
 
 ## Performance
 
-v0.5.0 generation benchmarks on Apple M5 Pro (8-bit quantization, 64 tokens):
+Benchmarks on Apple M5 Pro, 8-bit quantization, 64-token generation.
+
+### Generation Speed (tok/s)
 
 | Model | ForgeLLM Metal | MLX (8-bit) | llama.cpp (Q8_0) | vs MLX | vs llama.cpp |
 |-------|---------------|-------------|-------------------|--------|-------------|
-| SmolLM2-135M | **567 tok/s** | 438 tok/s | 494 tok/s | **1.29x** | **1.15x** |
+| SmolLM2-135M | **496 tok/s** | 414 tok/s | 481 tok/s | **1.20x** | **1.03x** |
 | SmolLM2-360M | **289 tok/s** | 264 tok/s | 267 tok/s | **1.09x** | **1.08x** |
-| Llama-3.2-1B | **170 tok/s** | 107 tok/s | 129 tok/s | **1.59x** | **1.32x** |
+| Llama-3.2-1B | **178 tok/s** | 111 tok/s | 130 tok/s | **1.60x** | **1.37x** |
 
-Faster than both llama.cpp and Apple's own MLX framework. The advantage grows with model size.
+### Prefill Speed (tok/s, long prompt)
+
+| Model | ForgeLLM Metal | MLX (8-bit) | llama.cpp (Q8_0) |
+|-------|---------------|-------------|-------------------|
+| SmolLM2-135M (~130 tok) | **3,173** | 1,507 | 2,812 |
+| SmolLM2-135M (~1250 tok) | **9,335** | — | — |
+| Llama-3.2-1B (~325 tok) | 475 | **2,718** | 556 |
+
+**We beat MLX and llama.cpp on generation across all model sizes, and on prefill for small-to-medium models.** For very large models (1B+), MLX's Apple Accelerate BLAS leads on prefill — closing that gap requires hardware matrix multiply instructions (`simdgroup_multiply_accumulate`).
+
 See [benchmarks/HISTORY.md](benchmarks/HISTORY.md) and [blog/beating-llama-cpp.md](blog/beating-llama-cpp.md) for details.
 
 ## Quick Start
