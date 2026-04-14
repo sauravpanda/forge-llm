@@ -2,55 +2,86 @@
 
 **Compile your LLMs, don't interpret them.**
 
-ForgeLLM is a Rust-native ahead-of-time (AOT) ML compiler for small language models (1M-7B parameters). It takes a model definition and compiles it into an optimized, self-contained binary — no runtime interpreter, no Python dependencies, no dynamic dispatch.
+ForgeLLM is a Rust-native ahead-of-time (AOT) ML compiler for language models (1M-7B parameters). It compiles GGUF models into optimized, self-contained binaries with native Metal GPU acceleration — no runtime interpreter, no Python dependencies, no dynamic dispatch.
 
-[Documentation](https://sauravpanda.github.io/forge-llm/) | [Crates.io](https://crates.io/crates/forgellm-frontend) | [forgellm.dev](https://forgellm.dev)
+**Faster than llama.cpp** on Apple Silicon.
 
-## It Works
+[Documentation](https://sauravpanda.github.io/forge-llm/) | [Crates.io](https://crates.io/crates/forgellm-frontend) | [forgellm.dev](https://forgellm.dev) | [Blog: How we beat llama.cpp](blog/beating-llama-cpp.md)
 
-```
-$ forge run --model SmolLM2-135M-Instruct-Q8_0.gguf \
-            --tokenizer tokenizer.json \
-            --prompt "The meaning of life is"
+## Performance
 
-The meaning of life is a complex and multifaceted concept that has been
-debated by philosophers, scientists, and theologians for centuries. At its
-core, the question of what it means to be human...
+v0.5.0 benchmarks on Apple M5 Pro (Q8_0, 64 tokens):
 
-Prefill: 5 tokens in 0.25s (19.7 tok/s)
-Generate: 33 tokens in 1.53s (21.6 tok/s)
-```
+| Model | ForgeLLM Metal | llama.cpp | Speedup |
+|-------|---------------|-----------|---------|
+| SmolLM2-135M | **567 tok/s** | 492 tok/s | **1.15x** |
+| SmolLM2-360M | **289 tok/s** | 267 tok/s | **1.08x** |
+| Llama-3.2-1B | **170 tok/s** | 110 tok/s | **1.55x** |
 
-## Why ForgeLLM?
-
-Every existing LLM inference engine loads model weights at runtime and executes a generic inference loop. This is like shipping a Python interpreter when you could ship a compiled binary.
-
-ForgeLLM compiles models into hardware-specific code with:
-- **Fused operations** baked into the binary
-- **Shape-specialized kernels** tuned to exact weight dimensions
-- **Compile-time quantization** — no quantization overhead at inference
-- **Static memory planning** — zero allocations during inference
-- **Single binary output** — deploy with `scp`
+The advantage grows with model size. See [benchmarks/HISTORY.md](benchmarks/HISTORY.md) for details.
 
 ## Quick Start
+
+### Metal GPU (Apple Silicon)
 
 ```bash
 # Build from source
 git clone https://github.com/sauravpanda/forge-llm.git
-cd forge-llm
-cargo build --release
+cd forge-llm && cargo build --release
 
-# Download a model
-pip install huggingface-hub
-python3 -c "from huggingface_hub import hf_hub_download; print(hf_hub_download('bartowski/SmolLM2-135M-Instruct-GGUF', 'SmolLM2-135M-Instruct-Q8_0.gguf'))"
-python3 -c "from huggingface_hub import hf_hub_download; print(hf_hub_download('HuggingFaceTB/SmolLM2-135M-Instruct', 'tokenizer.json'))"
+# Compile model to Metal binary
+forge compile --model model.gguf --output ./my-model --target metal
+forge export-weights --model model.gguf --output ./my-model/weights.bin
+cp tokenizer.json ./my-model/
 
-# Run inference
-cargo run --release -- run \
-  --model path/to/SmolLM2-135M-Instruct-Q8_0.gguf \
-  --tokenizer path/to/tokenizer.json \
-  --prompt "Hello, world"
+# Build and run
+cd my-model && cargo build --release
+./target/release/my-model weights.bin tokenizer.json "The meaning of life is"
 ```
+
+### API Server
+
+```bash
+# Start OpenAI-compatible server
+./target/release/my-model weights.bin tokenizer.json --serve --port 8080
+
+# Query it
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "Hello!"}], "stream": true}'
+```
+
+### CPU (cross-platform)
+
+```bash
+# Compile for CPU with NEON SIMD + Rayon parallelism
+forge compile --model model.gguf --output ./my-model --target cpu --run
+```
+
+## Why ForgeLLM is faster
+
+Every existing LLM inference engine — llama.cpp, vLLM, MLX — loads model weights at runtime and executes a generic inference loop. This is like shipping a Python interpreter when you could ship a compiled binary.
+
+ForgeLLM compiles models into hardware-specific code:
+
+| | llama.cpp (interpreter) | ForgeLLM (compiler) |
+|---|---|---|
+| **Dispatch** | Runtime graph build + plan + execute | Direct function calls, zero overhead |
+| **Dimensions** | Dynamic (runtime checks) | Baked in at compile time |
+| **GPU commands** | Multiple command encoders per layer | Single encoder for entire forward pass |
+| **Projections** | Separate Q, K, V matmuls | Fused QKV in one dispatch |
+| **Memory** | Runtime allocation | Static, pre-allocated buffers |
+| **Quantization** | Dequant at load time | Native Q8_0/Q4_0 GPU kernels |
+| **Output** | Shared library + runtime | Self-contained binary, deploy with `scp` |
+
+## Compilation Targets
+
+| Target | Command | Features |
+|--------|---------|----------|
+| **Metal GPU** | `--target metal` | Native MSL shaders, simdgroup reductions, Q8_0/Q4_0 kernels, API server |
+| **CPU** | `--target cpu` | NEON sdot inline asm, Rayon parallelism, Apple AMX via Accelerate |
+| **WASM** | `--target wasm` | SIMD128, wasm-bindgen exports, browser-ready |
+| **wgpu/WGSL** | `--target gpu` | Cross-platform GPU via WebGPU |
 
 ## Supported Models
 
@@ -58,91 +89,75 @@ cargo run --release -- run \
 |-------------|--------|--------|
 | LlamaForCausalLM | SmolLM2 (135M, 360M, 1.7B), Llama 3.2 (1B, 3B), TinyLlama | Verified |
 | Qwen2ForCausalLM | Qwen2.5 (0.5B-7B) | Verified |
-| MistralForCausalLM | Mistral 7B | Supported |
+| MistralForCausalLM | Mistral 7B (sliding-window attention) | Supported |
 | Phi3ForCausalLM | Phi-3 Mini | Supported |
 | GemmaForCausalLM | Gemma 2B, 7B | Supported |
 | StableLMForCausalLM | StableLM 1.6B, 3B | Supported |
 
-Supports 12 GGUF quantization formats: F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q2_K through Q8_K.
+Supports GGUF quantization formats: F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q2_K through Q8_K.
+Also supports SafeTensors and LoRA adapter merging at compile time.
 
-## Performance
+## Metal GPU Features
 
-v0.3.0 benchmarks on Apple M5 Pro (Q8_0 quantization, 64 tokens):
+The Metal backend generates optimized Apple Silicon compute shaders:
 
-| Model | Params | Interpreter | AOT Binary |
-|-------|--------|-------------|------------|
-| SmolLM2-135M | 135M | 119.7 tok/s | **119.5 tok/s** |
-| SmolLM2-360M | 360M | 46.3 tok/s | **47.3 tok/s** |
-| Qwen2.5-0.5B | 494M | 33.6 tok/s | **35.8 tok/s** |
-
-AOT binaries match or exceed interpreter performance with the bonus of
-single-file deployment, smaller memory footprint, and faster startup.
-See [`benchmarks/HISTORY.md`](benchmarks/HISTORY.md) for version-over-version progress.
-
-## AOT Compilation
-
-The flagship feature: compile a GGUF model into a standalone, optimized binary.
-
-```bash
-# One-command compile and run
-forge compile --model model.gguf --output ./my-model --run --prompt "Hello"
-
-# Single-file binary with embedded weights
-forge compile --model model.gguf --output ./my-model --embed-weights --run
-
-# Cross-compile for Linux
-forge compile --model model.gguf --output ./my-model --cross-target x86_64-unknown-linux-gnu
-```
-
-Generated binaries feature:
-- **Shape-specialized matmul** — all dimensions baked in at compile time
-- **Zero-allocation forward pass** — fixed-size stack arrays
-- **Fused operators** — `silu_mul`, `residual_add` reduce memory passes
-- **NEON SIMD + Rayon parallelism** — multi-core with ARM intrinsics
-- **Precomputed RoPE** — frequency table computed once at startup
-- **Full sampling** — temperature, top-k, top-p, repetition penalty
-- **Interactive chat** — `--interactive` flag for REPL mode
-- **EOS detection** — stops at end-of-sequence tokens
-- **Memory-mapped weights** — fast startup via memmap2
+- **Simdgroup cooperative matmul** — 32-lane SIMD reductions with shared memory vector caching
+- **Native Q8_0/Q4_0 kernels** — Dequantize on-the-fly during matmul, halving memory bandwidth
+- **Fused projections** — QKV and gate+up concatenated into single matmul dispatches
+- **Single compute encoder** — Entire forward pass in one encoder, zero transitions
+- **Double-buffered prefill** — GPU overlaps with CPU encoding
+- **`fast::` math** — Hardware-accelerated rsqrt/exp in normalization and attention
+- **OpenAI-compatible API** — `--serve` mode with SSE streaming
 
 ## CLI Commands
 
 ```bash
-# Run inference on a GGUF model
+# AOT compile to Metal GPU binary
+forge compile --model model.gguf --output ./out --target metal
+
+# AOT compile to CPU binary
+forge compile --model model.gguf --output ./out --target cpu --run
+
+# Export weights for compiled binary
+forge export-weights --model model.gguf --output ./out/weights.bin
+
+# Run interpreter (no compilation)
 forge run --model model.gguf --tokenizer tokenizer.json --prompt "Hello"
 
 # Interactive chat
 forge chat --model model.gguf --tokenizer tokenizer.json
 
-# Start OpenAI-compatible API server
+# Start API server (interpreter mode)
 forge serve --model model.gguf --tokenizer tokenizer.json --port 8080
 
-# Benchmark performance
-forge bench --model model.gguf --tokenizer tokenizer.json --num-tokens 128 --runs 3
+# Benchmark
+forge bench --model model.gguf --tokenizer tokenizer.json --num-tokens 128
 
-# Inspect model architecture
+# Inspect model
 forge info model.gguf
 
-# AOT compile (see above for full options)
-forge compile --model model.gguf --output ./out --run
+# ONNX export
+forge export-onnx --model model.gguf --output model.onnx
+
+# Speculative decoding
+forge speculative --draft small.gguf --target-model large.gguf --output ./spec
 ```
 
 ## Architecture
 
 ```
-GGUF/SafeTensors → Frontend (parse) → IR Graph → Optimizer → Codegen/Interpreter → Text
+GGUF/SafeTensors → Frontend → IR Graph → Optimizer → Codegen → Binary
+                     parse      build      fuse       emit     compile
 ```
 
-7 crates (all [published on crates.io](https://crates.io/search?q=forgellm)): `forgellm-frontend`, `forgellm-optimizer`, `forgellm-codegen-cpu`, `forgellm-codegen-wasm`, `forgellm-codegen-gpu`, `forgellm-runtime`, `forgellm-cli`
-
-See the [full documentation](https://sauravpanda.github.io/forge-llm/) for architecture details.
+8 crates: `forgellm-frontend`, `forgellm-optimizer`, `forgellm-codegen-cpu`, `forgellm-codegen-wasm`, `forgellm-codegen-gpu`, `forgellm-codegen-metal`, `forgellm-runtime`, `forgellm-cli`
 
 ## Contributing
 
 ```bash
-cargo test --workspace            # Run tests (105+ tests)
-cargo clippy --workspace -- -D warnings  # Lint
-cargo fmt --all -- --check        # Format check
+cargo test --workspace --exclude forgellm-python  # 258+ tests
+cargo clippy --workspace -- -D warnings
+cargo fmt --all -- --check
 ```
 
 ## License
