@@ -178,4 +178,81 @@ mod tests {
         assert_eq!(cache.num_layers(), 16);
         assert_eq!(cache.entry_size(), 512);
     }
+
+    // ── Real-world validation tests ──────────────────────────────────────
+
+    #[test]
+    fn clear_resets_completely_for_independent_generation() {
+        // After clear(), the cache should behave identically to a fresh cache.
+        // This matters for multi-turn serving where the model resets between requests.
+        let mut cache = KVCache::new(2, 4, 16);
+
+        // Fill cache with some data
+        let data_a = vec![1.0f32; 64];
+        for _ in 0..5 {
+            cache.append(0, &data_a, &data_a);
+            cache.append(1, &data_a, &data_a);
+            cache.advance();
+        }
+        assert_eq!(cache.len(), 5);
+        assert_eq!(cache.k(0).len(), 5 * 64);
+
+        // Clear and verify complete reset
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+        assert!(cache.is_empty());
+        assert!(cache.k(0).is_empty());
+        assert!(cache.v(0).is_empty());
+        assert!(cache.k(1).is_empty());
+        assert!(cache.v(1).is_empty());
+
+        // Append new data after clear — should be independent of previous content
+        let data_b = vec![2.0f32; 64];
+        cache.append(0, &data_b, &data_b);
+        cache.append(1, &data_b, &data_b);
+        cache.advance();
+
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.k(0).len(), 64);
+        // First element should be from data_b, not data_a
+        assert_eq!(
+            cache.k(0)[0],
+            2.0,
+            "after clear, new data should overwrite old content"
+        );
+    }
+
+    #[test]
+    fn cache_handles_max_realistic_sequence() {
+        // Simulate filling a cache up to a realistic max sequence length (512 tokens)
+        // for a small model and verify no data corruption at the boundary.
+        let num_layers = 4;
+        let num_kv_heads = 2;
+        let head_dim = 8;
+        let max_seq = 512;
+        let entry_size = num_kv_heads * head_dim; // 16
+
+        let mut cache = KVCache::with_capacity(num_layers, num_kv_heads, head_dim, max_seq);
+
+        for pos in 0..max_seq {
+            let data: Vec<f32> = (0..entry_size)
+                .map(|j| (pos * entry_size + j) as f32)
+                .collect();
+            for layer in 0..num_layers {
+                cache.append(layer, &data, &data);
+            }
+            cache.advance();
+        }
+
+        assert_eq!(cache.len(), max_seq);
+        assert_eq!(cache.k(0).len(), max_seq * entry_size);
+
+        // Verify data integrity at first and last positions
+        // First token in layer 0: values 0..16
+        assert_eq!(cache.k(0)[0], 0.0);
+        assert_eq!(cache.k(0)[entry_size - 1], (entry_size - 1) as f32);
+        // Last token in layer 0: values (511*16)..(511*16+16)
+        let last_start = (max_seq - 1) * entry_size;
+        assert_eq!(cache.k(0)[last_start], last_start as f32);
+    }
 }

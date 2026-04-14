@@ -1469,4 +1469,143 @@ mod tests {
             result[96]
         );
     }
+
+    // ── Real-world validation tests ──────────────────────────────────────
+
+    #[test]
+    fn quantize_q4_0_handles_large_values() {
+        // Values near the extremes of typical weight ranges.
+        // Real model weights rarely exceed ~10.0 but we test larger values
+        // to ensure no overflow in the quantization path.
+        let mut input = vec![0.0f32; 32];
+        input[0] = 1000.0;
+        input[1] = -1000.0;
+        input[15] = 500.0;
+        input[16] = -500.0;
+
+        let q4_bytes = quantize_f32_to_q4_0(&input);
+        assert_eq!(q4_bytes.len(), 18); // 1 block
+
+        // Dequantize and verify no NaN/Inf
+        let output = dequant_q4_0(&q4_bytes, 32);
+        for (i, &v) in output.iter().enumerate() {
+            assert!(
+                v.is_finite(),
+                "dequantized value at index {i} is not finite: {v}"
+            );
+        }
+
+        // The largest positive value should still be positive after roundtrip
+        assert!(
+            output[0] > 0.0,
+            "large positive value should remain positive after Q4_0 roundtrip"
+        );
+        // The largest negative value should still be negative
+        assert!(
+            output[1] < 0.0,
+            "large negative value should remain negative after Q4_0 roundtrip"
+        );
+    }
+
+    #[test]
+    fn dequant_q8_0_roundtrip_preserves_sign() {
+        // Build Q8_0 blocks with mixed positive and negative values.
+        // After dequantization, the sign must be preserved.
+        //
+        // Q8_0: each block = 2 bytes (f16 scale) + 32 bytes (int8 quantized values)
+        // int8 values: -128 to 127 (signed)
+        let scale_f16: u16 = 0x4000; // 2.0 in f16
+        let mut block = Vec::new();
+        block.extend_from_slice(&scale_f16.to_le_bytes());
+
+        // Push signed int8 values: alternating positive and negative
+        for i in 0..32i8 {
+            if i % 2 == 0 {
+                block.push(i as u8); // positive: 0, 2, 4, ...
+            } else {
+                block.push((-i) as u8); // negative: -1, -3, -5, ...
+            }
+        }
+
+        let result = dequant_q8_0(&block, 32);
+        assert_eq!(result.len(), 32);
+
+        // Even indices should be non-negative
+        for i in (0..32).step_by(2) {
+            assert!(
+                result[i] >= 0.0,
+                "Q8_0 dequant: index {i} should be non-negative, got {}",
+                result[i]
+            );
+        }
+        // Odd indices should be negative (except i=0 which maps to 0)
+        for i in (1..32).step_by(2) {
+            assert!(
+                result[i] < 0.0,
+                "Q8_0 dequant: index {i} should be negative, got {}",
+                result[i]
+            );
+        }
+
+        // Verify specific values: val = int8_val * scale
+        // index 0: 0 * 2.0 = 0.0
+        assert!((result[0] - 0.0).abs() < 1e-6);
+        // index 1: -1 * 2.0 = -2.0
+        assert!((result[1] - (-2.0)).abs() < 1e-6);
+        // index 2: 2 * 2.0 = 4.0
+        assert!((result[2] - 4.0).abs() < 1e-6);
+        // index 31: -31 * 2.0 = -62.0
+        assert!((result[31] - (-62.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dequant_q8_0_all_zeros() {
+        // Zero scale means all dequantized values should be zero.
+        let mut block = vec![0u8; 34]; // scale = 0, 32 arbitrary values
+        for i in 2..34 {
+            block[i] = 127; // max int8 value
+        }
+
+        let result = dequant_q8_0(&block, 32);
+        for (i, &v) in result.iter().enumerate() {
+            assert_eq!(v, 0.0, "with zero scale, index {i} should be 0.0, got {v}");
+        }
+    }
+
+    #[test]
+    fn quantize_q4_0_roundtrip_sign_preservation() {
+        // Generate values with a clear sign pattern and verify the sign
+        // survives the Q4_0 quantize → dequantize roundtrip.
+        let input: Vec<f32> = (0..32)
+            .map(|i| {
+                if i < 16 {
+                    -(i as f32 + 1.0)
+                } else {
+                    i as f32 - 15.0
+                }
+            })
+            .collect();
+
+        let q4_bytes = quantize_f32_to_q4_0(&input);
+        let output = dequant_q4_0(&q4_bytes, 32);
+
+        // First 16 values should be negative (or zero for small values due to quantization)
+        for i in 0..16 {
+            assert!(
+                output[i] <= 0.0,
+                "input[{i}]={}, roundtrip output[{i}]={} should be <= 0.0",
+                input[i],
+                output[i]
+            );
+        }
+        // Last 16 values should be non-negative
+        for i in 16..32 {
+            assert!(
+                output[i] >= 0.0,
+                "input[{i}]={}, roundtrip output[{i}]={} should be >= 0.0",
+                input[i],
+                output[i]
+            );
+        }
+    }
 }

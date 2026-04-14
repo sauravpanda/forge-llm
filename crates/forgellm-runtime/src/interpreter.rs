@@ -444,4 +444,182 @@ mod tests {
 
         assert_eq!(cache.len(), 3);
     }
+
+    // ── Real-world validation tests ──────────────────────────────────────
+
+    /// Build a tiny model with distinguishable per-token embeddings so that
+    /// different token IDs produce different logit distributions.
+    fn tiny_model_with_varied_weights() -> (ModelConfig, Graph, ModelWeights) {
+        let config = ModelConfig {
+            architecture: Architecture::Llama,
+            hidden_size: 8,
+            intermediate_size: 16,
+            num_layers: 1,
+            num_attention_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 4,
+            vocab_size: 16,
+            max_seq_len: 32,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            dtype: DType::F32,
+            sliding_window_size: None,
+            qkv_bias: false,
+        };
+
+        let graph = forgellm_frontend::graph_builder::build_graph(&config).unwrap();
+
+        let h = 8;
+        let inter = 16;
+        let vocab = 16;
+        let num_heads = 2;
+        let num_kv_heads = 1;
+        let head_dim = 4;
+
+        let mut tensors = HashMap::new();
+
+        // Varied embeddings: each token gets a distinct embedding vector
+        let mut embed = vec![0.0f32; vocab * h];
+        for tok in 0..vocab {
+            for d in 0..h {
+                embed[tok * h + d] = ((tok * h + d) as f32 + 1.0) * 0.05;
+            }
+        }
+        tensors.insert("model.embed_tokens.weight".into(), embed);
+
+        tensors.insert(
+            "model.layers.0.input_layernorm.weight".into(),
+            vec![1.0f32; h],
+        );
+        // Use varied projection weights so the model isn't degenerate
+        let q_w: Vec<f32> = (0..num_heads * head_dim * h)
+            .map(|i| ((i % 7) as f32 + 1.0) * 0.01)
+            .collect();
+        let k_w: Vec<f32> = (0..num_kv_heads * head_dim * h)
+            .map(|i| ((i % 5) as f32 + 1.0) * 0.01)
+            .collect();
+        let v_w: Vec<f32> = (0..num_kv_heads * head_dim * h)
+            .map(|i| ((i % 3) as f32 + 1.0) * 0.01)
+            .collect();
+        let o_w: Vec<f32> = (0..h * num_heads * head_dim)
+            .map(|i| ((i % 11) as f32 + 1.0) * 0.01)
+            .collect();
+        tensors.insert("model.layers.0.self_attn.q_proj.weight".into(), q_w);
+        tensors.insert("model.layers.0.self_attn.k_proj.weight".into(), k_w);
+        tensors.insert("model.layers.0.self_attn.v_proj.weight".into(), v_w);
+        tensors.insert("model.layers.0.self_attn.o_proj.weight".into(), o_w);
+        tensors.insert(
+            "model.layers.0.post_attention_layernorm.weight".into(),
+            vec![1.0f32; h],
+        );
+
+        let gate_w: Vec<f32> = (0..inter * h)
+            .map(|i| ((i % 13) as f32 + 1.0) * 0.01)
+            .collect();
+        let up_w: Vec<f32> = (0..inter * h)
+            .map(|i| ((i % 9) as f32 + 1.0) * 0.01)
+            .collect();
+        let down_w: Vec<f32> = (0..h * inter)
+            .map(|i| ((i % 7) as f32 + 1.0) * 0.01)
+            .collect();
+        tensors.insert("model.layers.0.mlp.gate_proj.weight".into(), gate_w);
+        tensors.insert("model.layers.0.mlp.up_proj.weight".into(), up_w);
+        tensors.insert("model.layers.0.mlp.down_proj.weight".into(), down_w);
+
+        tensors.insert("model.norm.weight".into(), vec![1.0f32; h]);
+        // Varied lm_head so different hidden states map to different logits
+        let lm_head: Vec<f32> = (0..vocab * h)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.02)
+            .collect();
+        tensors.insert("lm_head.weight".into(), lm_head);
+
+        let weights = ModelWeights { tensors };
+        (config, graph, weights)
+    }
+
+    #[test]
+    fn different_prompts_produce_different_logits() {
+        // Two different token IDs at pos=0 should produce different logit vectors.
+        // This validates that the model distinguishes inputs (not degenerate).
+        let (_config, graph, weights) = tiny_model_with_varied_weights();
+
+        let mut cache1 = KVCache::new(1, 1, 4);
+        let logits1 = forward(0, 0, &graph, &weights, &mut cache1);
+
+        let mut cache2 = KVCache::new(1, 1, 4);
+        let logits2 = forward(5, 0, &graph, &weights, &mut cache2);
+
+        // Both should be finite
+        for &l in &logits1 {
+            assert!(l.is_finite(), "logits1 contains non-finite value: {l}");
+        }
+        for &l in &logits2 {
+            assert!(l.is_finite(), "logits2 contains non-finite value: {l}");
+        }
+
+        // They should differ (the model is not degenerate)
+        let differs = logits1
+            .iter()
+            .zip(logits2.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-6);
+        assert!(
+            differs,
+            "different input tokens should produce different logit distributions"
+        );
+    }
+
+    #[test]
+    fn cache_reset_produces_same_logits() {
+        // After clearing the cache, running the same token at pos=0 should
+        // produce identical logits as a fresh run. This validates that clear()
+        // truly resets all state for independent multi-request serving.
+        let (_config, graph, weights) = tiny_model_with_varied_weights();
+
+        // First run: fresh cache
+        let mut cache = KVCache::new(1, 1, 4);
+        let logits_fresh = forward(3, 0, &graph, &weights, &mut cache);
+
+        // Advance the cache with more tokens to build up state
+        cache.advance();
+        let _ = forward(7, 1, &graph, &weights, &mut cache);
+        cache.advance();
+        assert_eq!(cache.len(), 2);
+
+        // Clear and re-run
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+        let logits_after_reset = forward(3, 0, &graph, &weights, &mut cache);
+
+        // Should be identical
+        for (i, (a, b)) in logits_fresh
+            .iter()
+            .zip(logits_after_reset.iter())
+            .enumerate()
+        {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "logit[{i}] differs after reset: fresh={a}, after_reset={b}"
+            );
+        }
+    }
+
+    #[test]
+    fn forward_at_pos_zero_no_nan() {
+        // pos=0 is the first token where seq_len=1 in attention.
+        // This is a common edge case: softmax over a single element,
+        // RoPE with angle=0, and KV cache with one entry.
+        let (_config, graph, weights) = tiny_model_with_varied_weights();
+        let mut cache = KVCache::new(1, 1, 4);
+
+        let logits = forward(0, 0, &graph, &weights, &mut cache);
+        assert_eq!(logits.len(), 16);
+
+        for (i, &l) in logits.iter().enumerate() {
+            assert!(
+                !l.is_nan(),
+                "logit[{i}] is NaN at pos=0 — likely a softmax or attention bug"
+            );
+            assert!(!l.is_infinite(), "logit[{i}] is infinite at pos=0");
+        }
+    }
 }

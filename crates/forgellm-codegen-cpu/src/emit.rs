@@ -4721,4 +4721,130 @@ mod tests {
             "max round-trip error {max_err:.6} exceeds one quantization step {step:.6}"
         );
     }
+
+    // ── Real-world validation tests ──────────────────────────────────────
+
+    #[test]
+    fn generated_code_handles_pos_zero() {
+        // Verify forward() with pos=0 doesn't produce degenerate output.
+        // At pos=0 the RoPE angle is 0 (cos=1, sin=0) and the KV cache has
+        // seq_len=1.  The attention scores array is `[0.0f32; MAX_SEQ_LEN]`
+        // and only scores[0] is written, so softmax must handle a single-element
+        // slice without NaN/Inf.
+        let config = tiny_config();
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let code = generate(&graph).unwrap();
+
+        // The forward function should accept pos=0 (no guard against it)
+        assert!(
+            !code.contains("assert!(pos > 0"),
+            "forward() must accept pos=0 for the first token"
+        );
+        // Softmax in the generated code should use max subtraction for
+        // numerical stability (prevents exp() overflow)
+        assert!(
+            code.contains("f32::NEG_INFINITY") || code.contains("fold(f32::NEG_INFINITY"),
+            "softmax should initialize max to NEG_INFINITY for numerical stability"
+        );
+        // Attention at seq_len=1: the code slices scores[..seq_len] which
+        // at pos=0 means scores[..1].  Verify softmax operates on the slice.
+        assert!(
+            code.contains("softmax(&mut scores[..seq_len])")
+                || code.contains("softmax(&mut scores[..seq_len]);"),
+            "attention must apply softmax to the active seq_len slice"
+        );
+    }
+
+    #[test]
+    fn generated_code_caps_max_seq_len() {
+        // Models like Qwen2.5 declare max_seq_len=32768 but the generated
+        // code should cap it to avoid multi-GB KV cache allocations.
+        let config = ModelConfig {
+            architecture: Architecture::Llama,
+            hidden_size: 64,
+            intermediate_size: 128,
+            num_layers: 1,
+            num_attention_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 16,
+            vocab_size: 256,
+            max_seq_len: 32768,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            dtype: DType::F16,
+            sliding_window_size: None,
+            qkv_bias: false,
+        };
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let code = generate(&graph).unwrap();
+
+        // MAX_SEQ_LEN should be capped (currently at 4096)
+        assert!(
+            code.contains("pub const MAX_SEQ_LEN: usize = 4096;"),
+            "MAX_SEQ_LEN should be capped at 4096 for models with very large max_seq_len"
+        );
+        // The comment should mention the original value
+        assert!(
+            code.contains("capped from model's 32768"),
+            "generated code should document the original max_seq_len"
+        );
+    }
+
+    #[test]
+    fn generated_softmax_is_numerically_stable() {
+        // Verify the generated softmax uses the max-subtraction trick.
+        // Without it, very negative logits would underflow and very positive
+        // logits would overflow, producing NaN.
+        let config = tiny_config();
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let code = generate(&graph).unwrap();
+
+        // Extract the softmax function body (up to 1000 chars to cover NEON variant)
+        let softmax_start = code.find("pub fn softmax(").expect("softmax must exist");
+        let softmax_body =
+            &code[softmax_start..softmax_start + 1000.min(code.len() - softmax_start)];
+
+        // Must subtract max before exp() — the generated code uses `*v - max_val`
+        assert!(
+            softmax_body.contains("- max_val") || softmax_body.contains("-max_val"),
+            "softmax must subtract max value before exp() for numerical stability"
+        );
+        // Must guard against zero sum (degenerate case where all exp() underflow)
+        assert!(
+            softmax_body.contains("if sum > 0.0") || softmax_body.contains("1.0 / sum"),
+            "softmax should guard against division by zero when sum is zero"
+        );
+    }
+
+    #[test]
+    fn generated_code_valid_rust_for_large_context_model() {
+        // A model with max_seq_len > 512 triggers flash attention codegen.
+        // Verify the generated code for this path is syntactically valid.
+        let config = ModelConfig {
+            architecture: Architecture::Llama,
+            hidden_size: 64,
+            intermediate_size: 128,
+            num_layers: 1,
+            num_attention_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 16,
+            vocab_size: 256,
+            max_seq_len: 2048, // > 512 triggers flash attention
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            dtype: DType::F16,
+            sliding_window_size: None,
+            qkv_bias: false,
+        };
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let code = generate(&graph).unwrap();
+
+        // Flash attention should be emitted
+        assert!(
+            code.contains("attention_flash"),
+            "model with max_seq_len > 512 should use flash attention"
+        );
+        // The generated code should still be valid Rust
+        syn::parse_file(&code).expect("flash attention code should be valid Rust syntax");
+    }
 }
