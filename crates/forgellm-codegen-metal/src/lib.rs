@@ -388,6 +388,31 @@ kernel void elementwise_add(
     output[id] = a[id] + b[id];
 }
 
+// ── copy_buffer ─────────────────────────────────────────────────────────
+// Simple buffer-to-buffer copy via compute kernel, avoiding blit encoder
+// transitions. Used for KV cache updates and embedding lookup.
+kernel void copy_buffer(
+    device const float* src [[buffer(0)]],
+    device float* dst       [[buffer(1)]],
+    constant uint& count    [[buffer(2)]],
+    uint id [[thread_position_in_grid]])
+{
+    if (id < count) dst[id] = src[id];
+}
+
+// ── copy_offset ─────────────────────────────────────────────────────────
+// Copy with source offset (in floats). Used for embedding table lookup
+// where we need to copy a specific row from a large table.
+kernel void copy_offset(
+    device const float* src     [[buffer(0)]],
+    device float* dst           [[buffer(1)]],
+    constant uint& src_offset   [[buffer(2)]],  // in floats
+    constant uint& count        [[buffer(3)]],
+    uint id [[thread_position_in_grid]])
+{
+    if (id < count) dst[id] = src[src_offset + id];
+}
+
 // ── add_inplace ─────────────────────────────────────────────────────────
 // In-place residual connection: a[i] += b[i]
 // Avoids a separate blit copy for residual add, reducing encoder overhead.
@@ -740,6 +765,8 @@ fn emit_metal_model_struct(
     writeln!(code, "    add_pipeline: ComputePipelineState,")?;
     writeln!(code, "    attention_pipeline: ComputePipelineState,")?;
     writeln!(code, "    add_inplace_pipeline: ComputePipelineState,")?;
+    writeln!(code, "    copy_pipeline: ComputePipelineState,")?;
+    writeln!(code, "    copy_offset_pipeline: ComputePipelineState,")?;
     writeln!(code)?;
     writeln!(code, "    // ── Weight buffers (Metal shared memory) ──")?;
     writeln!(
@@ -885,6 +912,8 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         ("add_pipeline", "elementwise_add"),
         ("attention_pipeline", "attention"),
         ("add_inplace_pipeline", "add_inplace"),
+        ("copy_pipeline", "copy_buffer"),
+        ("copy_offset_pipeline", "copy_offset"),
     ] {
         writeln!(
             code,
@@ -1207,6 +1236,8 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            add_pipeline,")?;
     writeln!(code, "            attention_pipeline,")?;
     writeln!(code, "            add_inplace_pipeline,")?;
+    writeln!(code, "            copy_pipeline,")?;
+    writeln!(code, "            copy_offset_pipeline,")?;
     writeln!(code, "            embed_buf,")?;
     writeln!(code, "            layers,")?;
     writeln!(code, "            norm_buf,")?;
@@ -1268,60 +1299,52 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "        let cmd = self.queue.new_command_buffer();")?;
     writeln!(code)?;
 
-    // 1. Embedding lookup
-    writeln!(
-        code,
-        "        // 1. Embedding lookup: copy row `token_id` from embed_buf -> hidden_buf"
-    )?;
-    writeln!(code, "        {{")?;
-    writeln!(
-        code,
-        "            let src_offset = (token_id as usize) * HIDDEN_SIZE * 4;"
-    )?;
-    writeln!(code, "            let byte_len = HIDDEN_SIZE * 4;")?;
-    writeln!(
-        code,
-        "            let blit_enc = cmd.new_blit_command_encoder();"
-    )?;
-    writeln!(code, "            blit_enc.copy_from_buffer(")?;
-    writeln!(code, "                &self.embed_buf, src_offset as u64,")?;
-    writeln!(code, "                &self.hidden_buf, 0,")?;
-    writeln!(code, "                byte_len as u64,")?;
-    writeln!(code, "            );")?;
-    writeln!(code, "            blit_enc.copy_from_buffer(")?;
-    writeln!(code, "                &self.hidden_buf, 0,")?;
-    writeln!(code, "                &self.residual_buf, 0,")?;
-    writeln!(code, "                byte_len as u64,")?;
-    writeln!(code, "            );")?;
-    writeln!(code, "            blit_enc.end_encoding();")?;
-    writeln!(code, "        }}")?;
-    writeln!(code)?;
-
-    // 2. Transformer layers
-    writeln!(code, "        // 2. Transformer layers")?;
-    writeln!(code, "        for layer in 0..NUM_LAYERS {{")?;
-    writeln!(code)?;
-
-    // Batch pre-attention compute ops into one encoder
-    writeln!(
-        code,
-        "            // Compute encoder: rms_norm, Q/K/V projections, RoPE"
-    )?;
-    writeln!(code, "            {{")?;
-    writeln!(
-        code,
-        "                let enc = cmd.new_compute_command_encoder();"
-    )?;
-    writeln!(
-        code,
-        "                self.dispatch_rms_norm(&enc, &self.layers[layer].attn_norm);"
-    )?;
-
+    // Single compute encoder for the entire forward pass — no blit encoder
+    // transitions. Copy operations use compute copy kernels instead of blits.
     let matmul_fn = if is_q8 {
         "dispatch_matmul_q8"
     } else {
         "dispatch_matmul"
     };
+
+    writeln!(
+        code,
+        "        // Single compute encoder for the entire forward pass (no blit transitions)"
+    )?;
+    writeln!(code, "        {{")?;
+    writeln!(
+        code,
+        "            let enc = cmd.new_compute_command_encoder();"
+    )?;
+    writeln!(code)?;
+
+    // 1. Embedding lookup via compute copy
+    writeln!(
+        code,
+        "            // 1. Embedding lookup via compute copy (no blit encoder needed)"
+    )?;
+    writeln!(
+        code,
+        "            self.dispatch_copy_offset(&enc, &self.embed_buf, &self.hidden_buf, (token_id as usize) * HIDDEN_SIZE, HIDDEN_SIZE);"
+    )?;
+    writeln!(
+        code,
+        "            self.dispatch_copy(&enc, &self.hidden_buf, &self.residual_buf, HIDDEN_SIZE);"
+    )?;
+    writeln!(code)?;
+
+    // 2. Transformer layers
+    writeln!(code, "            // 2. Transformer layers")?;
+    writeln!(code, "            for layer in 0..NUM_LAYERS {{")?;
+    writeln!(code)?;
+    writeln!(
+        code,
+        "                // Pre-attention: rms_norm, Q/K/V projections, RoPE"
+    )?;
+    writeln!(
+        code,
+        "                self.dispatch_rms_norm(&enc, &self.layers[layer].attn_norm);"
+    )?;
     writeln!(
         code,
         "                self.{matmul_fn}(&enc, &self.hidden_buf, &self.layers[layer].q_weight, &self.q_buf, {hidden}, {hidden});"
@@ -1342,50 +1365,24 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "                self.dispatch_rope(&enc, &self.k_buf, {num_kv_heads}, {head_dim}, pos);"
     )?;
-    writeln!(code, "                enc.end_encoding();")?;
-    writeln!(code, "            }}")?;
     writeln!(code)?;
-
-    // 2d. Update KV cache (blit encoder)
-    writeln!(code, "            // Blit encoder: update KV cache")?;
-    writeln!(code, "            {{")?;
     writeln!(
         code,
-        "                let kv_head_size = {num_kv_heads} * {head_dim};"
+        "                // KV cache update via compute copy (no blit encoder needed)"
+    )?;
+    writeln!(code, "                let kv_offset = pos * {kv_dim};")?;
+    writeln!(
+        code,
+        "                self.dispatch_copy_to_offset(&enc, &self.k_buf, &self.k_cache[layer], kv_offset, {kv_dim});"
     )?;
     writeln!(
         code,
-        "                let offset = (pos * kv_head_size) * 4;"
+        "                self.dispatch_copy_to_offset(&enc, &self.v_buf, &self.v_cache[layer], kv_offset, {kv_dim});"
     )?;
-    writeln!(
-        code,
-        "                let byte_len = (kv_head_size * 4) as u64;"
-    )?;
-    writeln!(
-        code,
-        "                let enc = cmd.new_blit_command_encoder();"
-    )?;
-    writeln!(
-        code,
-        "                enc.copy_from_buffer(&self.k_buf, 0, &self.k_cache[layer], offset as u64, byte_len);"
-    )?;
-    writeln!(
-        code,
-        "                enc.copy_from_buffer(&self.v_buf, 0, &self.v_cache[layer], offset as u64, byte_len);"
-    )?;
-    writeln!(code, "                enc.end_encoding();")?;
-    writeln!(code, "            }}")?;
     writeln!(code)?;
-
-    // Batch post-attention compute ops into one encoder
     writeln!(
         code,
-        "            // Compute encoder: attention, O proj, residual, FFN"
-    )?;
-    writeln!(code, "            {{")?;
-    writeln!(
-        code,
-        "                let enc = cmd.new_compute_command_encoder();"
+        "                // Post-attention: attention, O proj, residual, FFN"
     )?;
     writeln!(
         code,
@@ -1423,21 +1420,11 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "                self.dispatch_add_inplace(&enc, &self.residual_buf, &self.ffn_out_buf, {hidden});"
     )?;
-    writeln!(code, "                enc.end_encoding();")?;
     writeln!(code, "            }}")?;
-    writeln!(code, "        }}")?;
     writeln!(code)?;
 
-    // 3. Final RMS norm + logits in one encoder
-    writeln!(
-        code,
-        "        // Compute encoder: final RMS norm + logits projection"
-    )?;
-    writeln!(code, "        {{")?;
-    writeln!(
-        code,
-        "            let enc = cmd.new_compute_command_encoder();"
-    )?;
+    // 3. Final RMS norm + logits
+    writeln!(code, "            // 3. Final RMS norm + logits projection")?;
     writeln!(
         code,
         "            self.dispatch_rms_norm(&enc, &self.norm_buf);"
@@ -1446,6 +1433,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "            self.{matmul_fn}(&enc, &self.hidden_buf, &self.lm_head_buf, &self.logits_buf, {vocab}, {hidden});"
     )?;
+    writeln!(code)?;
     writeln!(code, "            enc.end_encoding();")?;
     writeln!(code, "        }}")?;
     writeln!(code)?;
@@ -1506,48 +1494,40 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "        let cmd = self.queue.new_command_buffer();")?;
     writeln!(code)?;
 
-    // Embedding lookup (same as forward)
+    // Single compute encoder for the entire prefill forward pass (no blit transitions)
     writeln!(
         code,
-        "        // 1. Embedding lookup: copy row `token_id` from embed_buf -> hidden_buf"
+        "        // Single compute encoder for the entire prefill forward pass (no blit transitions)"
     )?;
     writeln!(code, "        {{")?;
     writeln!(
         code,
-        "            let src_offset = (token_id as usize) * HIDDEN_SIZE * 4;"
+        "            let enc = cmd.new_compute_command_encoder();"
     )?;
-    writeln!(code, "            let byte_len = HIDDEN_SIZE * 4;")?;
-    writeln!(
-        code,
-        "            let blit_enc = cmd.new_blit_command_encoder();"
-    )?;
-    writeln!(code, "            blit_enc.copy_from_buffer(")?;
-    writeln!(code, "                &self.embed_buf, src_offset as u64,")?;
-    writeln!(code, "                &self.hidden_buf, 0,")?;
-    writeln!(code, "                byte_len as u64,")?;
-    writeln!(code, "            );")?;
-    writeln!(code, "            blit_enc.copy_from_buffer(")?;
-    writeln!(code, "                &self.hidden_buf, 0,")?;
-    writeln!(code, "                &self.residual_buf, 0,")?;
-    writeln!(code, "                byte_len as u64,")?;
-    writeln!(code, "            );")?;
-    writeln!(code, "            blit_enc.end_encoding();")?;
-    writeln!(code, "        }}")?;
     writeln!(code)?;
 
-    // Transformer layers (same as forward)
-    writeln!(code, "        // 2. Transformer layers")?;
-    writeln!(code, "        for layer in 0..NUM_LAYERS {{")?;
+    // 1. Embedding lookup via compute copy
+    writeln!(
+        code,
+        "            // 1. Embedding lookup via compute copy (no blit encoder needed)"
+    )?;
+    writeln!(
+        code,
+        "            self.dispatch_copy_offset(&enc, &self.embed_buf, &self.hidden_buf, (token_id as usize) * HIDDEN_SIZE, HIDDEN_SIZE);"
+    )?;
+    writeln!(
+        code,
+        "            self.dispatch_copy(&enc, &self.hidden_buf, &self.residual_buf, HIDDEN_SIZE);"
+    )?;
     writeln!(code)?;
 
+    // 2. Transformer layers
+    writeln!(code, "            // 2. Transformer layers")?;
+    writeln!(code, "            for layer in 0..NUM_LAYERS {{")?;
+    writeln!(code)?;
     writeln!(
         code,
-        "            // Compute encoder: rms_norm, Q/K/V projections, RoPE"
-    )?;
-    writeln!(code, "            {{")?;
-    writeln!(
-        code,
-        "                let enc = cmd.new_compute_command_encoder();"
+        "                // Pre-attention: rms_norm, Q/K/V projections, RoPE"
     )?;
     writeln!(
         code,
@@ -1573,48 +1553,24 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "                self.dispatch_rope(&enc, &self.k_buf, {num_kv_heads}, {head_dim}, pos);"
     )?;
-    writeln!(code, "                enc.end_encoding();")?;
-    writeln!(code, "            }}")?;
     writeln!(code)?;
-
-    writeln!(code, "            // Blit encoder: update KV cache")?;
-    writeln!(code, "            {{")?;
     writeln!(
         code,
-        "                let kv_head_size = {num_kv_heads} * {head_dim};"
+        "                // KV cache update via compute copy (no blit encoder needed)"
+    )?;
+    writeln!(code, "                let kv_offset = pos * {kv_dim};")?;
+    writeln!(
+        code,
+        "                self.dispatch_copy_to_offset(&enc, &self.k_buf, &self.k_cache[layer], kv_offset, {kv_dim});"
     )?;
     writeln!(
         code,
-        "                let offset = (pos * kv_head_size) * 4;"
+        "                self.dispatch_copy_to_offset(&enc, &self.v_buf, &self.v_cache[layer], kv_offset, {kv_dim});"
     )?;
-    writeln!(
-        code,
-        "                let byte_len = (kv_head_size * 4) as u64;"
-    )?;
-    writeln!(
-        code,
-        "                let enc = cmd.new_blit_command_encoder();"
-    )?;
-    writeln!(
-        code,
-        "                enc.copy_from_buffer(&self.k_buf, 0, &self.k_cache[layer], offset as u64, byte_len);"
-    )?;
-    writeln!(
-        code,
-        "                enc.copy_from_buffer(&self.v_buf, 0, &self.v_cache[layer], offset as u64, byte_len);"
-    )?;
-    writeln!(code, "                enc.end_encoding();")?;
-    writeln!(code, "            }}")?;
     writeln!(code)?;
-
     writeln!(
         code,
-        "            // Compute encoder: attention, O proj, residual, FFN"
-    )?;
-    writeln!(code, "            {{")?;
-    writeln!(
-        code,
-        "                let enc = cmd.new_compute_command_encoder();"
+        "                // Post-attention: attention, O proj, residual, FFN"
     )?;
     writeln!(
         code,
@@ -1652,8 +1608,9 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "                self.dispatch_add_inplace(&enc, &self.residual_buf, &self.ffn_out_buf, {hidden});"
     )?;
-    writeln!(code, "                enc.end_encoding();")?;
     writeln!(code, "            }}")?;
+    writeln!(code)?;
+    writeln!(code, "            enc.end_encoding();")?;
     writeln!(code, "        }}")?;
     writeln!(code)?;
 
@@ -1934,6 +1891,118 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(
         code,
         "        let grid_size = MTLSize::new(((n + 255) / 256) as u64, 1, 1);"
+    )?;
+    writeln!(
+        code,
+        "        enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
+
+    // dispatch_copy (simple src -> dst copy via compute kernel)
+    writeln!(
+        code,
+        "    /// Dispatch buffer copy via compute kernel: dst[i] = src[i] for i in 0..count."
+    )?;
+    writeln!(
+        code,
+        "    fn dispatch_copy(&self, enc: &ComputeCommandEncoderRef, src: &Buffer, dst: &Buffer, count: usize) {{"
+    )?;
+    writeln!(code, "        let n: u32 = count as u32;")?;
+    writeln!(
+        code,
+        "        enc.set_compute_pipeline_state(&self.copy_pipeline);"
+    )?;
+    writeln!(code, "        enc.set_buffer(0, Some(src), 0);")?;
+    writeln!(code, "        enc.set_buffer(1, Some(dst), 0);")?;
+    writeln!(
+        code,
+        "        enc.set_bytes(2, mem::size_of::<u32>() as u64, &n as *const u32 as *const _);"
+    )?;
+    writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
+    writeln!(
+        code,
+        "        let grid_size = MTLSize::new(((count + 255) / 256) as u64, 1, 1);"
+    )?;
+    writeln!(
+        code,
+        "        enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
+
+    // dispatch_copy_offset (copy from src[src_offset..] -> dst)
+    writeln!(
+        code,
+        "    /// Dispatch offset copy via compute kernel: dst[i] = src[src_offset + i]."
+    )?;
+    writeln!(
+        code,
+        "    /// Used for embedding table lookup (copy a specific row)."
+    )?;
+    writeln!(
+        code,
+        "    fn dispatch_copy_offset(&self, enc: &ComputeCommandEncoderRef, src: &Buffer, dst: &Buffer, src_offset: usize, count: usize) {{"
+    )?;
+    writeln!(code, "        let off: u32 = src_offset as u32;")?;
+    writeln!(code, "        let n: u32 = count as u32;")?;
+    writeln!(
+        code,
+        "        enc.set_compute_pipeline_state(&self.copy_offset_pipeline);"
+    )?;
+    writeln!(code, "        enc.set_buffer(0, Some(src), 0);")?;
+    writeln!(code, "        enc.set_buffer(1, Some(dst), 0);")?;
+    writeln!(
+        code,
+        "        enc.set_bytes(2, mem::size_of::<u32>() as u64, &off as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(3, mem::size_of::<u32>() as u64, &n as *const u32 as *const _);"
+    )?;
+    writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
+    writeln!(
+        code,
+        "        let grid_size = MTLSize::new(((count + 255) / 256) as u64, 1, 1);"
+    )?;
+    writeln!(
+        code,
+        "        enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
+
+    // dispatch_copy_to_offset (copy src -> dst[dst_offset..])
+    writeln!(
+        code,
+        "    /// Dispatch copy to destination offset: dst[dst_offset + i] = src[i]."
+    )?;
+    writeln!(
+        code,
+        "    /// Used for KV cache updates (write to a specific position in the cache)."
+    )?;
+    writeln!(
+        code,
+        "    fn dispatch_copy_to_offset(&self, enc: &ComputeCommandEncoderRef, src: &Buffer, dst: &Buffer, dst_offset: usize, count: usize) {{"
+    )?;
+    writeln!(code, "        let n: u32 = count as u32;")?;
+    writeln!(
+        code,
+        "        enc.set_compute_pipeline_state(&self.copy_pipeline);"
+    )?;
+    writeln!(code, "        enc.set_buffer(0, Some(src), 0);")?;
+    writeln!(
+        code,
+        "        enc.set_buffer(1, Some(dst), (dst_offset * mem::size_of::<f32>()) as u64);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(2, mem::size_of::<u32>() as u64, &n as *const u32 as *const _);"
+    )?;
+    writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
+    writeln!(
+        code,
+        "        let grid_size = MTLSize::new(((count + 255) / 256) as u64, 1, 1);"
     )?;
     writeln!(
         code,
@@ -2316,6 +2385,14 @@ mod tests {
             shaders.contains("kernel void add_inplace"),
             "shaders should contain add_inplace kernel"
         );
+        assert!(
+            shaders.contains("kernel void copy_buffer"),
+            "shaders should contain copy_buffer kernel"
+        );
+        assert!(
+            shaders.contains("kernel void copy_offset"),
+            "shaders should contain copy_offset kernel"
+        );
     }
 
     #[test]
@@ -2474,6 +2551,9 @@ mod tests {
             "fn dispatch_attention(&self, enc: &ComputeCommandEncoderRef",
             "fn dispatch_silu_mul(&self, enc: &ComputeCommandEncoderRef",
             "fn dispatch_add_inplace(&self, enc: &ComputeCommandEncoderRef",
+            "fn dispatch_copy(&self, enc: &ComputeCommandEncoderRef",
+            "fn dispatch_copy_offset(&self, enc: &ComputeCommandEncoderRef",
+            "fn dispatch_copy_to_offset(&self, enc: &ComputeCommandEncoderRef",
         ] {
             assert!(
                 model_rs.contains(method),
@@ -2542,24 +2622,21 @@ mod tests {
             "forward() should not allocate new buffers per call"
         );
 
-        // Forward should use batched compute encoders (fewer than one per op)
-        // Per layer: 1 compute encoder (pre-attention) + 1 blit + 1 compute encoder (post-attention)
-        // Plus 1 blit (embedding) + 1 compute encoder (final norm + logits)
-        // For 2 layers: 2*2 compute + 2 blit (layers) + 1 blit (embed) + 1 compute = 5 compute, 3 blit
+        // Forward should use a SINGLE compute encoder for the entire pass (no blit transitions).
+        // Copy operations use compute copy kernels instead of blit encoders.
         let compute_encoder_count = forward_code
             .matches("new_compute_command_encoder()")
             .count();
         let blit_encoder_count = forward_code.matches("new_blit_command_encoder()").count();
 
-        // With batching, we expect far fewer encoders than the old per-op approach
-        // Old: ~15+ compute encoders per layer. New: 2 compute + 1 blit per layer + 1 final compute
-        assert!(
-            compute_encoder_count <= 6,
-            "forward() should batch compute dispatches into fewer encoders, found {compute_encoder_count}"
+        // Single compute encoder for everything: embedding copy, all layers, final norm + logits
+        assert_eq!(
+            compute_encoder_count, 1,
+            "forward() should use exactly 1 compute encoder for the entire pass, found {compute_encoder_count}"
         );
-        assert!(
-            blit_encoder_count <= 4,
-            "forward() should have minimal blit encoders, found {blit_encoder_count}"
+        assert_eq!(
+            blit_encoder_count, 0,
+            "forward() should have zero blit encoders (replaced by compute copy kernels), found {blit_encoder_count}"
         );
     }
 
