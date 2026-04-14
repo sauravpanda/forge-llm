@@ -112,7 +112,8 @@ fn generate_metal_shaders() -> String {
 // Metal Shading Language compute kernels for transformer inference.
 //
 // Optimized with simdgroup cooperative reductions, shared memory vector
-// caching, and float4 vectorized loads for Apple Silicon throughput.
+// caching, float4 vectorized loads, multi-block Q8_0 processing per SIMD
+// lane, and fast:: math intrinsics for Apple Silicon throughput.
 //
 
 #include <metal_stdlib>
@@ -211,7 +212,7 @@ kernel void rms_norm(
         for (uint i = 0; i < 8; i++) {
             total += shared[i];
         }
-        shared[0] = rsqrt(total / float(n) + eps);
+        shared[0] = fast::rsqrt(total / float(n) + eps);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -284,7 +285,7 @@ kernel void softmax(
     // Pass 2: exp and sum
     float local_sum = 0.0f;
     for (uint i = tid; i < n; i += tg_size) {
-        float e = exp(data[i] - max_val);
+        float e = fast::exp(data[i] - max_val);
         data[i] = e;
         local_sum += e;
     }
@@ -318,7 +319,7 @@ kernel void silu_mul(
 {
     if (id >= n) return;
     float g = gate[id];
-    output[id] = (g / (1.0f + exp(-g))) * up[id];
+    output[id] = (g / (1.0f + fast::exp(-g))) * up[id];
 }
 
 // ── elementwise_add ─────────────────────────────────────────────────────
@@ -384,18 +385,56 @@ kernel void matmul_vec_q8(
 
     float sum = 0.0;
 
-    // Each lane handles every 32nd block
-    for (uint blk = simd_lane; blk < blocks_per_row; blk += 32) {
+    // Multi-block processing: each lane processes 2 blocks per iteration
+    // for better instruction-level parallelism and SIMD lane occupancy.
+    uint blk = simd_lane;
+    while (blk + 32 < blocks_per_row) {
+        // Process first block
+        {
+            uint blk_byte = blk * 34;
+            device const half* scale_ptr = (device const half*)(row_data + blk_byte);
+            float scale = float(*scale_ptr);
+            uint vec_base = blk * 32;
+            float block_dot = 0.0;
+            device const char4* data_ptr = (device const char4*)(row_data + blk_byte + 2);
+            for (uint q = 0; q < 8; q++) {
+                char4 vals = data_ptr[q];
+                uint vi = vec_base + q * 4;
+                block_dot += float(vals.x) * vec_tile[vi]
+                           + float(vals.y) * vec_tile[vi + 1]
+                           + float(vals.z) * vec_tile[vi + 2]
+                           + float(vals.w) * vec_tile[vi + 3];
+            }
+            sum += scale * block_dot;
+        }
+        // Process second block (blk + 32) in same iteration
+        {
+            uint blk2 = blk + 32;
+            uint blk_byte = blk2 * 34;
+            device const half* scale_ptr = (device const half*)(row_data + blk_byte);
+            float scale = float(*scale_ptr);
+            uint vec_base = blk2 * 32;
+            float block_dot = 0.0;
+            device const char4* data_ptr = (device const char4*)(row_data + blk_byte + 2);
+            for (uint q = 0; q < 8; q++) {
+                char4 vals = data_ptr[q];
+                uint vi = vec_base + q * 4;
+                block_dot += float(vals.x) * vec_tile[vi]
+                           + float(vals.y) * vec_tile[vi + 1]
+                           + float(vals.z) * vec_tile[vi + 2]
+                           + float(vals.w) * vec_tile[vi + 3];
+            }
+            sum += scale * block_dot;
+        }
+        blk += 64;
+    }
+    // Handle remaining block (when blocks_per_row is not evenly divisible)
+    if (blk < blocks_per_row) {
         uint blk_byte = blk * 34;
-
-        // Read f16 scale (2 bytes) directly via native half pointer
         device const half* scale_ptr = (device const half*)(row_data + blk_byte);
         float scale = float(*scale_ptr);
-
         uint vec_base = blk * 32;
         float block_dot = 0.0;
-
-        // Read 32 int8 values as 8 x char4 (vectorized: 4 bytes per load)
         device const char4* data_ptr = (device const char4*)(row_data + blk_byte + 2);
         for (uint q = 0; q < 8; q++) {
             char4 vals = data_ptr[q];
@@ -405,7 +444,6 @@ kernel void matmul_vec_q8(
                        + float(vals.z) * vec_tile[vi + 2]
                        + float(vals.w) * vec_tile[vi + 3];
         }
-
         sum += scale * block_dot;
     }
 
@@ -458,7 +496,7 @@ kernel void attention(
         }
         dot = simd_sum(dot);
         if (simd_lane == 0) {
-            scores[s] = dot / sqrt(float(head_dim));
+            scores[s] = dot * fast::rsqrt(float(head_dim));
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -484,7 +522,7 @@ kernel void attention(
     // Exp and sum
     float local_sum = 0.0;
     for (uint s = tid; s < seq_len; s += 256) {
-        scores[s] = exp(scores[s] - max_val);
+        scores[s] = fast::exp(scores[s] - max_val);
         local_sum += scores[s];
     }
     local_sum = simd_sum(local_sum);
