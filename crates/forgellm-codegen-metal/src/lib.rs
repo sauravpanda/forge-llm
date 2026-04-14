@@ -505,10 +505,10 @@ kernel void matmul_vec_q8(
         float sc2 = float(*(device const half*)(r2 + bb));
         float sc3 = float(*(device const half*)(r3 + bb));
 
-        device const char4* d0 = (device const char4*)(r0 + bb + 2);
-        device const char4* d1 = (device const char4*)(r1 + bb + 2);
-        device const char4* d2 = (device const char4*)(r2 + bb + 2);
-        device const char4* d3 = (device const char4*)(r3 + bb + 2);
+        device const packed_char4* d0 = (device const packed_char4*)(r0 + bb + 2);
+        device const packed_char4* d1 = (device const packed_char4*)(r1 + bb + 2);
+        device const packed_char4* d2 = (device const packed_char4*)(r2 + bb + 2);
+        device const packed_char4* d3 = (device const packed_char4*)(r3 + bb + 2);
 
         // Load all 8 float4 vector values for this 32-element block from shared memory
         float4 v0 = *(threadgroup const float4*)(vec_tile + vb);
@@ -628,10 +628,10 @@ kernel void matmul_vec_q4(
         float sc3 = float(*(device const half*)(r3 + bb));
 
         // Packed byte pointers (16 bytes = 32 nibbles = 32 elements)
-        device const uchar4* p0 = (device const uchar4*)(r0 + bb + 2);
-        device const uchar4* p1 = (device const uchar4*)(r1 + bb + 2);
-        device const uchar4* p2 = (device const uchar4*)(r2 + bb + 2);
-        device const uchar4* p3 = (device const uchar4*)(r3 + bb + 2);
+        device const packed_uchar4* p0 = (device const packed_uchar4*)(r0 + bb + 2);
+        device const packed_uchar4* p1 = (device const packed_uchar4*)(r1 + bb + 2);
+        device const packed_uchar4* p2 = (device const packed_uchar4*)(r2 + bb + 2);
+        device const packed_uchar4* p3 = (device const packed_uchar4*)(r3 + bb + 2);
 
         // Load 8 float4 vector values for 32 elements from shared memory
         // Low nibble elements: indices [0..15], High nibble elements: indices [16..31]
