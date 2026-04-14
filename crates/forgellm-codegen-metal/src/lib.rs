@@ -1323,6 +1323,141 @@ kernel void matmul_vec_q4_batch(
         if (row_base + 3 < rows) output[row_base + 3] = sum3;
     }
 }
+
+// ── copy_kv_batch ─────────────────────────────────────────────────────
+// Copy K or V from a strided batch QKV buffer to the KV cache.
+// src layout: [M, qkv_stride] with K/V at src_float_offset within each row.
+// dst layout: contiguous [max_seq, kv_dim] cache.
+kernel void copy_kv_batch(
+    device const float* src  [[buffer(0)]],  // batch QKV buffer
+    device float* dst        [[buffer(1)]],  // KV cache
+    constant uint& M         [[buffer(2)]],  // num tokens in batch
+    constant uint& kv_dim    [[buffer(3)]],  // floats per KV vector
+    constant uint& base_pos  [[buffer(4)]],  // starting position in cache
+    constant uint& src_stride [[buffer(5)]], // floats per row in src (qkv_rows)
+    constant uint& src_offset [[buffer(6)]], // float offset within each src row
+    uint id [[thread_position_in_grid]])
+{
+    uint total = M * kv_dim;
+    if (id >= total) return;
+    uint token = id / kv_dim;
+    uint d = id % kv_dim;
+    uint dst_off = (base_pos + token) * kv_dim + d;
+    uint src_off = token * src_stride + src_offset + d;
+    dst[dst_off] = src[src_off];
+}
+
+// ── attention_batch ───────────────────────────────────────────────────
+// Batched causal attention for prefill. Processes M tokens in one dispatch.
+// Each threadgroup handles one (token, head) pair.
+// Q is read from a strided buffer (batch QKV), K/V from the KV cache.
+// Causal masking: token i can only attend to positions 0..base_pos+i.
+kernel void attention_batch(
+    device const float* q_batch      [[buffer(0)]],  // batch QKV buf (strided)
+    device const float* k_cache      [[buffer(1)]],  // [max_seq, num_kv_heads * head_dim]
+    device const float* v_cache      [[buffer(2)]],  // [max_seq, num_kv_heads * head_dim]
+    device float* output_batch       [[buffer(3)]],  // [M, num_heads * head_dim]
+    constant uint& M                 [[buffer(4)]],  // num tokens in batch
+    constant uint& base_pos          [[buffer(5)]],  // starting position in KV cache
+    constant uint& num_heads         [[buffer(6)]],
+    constant uint& num_kv_heads      [[buffer(7)]],
+    constant uint& head_dim          [[buffer(8)]],
+    constant uint& q_stride          [[buffer(9)]],  // floats per row in q_batch
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]])
+{
+    // Grid: M * num_heads threadgroups
+    uint token_idx = tgid / num_heads;
+    uint head = tgid % num_heads;
+    if (token_idx >= M) return;
+
+    uint kv_head = head / (num_heads / num_kv_heads);
+    uint seq_len = base_pos + token_idx + 1;  // causal: see positions 0..base_pos+token_idx
+
+    // Q offset uses strided layout (from batch QKV buffer)
+    uint q_off = token_idx * q_stride + head * head_dim;
+    // Output is contiguous [M, num_heads * head_dim]
+    uint out_off = token_idx * num_heads * head_dim + head * head_dim;
+
+    // Shared memory for attention scores
+    threadgroup float scores[2048];
+
+    // Step 1: Q * K^T with simdgroup reduction
+    for (uint s = simd_id; s < seq_len; s += 8) {
+        uint k_off = s * num_kv_heads * head_dim + kv_head * head_dim;
+        float dot = 0.0;
+        for (uint d = simd_lane; d < head_dim; d += 32) {
+            dot += q_batch[q_off + d] * k_cache[k_off + d];
+        }
+        dot = simd_sum(dot);
+        if (simd_lane == 0) {
+            scores[s] = dot * fast::rsqrt(float(head_dim));
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 2: Softmax (cooperative)
+    float local_max = -INFINITY;
+    for (uint s = tid; s < seq_len; s += 256) {
+        local_max = max(local_max, scores[s]);
+    }
+    local_max = simd_max(local_max);
+    threadgroup float shared_max[8];
+    if (simd_lane == 0) shared_max[simd_id] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float m = shared_max[0];
+        for (uint i = 1; i < 8; i++) m = max(m, shared_max[i]);
+        shared_max[0] = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float max_val = shared_max[0];
+
+    float local_sum = 0.0;
+    for (uint s = tid; s < seq_len; s += 256) {
+        scores[s] = fast::exp(scores[s] - max_val);
+        local_sum += scores[s];
+    }
+    local_sum = simd_sum(local_sum);
+    threadgroup float shared_sum[8];
+    if (simd_lane == 0) shared_sum[simd_id] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float total = 0.0;
+        for (uint i = 0; i < 8; i++) total += shared_sum[i];
+        shared_sum[0] = (total > 0.0) ? (1.0 / total) : 0.0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_sum = shared_sum[0];
+    for (uint s = tid; s < seq_len; s += 256) {
+        scores[s] *= inv_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 3: scores * V with 4-way unrolling
+    uint seq_len4 = seq_len & ~3u;
+    uint v_stride = num_kv_heads * head_dim;
+    for (uint d = tid; d < head_dim; d += 256) {
+        float acc = 0.0;
+        uint v_base = kv_head * head_dim + d;
+        for (uint s = 0; s < seq_len4; s += 4) {
+            float sc0 = scores[s];
+            float sc1 = scores[s + 1];
+            float sc2 = scores[s + 2];
+            float sc3 = scores[s + 3];
+            acc += sc0 * v_cache[s * v_stride + v_base]
+                 + sc1 * v_cache[(s+1) * v_stride + v_base]
+                 + sc2 * v_cache[(s+2) * v_stride + v_base]
+                 + sc3 * v_cache[(s+3) * v_stride + v_base];
+        }
+        for (uint s = seq_len4; s < seq_len; s++) {
+            acc += scores[s] * v_cache[s * v_stride + v_base];
+        }
+        output_batch[out_off + d] = acc;
+    }
+}
 "#
     .replace("VEC_TILE_SIZE", &vec_tile_size.to_string())
 }
@@ -1468,6 +1603,8 @@ fn emit_metal_model_struct(
         code,
         "    copy_embedding_batch_pipeline: ComputePipelineState,"
     )?;
+    writeln!(code, "    attention_batch_pipeline: ComputePipelineState,")?;
+    writeln!(code, "    copy_kv_batch_pipeline: ComputePipelineState,")?;
     writeln!(code)?;
     writeln!(code, "    // ── Weight buffers (Metal shared memory) ──")?;
     writeln!(
@@ -1673,6 +1810,8 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         ("silu_mul_fused_batch_pipeline", "silu_mul_fused_batch"),
         ("add_inplace_batch_pipeline", "add_inplace_batch"),
         ("copy_embedding_batch_pipeline", "copy_embedding_batch"),
+        ("attention_batch_pipeline", "attention_batch"),
+        ("copy_kv_batch_pipeline", "copy_kv_batch"),
     ] {
         writeln!(
             code,
@@ -2171,6 +2310,8 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            silu_mul_fused_batch_pipeline,")?;
     writeln!(code, "            add_inplace_batch_pipeline,")?;
     writeln!(code, "            copy_embedding_batch_pipeline,")?;
+    writeln!(code, "            attention_batch_pipeline,")?;
+    writeln!(code, "            copy_kv_batch_pipeline,")?;
     writeln!(code, "            embed_buf,")?;
     writeln!(code, "            layers,")?;
     writeln!(code, "            norm_buf,")?;
@@ -2456,7 +2597,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     )?;
     writeln!(
         code,
-        "    /// of mat-vec), with sequential attention due to causal dependency."
+        "    /// of mat-vec), and batched causal attention with a single GPU dispatch."
     )?;
     writeln!(
         code,
@@ -2564,51 +2705,39 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     )?;
     writeln!(code)?;
 
-    // Sequential attention: must process each token individually (causal dependency)
+    // Batched KV cache update: copy K and V from batch_qkv_buf to KV caches
+    let v_float_offset = hidden + kv_dim;
     writeln!(
         code,
-        "                // Sequential attention (causal dependency requires per-token processing)"
+        "                // Batched KV cache update: copy all K and V vectors to cache at once"
     )?;
-    writeln!(code, "                for t in 0..m {{")?;
-    writeln!(code, "                    let pos_t = start_pos + t;")?;
+    writeln!(
+        code,
+        "                self.dispatch_copy_kv_batch(&enc, &self.batch_qkv_buf, &self.k_cache[layer], m, {kv_dim}, start_pos, {qkv_rows}, {k_float_offset});"
+    )?;
+    writeln!(
+        code,
+        "                self.dispatch_copy_kv_batch(&enc, &self.batch_qkv_buf, &self.v_cache[layer], m, {kv_dim}, start_pos, {qkv_rows}, {v_float_offset});"
+    )?;
+    writeln!(code)?;
 
-    // Copy this token's K and V from batch_qkv_buf to KV cache
-    let qkv_token_bytes = (hidden + 2 * kv_dim) * 4;
+    // Batched causal attention: ONE dispatch for all M tokens
     writeln!(
         code,
-        "                    let qkv_token_offset = t * {qkv_token_bytes};"
+        "                // Batched causal attention: one dispatch for all M tokens"
     )?;
     writeln!(
         code,
-        "                    let kv_offset = pos_t * {kv_dim};"
+        "                self.dispatch_attention_batch(&enc, &self.batch_qkv_buf, &self.k_cache[layer], &self.v_cache[layer], &self.batch_attn_out_buf, m, start_pos, {qkv_rows});"
     )?;
-    writeln!(
-        code,
-        "                    self.dispatch_copy_from_offset(&enc, &self.batch_qkv_buf, qkv_token_offset + {k_byte_offset}, &self.k_cache[layer], kv_offset, {kv_dim});"
-    )?;
-    writeln!(
-        code,
-        "                    self.dispatch_copy_from_offset(&enc, &self.batch_qkv_buf, qkv_token_offset + {v_byte_offset}, &self.v_cache[layer], kv_offset, {kv_dim});"
-    )?;
+    writeln!(code)?;
 
-    // Attention: use Q from batch_qkv_buf at this token's offset
+    // Batched O projection: [M, hidden] x [hidden, hidden]^T -> [M, hidden]
+    writeln!(code, "                // Batched O projection")?;
     writeln!(
         code,
-        "                    self.dispatch_attention_offset(&enc, &self.batch_qkv_buf, qkv_token_offset + {q_byte_offset}, &self.k_cache[layer], &self.v_cache[layer], &self.attn_out_buf, pos_t + 1);"
+        "                self.{batch_matmul_fn}(&enc, &self.batch_attn_out_buf, &self.layers[layer].o_weight, &self.batch_attn_proj_buf, m, {hidden}, {hidden});"
     )?;
-
-    // O projection: single-token matmul into batch_attn_proj at token offset
-    writeln!(
-        code,
-        "                    self.{matmul_fn}(&enc, &self.attn_out_buf, &self.layers[layer].o_weight, &self.attn_proj_buf, {hidden}, {hidden});"
-    )?;
-
-    // Copy attn_proj to batch_attn_proj_buf at the right offset
-    writeln!(
-        code,
-        "                    self.dispatch_copy_to_offset_bytes(&enc, &self.attn_proj_buf, &self.batch_attn_proj_buf, t * {hidden}, {hidden});"
-    )?;
-    writeln!(code, "                }}")?;
     writeln!(code)?;
 
     // Batch add: residual += attn_proj for all tokens
@@ -3831,6 +3960,124 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(
         code,
         "        let grid_size = MTLSize::new(((count + 255) / 256) as u64, 1, 1);"
+    )?;
+    writeln!(
+        code,
+        "        enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
+
+    // dispatch_copy_kv_batch
+    writeln!(
+        code,
+        "    /// Dispatch batched KV cache copy: copy K or V from strided batch QKV buffer to KV cache."
+    )?;
+    writeln!(
+        code,
+        "    fn dispatch_copy_kv_batch(&self, enc: &ComputeCommandEncoderRef, src: &Buffer, dst: &Buffer, num_tokens: usize, kv_dim: usize, base_pos: usize, src_stride: usize, src_offset: usize) {{"
+    )?;
+    writeln!(code, "        let m_val: u32 = num_tokens as u32;")?;
+    writeln!(code, "        let kv: u32 = kv_dim as u32;")?;
+    writeln!(code, "        let bp: u32 = base_pos as u32;")?;
+    writeln!(code, "        let ss: u32 = src_stride as u32;")?;
+    writeln!(code, "        let so: u32 = src_offset as u32;")?;
+    writeln!(
+        code,
+        "        enc.set_compute_pipeline_state(&self.copy_kv_batch_pipeline);"
+    )?;
+    writeln!(code, "        enc.set_buffer(0, Some(src), 0);")?;
+    writeln!(code, "        enc.set_buffer(1, Some(dst), 0);")?;
+    writeln!(
+        code,
+        "        enc.set_bytes(2, mem::size_of::<u32>() as u64, &m_val as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(3, mem::size_of::<u32>() as u64, &kv as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(4, mem::size_of::<u32>() as u64, &bp as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(5, mem::size_of::<u32>() as u64, &ss as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(6, mem::size_of::<u32>() as u64, &so as *const u32 as *const _);"
+    )?;
+    writeln!(code, "        let total = num_tokens * kv_dim;")?;
+    writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
+    writeln!(
+        code,
+        "        let grid_size = MTLSize::new(((total + 255) / 256) as u64, 1, 1);"
+    )?;
+    writeln!(
+        code,
+        "        enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
+
+    // dispatch_attention_batch
+    writeln!(
+        code,
+        "    /// Dispatch batched causal attention: one dispatch for all M tokens."
+    )?;
+    writeln!(
+        code,
+        "    fn dispatch_attention_batch(&self, enc: &ComputeCommandEncoderRef, q_buf: &Buffer, k_cache: &Buffer, v_cache: &Buffer, output: &Buffer, num_tokens: usize, base_pos: usize, q_stride: usize) {{"
+    )?;
+    writeln!(code, "        let m_val: u32 = num_tokens as u32;")?;
+    writeln!(code, "        let bp: u32 = base_pos as u32;")?;
+    writeln!(code, "        let nh: u32 = NUM_HEADS as u32;")?;
+    writeln!(code, "        let nkv: u32 = NUM_KV_HEADS as u32;")?;
+    writeln!(code, "        let hd: u32 = HEAD_DIM as u32;")?;
+    writeln!(code, "        let qs: u32 = q_stride as u32;")?;
+    writeln!(
+        code,
+        "        enc.set_compute_pipeline_state(&self.attention_batch_pipeline);"
+    )?;
+    writeln!(code, "        enc.set_buffer(0, Some(q_buf), 0);")?;
+    writeln!(code, "        enc.set_buffer(1, Some(k_cache), 0);")?;
+    writeln!(code, "        enc.set_buffer(2, Some(v_cache), 0);")?;
+    writeln!(code, "        enc.set_buffer(3, Some(output), 0);")?;
+    writeln!(
+        code,
+        "        enc.set_bytes(4, mem::size_of::<u32>() as u64, &m_val as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(5, mem::size_of::<u32>() as u64, &bp as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(6, mem::size_of::<u32>() as u64, &nh as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(7, mem::size_of::<u32>() as u64, &nkv as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(8, mem::size_of::<u32>() as u64, &hd as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(9, mem::size_of::<u32>() as u64, &qs as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        // One threadgroup per (token, head) pair, 256 threads for cooperative reductions"
+    )?;
+    writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
+    writeln!(
+        code,
+        "        let grid_size = MTLSize::new((num_tokens * NUM_HEADS) as u64, 1, 1);"
     )?;
     writeln!(
         code,
@@ -5572,6 +5819,8 @@ mod tests {
             "silu_mul_fused_batch_pipeline",
             "add_inplace_batch_pipeline",
             "copy_embedding_batch_pipeline",
+            "attention_batch_pipeline",
+            "copy_kv_batch_pipeline",
         ] {
             assert!(
                 model_rs.contains(&format!("{pipeline}: ComputePipelineState")),
@@ -5659,10 +5908,15 @@ mod tests {
             batch_code.contains("dispatch_silu_mul_fused_batch"),
             "forward_prefill_batch should use dispatch_silu_mul_fused_batch"
         );
-        // Should have sequential attention loop
+        // Should use batched causal attention dispatch
         assert!(
-            batch_code.contains("for t in 0..m"),
-            "forward_prefill_batch should have sequential attention loop"
+            batch_code.contains("dispatch_attention_batch"),
+            "forward_prefill_batch should use dispatch_attention_batch"
+        );
+        // Should use batched KV cache copy
+        assert!(
+            batch_code.contains("dispatch_copy_kv_batch"),
+            "forward_prefill_batch should use dispatch_copy_kv_batch"
         );
     }
 
