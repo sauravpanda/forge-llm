@@ -3895,6 +3895,7 @@ fn generate_main_rs(model_name: &str, config: &ModelConfig) -> Result<String, Me
     writeln!(code, "mod model;")?;
     writeln!(code)?;
     writeln!(code, "use std::io::Write;")?;
+    writeln!(code, "use std::time::Instant;")?;
     writeln!(code, "use serde::Deserialize;")?;
     writeln!(code)?;
 
@@ -3915,7 +3916,7 @@ fn generate_main_rs(model_name: &str, config: &ModelConfig) -> Result<String, Me
     )?;
     writeln!(code)?;
     writeln!(code, "    if !serve_mode && args.len() < 4 {{")?;
-    writeln!(code, "        eprintln!(\"Usage: {{}} <weights.bin> <tokenizer.json> <prompt> [--max-tokens N]\", args[0]);")?;
+    writeln!(code, "        eprintln!(\"Usage: {{}} <weights.bin> <tokenizer.json> <prompt> [--max-tokens N] [--quiet]\", args[0]);")?;
     writeln!(code, "        eprintln!(\"       {{}} <weights.bin> <tokenizer.json> --serve [--port 8080]\", args[0]);")?;
     writeln!(code, "        std::process::exit(1);")?;
     writeln!(code, "    }}")?;
@@ -3931,6 +3932,10 @@ fn generate_main_rs(model_name: &str, config: &ModelConfig) -> Result<String, Me
     writeln!(code, "    // Parse optional flags")?;
     writeln!(code, "    let mut max_tokens: usize = 128;")?;
     writeln!(code, "    let mut port: u16 = 8080;")?;
+    writeln!(
+        code,
+        "    let quiet = args.iter().any(|a| a == \"--quiet\" || a == \"-q\");"
+    )?;
     writeln!(code, "    let mut i = 3;")?;
     writeln!(code, "    while i < args.len() {{")?;
     writeln!(
@@ -3996,14 +4001,14 @@ fn generate_main_rs(model_name: &str, config: &ModelConfig) -> Result<String, Me
     writeln!(code, "        let prompt = &args[3];")?;
     writeln!(
         code,
-        "        cli_mode(&mut model, &tokenizer, prompt, max_tokens);"
+        "        cli_mode(&mut model, &tokenizer, prompt, max_tokens, quiet);"
     )?;
     writeln!(code, "    }}")?;
     writeln!(code, "}}")?;
     writeln!(code)?;
 
     // -- cli_mode function --
-    writeln!(code, "fn cli_mode(model: &mut model::MetalModel, tokenizer: &tokenizers::Tokenizer, prompt: &str, max_tokens: usize) {{")?;
+    writeln!(code, "fn cli_mode(model: &mut model::MetalModel, tokenizer: &tokenizers::Tokenizer, prompt: &str, max_tokens: usize, quiet: bool) {{")?;
     writeln!(code, "    // Tokenize prompt")?;
     writeln!(code, "    let encoding = tokenizer.encode(prompt, true)")?;
     writeln!(code, "        .unwrap_or_else(|e| {{ eprintln!(\"Tokenization failed: {{e}}\"); std::process::exit(1); }});")?;
@@ -4022,6 +4027,7 @@ fn generate_main_rs(model_name: &str, config: &ModelConfig) -> Result<String, Me
         "    // The last token uses synchronous forward() to get logits."
     )?;
     writeln!(code, "    let prompt_len = prompt_tokens.len();")?;
+    writeln!(code, "    let prefill_start = Instant::now();")?;
     writeln!(code, "    let logits = if prompt_len > 1 {{")?;
     writeln!(
         code,
@@ -4031,18 +4037,36 @@ fn generate_main_rs(model_name: &str, config: &ModelConfig) -> Result<String, Me
     writeln!(code, "    }} else {{")?;
     writeln!(code, "        model.forward(prompt_tokens[0])")?;
     writeln!(code, "    }};")?;
+    writeln!(
+        code,
+        "    let prefill_elapsed = prefill_start.elapsed().as_secs_f64();"
+    )?;
+    writeln!(code, "    let prefill_tokens = prompt_tokens.len();")?;
+    writeln!(
+        code,
+        "    eprintln!(\"Prefill: {{}} tokens in {{:.3}}s ({{:.1}} tok/s)\","
+    )?;
+    writeln!(
+        code,
+        "        prefill_tokens, prefill_elapsed, prefill_tokens as f64 / prefill_elapsed);"
+    )?;
     writeln!(code)?;
     writeln!(code, "    // Generate tokens")?;
     writeln!(code, "    let mut next_token = argmax(&logits);")?;
+    writeln!(code, "    let gen_start = Instant::now();")?;
+    writeln!(code, "    let mut generated_count: usize = 0;")?;
     writeln!(code)?;
     writeln!(code, "    for _ in 0..max_tokens {{")?;
     writeln!(
         code,
         "        if let Some(text) = tokenizer.decode(&[next_token], false).ok() {{"
     )?;
-    writeln!(code, "            print!(\"{{}}\", text);")?;
-    writeln!(code, "            std::io::stdout().flush().ok();")?;
+    writeln!(code, "            if !quiet {{")?;
+    writeln!(code, "                print!(\"{{}}\", text);")?;
+    writeln!(code, "                std::io::stdout().flush().ok();")?;
+    writeln!(code, "            }}")?;
     writeln!(code, "        }}")?;
+    writeln!(code, "        generated_count += 1;")?;
     writeln!(code)?;
     writeln!(code, "        let logits = model.forward(next_token);")?;
     writeln!(code, "        next_token = argmax(&logits);")?;
@@ -4052,7 +4076,21 @@ fn generate_main_rs(model_name: &str, config: &ModelConfig) -> Result<String, Me
     writeln!(code, "            break;")?;
     writeln!(code, "        }}")?;
     writeln!(code, "    }}")?;
-    writeln!(code, "    println!();")?;
+    writeln!(code, "    if !quiet {{")?;
+    writeln!(code, "        println!();")?;
+    writeln!(code, "    }}")?;
+    writeln!(
+        code,
+        "    let gen_elapsed = gen_start.elapsed().as_secs_f64();"
+    )?;
+    writeln!(
+        code,
+        "    eprintln!(\"Generate: {{}} tokens in {{:.2}}s ({{:.1}} tok/s)\","
+    )?;
+    writeln!(
+        code,
+        "        generated_count, gen_elapsed, generated_count as f64 / gen_elapsed);"
+    )?;
     writeln!(code, "}}")?;
     writeln!(code)?;
 
@@ -4264,8 +4302,14 @@ fn generate_main_rs(model_name: &str, config: &ModelConfig) -> Result<String, Me
     writeln!(code, "    model.reset();")?;
     writeln!(code)?;
 
-    // -- Prefill --
+    // -- Prefill with timing --
+    writeln!(code, "    let prefill_start = Instant::now();")?;
     writeln!(code, "    let logits = prefill(model, prompt_tokens);")?;
+    writeln!(
+        code,
+        "    let prefill_elapsed = prefill_start.elapsed().as_secs_f64();"
+    )?;
+    writeln!(code, "    let prefill_count = prompt_tokens.len();")?;
     writeln!(code, "    let mut next_token = argmax(&logits);")?;
     writeln!(code)?;
 
@@ -4276,6 +4320,8 @@ fn generate_main_rs(model_name: &str, config: &ModelConfig) -> Result<String, Me
         code,
         "        // SSE streaming: generate tokens and build SSE body"
     )?;
+    writeln!(code, "        let gen_start = Instant::now();")?;
+    writeln!(code, "        let mut generated_count: usize = 0;")?;
     writeln!(code, "        let mut sse_body = String::new();")?;
     writeln!(code, "        for _ in 0..max_tokens {{")?;
     writeln!(code, "            if next_token == 2 {{ break; }}")?;
@@ -4300,15 +4346,25 @@ fn generate_main_rs(model_name: &str, config: &ModelConfig) -> Result<String, Me
     writeln!(code, "                    inner")?;
     writeln!(code, "                ));")?;
     writeln!(code, "            }}")?;
+    writeln!(code, "            generated_count += 1;")?;
     writeln!(code, "            let logits = model.forward(next_token);")?;
     writeln!(code, "            next_token = argmax(&logits);")?;
     writeln!(code, "        }}")?;
+    writeln!(
+        code,
+        "        let gen_elapsed = gen_start.elapsed().as_secs_f64();"
+    )?;
+    writeln!(code, "        let gen_tok_s = if gen_elapsed > 0.0 {{ generated_count as f64 / gen_elapsed }} else {{ 0.0 }};")?;
+    writeln!(code, "        let gen_time_ms = gen_elapsed * 1000.0;")?;
     writeln!(code)?;
     writeln!(
         code,
-        "        // Final chunk with finish_reason + DONE sentinel"
+        "        // Final chunk with finish_reason, timing, and DONE sentinel"
     )?;
-    writeln!(code, "        sse_body.push_str(\"data: {{\\\"id\\\":\\\"chatcmpl-1\\\",\\\"object\\\":\\\"chat.completion.chunk\\\",\\\"choices\\\":[{{\\\"index\\\":0,\\\"delta\\\":{{}},\\\"finish_reason\\\":\\\"stop\\\"}}]}}\\n\\ndata: [DONE]\\n\\n\");")?;
+    writeln!(code, "        sse_body.push_str(&format!(")?;
+    writeln!(code, "            \"data: {{{{\\\"id\\\":\\\"chatcmpl-1\\\",\\\"object\\\":\\\"chat.completion.chunk\\\",\\\"choices\\\":[{{{{\\\"index\\\":0,\\\"delta\\\":{{{{}}}},\\\"finish_reason\\\":\\\"stop\\\"}}}}],\\\"usage\\\":{{{{\\\"prefill_tokens\\\":{{}},\\\"prefill_time_ms\\\":{{:.1}},\\\"generation_tokens\\\":{{}},\\\"generation_time_ms\\\":{{:.1}},\\\"tokens_per_sec\\\":{{:.1}}}}}}}}}}\\n\\ndata: [DONE]\\n\\n\",")?;
+    writeln!(code, "            prefill_count, prefill_elapsed * 1000.0, generated_count, gen_time_ms, gen_tok_s")?;
+    writeln!(code, "        ));")?;
     writeln!(code)?;
     writeln!(
         code,
@@ -4325,6 +4381,8 @@ fn generate_main_rs(model_name: &str, config: &ModelConfig) -> Result<String, Me
         code,
         "        // Non-streaming: generate all tokens, return JSON"
     )?;
+    writeln!(code, "        let gen_start = Instant::now();")?;
+    writeln!(code, "        let mut generated_count: usize = 0;")?;
     writeln!(code, "        let mut generated = String::new();")?;
     writeln!(code, "        for _ in 0..max_tokens {{")?;
     writeln!(code, "            if next_token == 2 {{ break; }}")?;
@@ -4334,9 +4392,15 @@ fn generate_main_rs(model_name: &str, config: &ModelConfig) -> Result<String, Me
     )?;
     writeln!(code, "                generated.push_str(&text);")?;
     writeln!(code, "            }}")?;
+    writeln!(code, "            generated_count += 1;")?;
     writeln!(code, "            let logits = model.forward(next_token);")?;
     writeln!(code, "            next_token = argmax(&logits);")?;
     writeln!(code, "        }}")?;
+    writeln!(
+        code,
+        "        let gen_elapsed = gen_start.elapsed().as_secs_f64();"
+    )?;
+    writeln!(code, "        let gen_tok_s = if gen_elapsed > 0.0 {{ generated_count as f64 / gen_elapsed }} else {{ 0.0 }};")?;
     writeln!(code)?;
     writeln!(code, "        let resp_json = serde_json::json!({{")?;
     writeln!(code, "            \"id\": \"chatcmpl-1\",")?;
@@ -4348,7 +4412,23 @@ fn generate_main_rs(model_name: &str, config: &ModelConfig) -> Result<String, Me
     writeln!(code, "                    \"content\": generated")?;
     writeln!(code, "                }},")?;
     writeln!(code, "                \"finish_reason\": \"stop\"")?;
-    writeln!(code, "            }}]")?;
+    writeln!(code, "            }}],")?;
+    writeln!(code, "            \"usage\": {{")?;
+    writeln!(code, "                \"prefill_tokens\": prefill_count,")?;
+    writeln!(
+        code,
+        "                \"prefill_time_ms\": (prefill_elapsed * 1000.0) as u64,"
+    )?;
+    writeln!(
+        code,
+        "                \"generation_tokens\": generated_count,"
+    )?;
+    writeln!(
+        code,
+        "                \"generation_time_ms\": (gen_elapsed * 1000.0) as u64,"
+    )?;
+    writeln!(code, "                \"tokens_per_sec\": gen_tok_s")?;
+    writeln!(code, "            }}")?;
     writeln!(code, "        }});")?;
     writeln!(
         code,
