@@ -666,10 +666,11 @@ fn emit_specialized_matmul_functions(
     )?;
     writeln!(code)?;
 
-    // Threshold for parallelization: only parallelize if N >= 4096
-    // (otherwise Rayon task-spawn overhead dominates; e.g. N=576 yields only 3 chunks
-    //  which gives poor utilization and more overhead than benefit)
-    let par_threshold = 4096;
+    // Parallelize when the weight matrix is large enough to amortize Rayon overhead.
+    // Use a byte-count threshold: N * row_bytes > 1 MB → parallel.
+    // This adapts to model size: 135M stays sequential for small projections,
+    // 1B parallelizes down_proj (2048 * 2720 = 5.4MB) and q/o_proj (2048 * 2176 = 4.3MB).
+    let par_byte_threshold: usize = 1_000_000;
 
     for &(k, n) in &matmul_shapes(config) {
         // --- macOS path: cblas_sgemv via Accelerate (uses AMX coprocessor) ---
@@ -714,7 +715,8 @@ fn emit_specialized_matmul_functions(
             "/// Specialized matmul: [1, {k}] x [{n}, {k}]^T -> [1, {n}]"
         )?;
         writeln!(code, "#[cfg(not(target_os = \"macos\"))]")?;
-        if n >= par_threshold {
+        let weight_bytes = n * k * 4; // f32: 4 bytes per element
+        if weight_bytes >= par_byte_threshold {
             // Parallel path: par_chunks_mut(256) for cache locality + amortized Rayon overhead
             writeln!(
                 code,
@@ -1477,9 +1479,8 @@ fn emit_specialized_q8_matmul_functions(
     )?;
     writeln!(code)?;
 
-    // Rayon overhead dominates for small N — only parallelize when N >= 4096
-    // (N=576 → 3 chunks, N=1536 → 6 chunks: too few for effective utilization)
-    let par_threshold = 4096;
+    // Parallelize when total weight bytes > 1 MB (adapts to model size).
+    let par_byte_threshold: usize = 1_000_000;
 
     for &(k, n) in &q8_matmul_shapes(config) {
         // Byte size per row: ceil(k/32)*34
@@ -1513,7 +1514,7 @@ fn emit_specialized_q8_matmul_functions(
         let n_rem8 = n % 8;
         let n_chunks4_tail = n_rem8 / 4;
         let n_rem4 = n_rem8 % 4;
-        if n >= par_threshold {
+        if n * ((k + 31) / 32 * 34) >= par_byte_threshold {
             writeln!(
                 code,
                 "    output.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
@@ -1593,7 +1594,7 @@ fn emit_specialized_q8_matmul_functions(
             code,
             "fn matmul_vec_q8_0_{k}x{n}(output: &mut [f32; {n}], input: &[f32; {k}], weight: &[u8]) {{"
         )?;
-        if n >= par_threshold {
+        if n * ((k + 31) / 32 * 34) >= par_byte_threshold {
             writeln!(
                 code,
                 "    output.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
@@ -2103,8 +2104,8 @@ fn emit_specialized_q4_matmul_functions(
     )?;
     writeln!(code)?;
 
-    // Same threshold as Q8_0: N < 4096 → sequential, N >= 4096 → parallel
-    let par_threshold = 4096;
+    // Parallelize when total weight bytes > 1 MB (adapts to model size).
+    let par_byte_threshold: usize = 1_000_000;
 
     for &(k, n) in &q4_matmul_shapes(config) {
         // Byte size per row: ceil(k/32)*18
@@ -2133,7 +2134,7 @@ fn emit_specialized_q4_matmul_functions(
         let n_rem8 = n % 8;
         let n_chunks4_tail = n_rem8 / 4;
         let n_rem4 = n_rem8 % 4;
-        if n >= par_threshold {
+        if n * ((k + 31) / 32 * 34) >= par_byte_threshold {
             writeln!(
                 code,
                 "    output.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
@@ -2213,7 +2214,7 @@ fn emit_specialized_q4_matmul_functions(
             code,
             "fn matmul_vec_q4_0_{k}x{n}(output: &mut [f32; {n}], input: &[f32; {k}], weight: &[u8]) {{"
         )?;
-        if n >= par_threshold {
+        if n * ((k + 31) / 32 * 34) >= par_byte_threshold {
             writeln!(
                 code,
                 "    output.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
