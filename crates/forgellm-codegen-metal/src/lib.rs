@@ -352,6 +352,8 @@ kernel void add_inplace(
 // Q8_0 block: 2 bytes f16 scale + 32 bytes int8 data = 34 bytes per 32 elements.
 // Operates directly on quantized weights to halve memory bandwidth vs f32,
 // yielding ~1.5-2x speedup on bandwidth-bound GPU matmul.
+// Uses char4 vectorized loads (4 int8 values per load) to reduce memory
+// transactions by 4x compared to scalar reads.
 // Each threadgroup processes 8 rows (one per simdgroup of 32 lanes).
 kernel void matmul_vec_q8(
     device const uchar* matrix   [[buffer(0)]],  // Q8_0 raw bytes
@@ -384,21 +386,27 @@ kernel void matmul_vec_q8(
 
     // Each lane handles every 32nd block
     for (uint blk = simd_lane; blk < blocks_per_row; blk += 32) {
-        uint blk_offset = blk * 34;
+        uint blk_byte = blk * 34;
 
-        // Read f16 scale (2 bytes) and convert to f32
-        device const half* scale_ptr = (device const half*)(row_data + blk_offset);
+        // Read f16 scale (2 bytes) directly via native half pointer
+        device const half* scale_ptr = (device const half*)(row_data + blk_byte);
         float scale = float(*scale_ptr);
 
-        // Read 32 int8 values and dot with corresponding vector elements
-        float block_sum = 0.0;
         uint vec_base = blk * 32;
-        for (uint i = 0; i < 32; i++) {
-            int8_t val = (int8_t)row_data[blk_offset + 2 + i];
-            block_sum += float(val) * vec_tile[vec_base + i];
+        float block_dot = 0.0;
+
+        // Read 32 int8 values as 8 x char4 (vectorized: 4 bytes per load)
+        device const char4* data_ptr = (device const char4*)(row_data + blk_byte + 2);
+        for (uint q = 0; q < 8; q++) {
+            char4 vals = data_ptr[q];
+            uint vi = vec_base + q * 4;
+            block_dot += float(vals.x) * vec_tile[vi]
+                       + float(vals.y) * vec_tile[vi + 1]
+                       + float(vals.z) * vec_tile[vi + 2]
+                       + float(vals.w) * vec_tile[vi + 3];
         }
 
-        sum += scale * block_sum;
+        sum += scale * block_dot;
     }
 
     sum = simd_sum(sum);
@@ -667,6 +675,16 @@ fn emit_metal_model_struct(
     writeln!(code)?;
     writeln!(code, "    // ── Inference state ──")?;
     writeln!(code, "    pos: usize,")?;
+    writeln!(code)?;
+    writeln!(
+        code,
+        "    /// Previous command buffer for double-buffered prefill."
+    )?;
+    writeln!(
+        code,
+        "    /// While the GPU executes token N, the CPU can encode token N+1."
+    )?;
+    writeln!(code, "    prev_cmd: Option<CommandBuffer>,")?;
     writeln!(code, "}}")?;
     writeln!(code)?;
 
@@ -1100,6 +1118,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            k_cache,")?;
     writeln!(code, "            v_cache,")?;
     writeln!(code, "            pos: 0,")?;
+    writeln!(code, "            prev_cmd: None,")?;
     writeln!(code, "        }}")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
@@ -1127,6 +1146,14 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "    pub fn forward(&mut self, token_id: u32) -> Vec<f32> {{"
     )?;
+    writeln!(
+        code,
+        "        // Wait for any pending prefill command buffer"
+    )?;
+    writeln!(code, "        if let Some(prev) = self.prev_cmd.take() {{")?;
+    writeln!(code, "            prev.wait_until_completed();")?;
+    writeln!(code, "        }}")?;
+    writeln!(code)?;
     writeln!(code, "        let pos = self.pos;")?;
     writeln!(code, "        let cmd = self.queue.new_command_buffer();")?;
     writeln!(code)?;
@@ -1335,6 +1362,200 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code)?;
     writeln!(code, "        self.pos += 1;")?;
     writeln!(code, "        logits")?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
+
+    // ── forward_prefill: async forward for prefill tokens (no logits readback) ──
+    writeln!(
+        code,
+        "    /// Asynchronous forward pass for prefill tokens (no logits readback)."
+    )?;
+    writeln!(code, "    ///")?;
+    writeln!(
+        code,
+        "    /// Commits the command buffer without waiting, enabling double-buffered"
+    )?;
+    writeln!(
+        code,
+        "    /// execution: GPU processes token N while CPU encodes token N+1."
+    )?;
+    writeln!(
+        code,
+        "    pub fn forward_prefill(&mut self, token_id: u32) {{"
+    )?;
+    writeln!(code, "        let pos = self.pos;")?;
+    writeln!(code)?;
+    writeln!(
+        code,
+        "        // Wait for previous prefill command buffer to complete before reusing buffers"
+    )?;
+    writeln!(code, "        if let Some(prev) = self.prev_cmd.take() {{")?;
+    writeln!(code, "            prev.wait_until_completed();")?;
+    writeln!(code, "        }}")?;
+    writeln!(code)?;
+    writeln!(code, "        let cmd = self.queue.new_command_buffer();")?;
+    writeln!(code)?;
+
+    // Embedding lookup (same as forward)
+    writeln!(
+        code,
+        "        // 1. Embedding lookup: copy row `token_id` from embed_buf -> hidden_buf"
+    )?;
+    writeln!(code, "        {{")?;
+    writeln!(
+        code,
+        "            let src_offset = (token_id as usize) * HIDDEN_SIZE * 4;"
+    )?;
+    writeln!(code, "            let byte_len = HIDDEN_SIZE * 4;")?;
+    writeln!(
+        code,
+        "            let blit_enc = cmd.new_blit_command_encoder();"
+    )?;
+    writeln!(code, "            blit_enc.copy_from_buffer(")?;
+    writeln!(code, "                &self.embed_buf, src_offset as u64,")?;
+    writeln!(code, "                &self.hidden_buf, 0,")?;
+    writeln!(code, "                byte_len as u64,")?;
+    writeln!(code, "            );")?;
+    writeln!(code, "            blit_enc.copy_from_buffer(")?;
+    writeln!(code, "                &self.hidden_buf, 0,")?;
+    writeln!(code, "                &self.residual_buf, 0,")?;
+    writeln!(code, "                byte_len as u64,")?;
+    writeln!(code, "            );")?;
+    writeln!(code, "            blit_enc.end_encoding();")?;
+    writeln!(code, "        }}")?;
+    writeln!(code)?;
+
+    // Transformer layers (same as forward)
+    writeln!(code, "        // 2. Transformer layers")?;
+    writeln!(code, "        for layer in 0..NUM_LAYERS {{")?;
+    writeln!(code)?;
+
+    writeln!(
+        code,
+        "            // Compute encoder: rms_norm, Q/K/V projections, RoPE"
+    )?;
+    writeln!(code, "            {{")?;
+    writeln!(
+        code,
+        "                let enc = cmd.new_compute_command_encoder();"
+    )?;
+    writeln!(
+        code,
+        "                self.dispatch_rms_norm(&enc, &self.layers[layer].attn_norm);"
+    )?;
+    writeln!(
+        code,
+        "                self.{matmul_fn}(&enc, &self.hidden_buf, &self.layers[layer].q_weight, &self.q_buf, {hidden}, {hidden});"
+    )?;
+    writeln!(
+        code,
+        "                self.{matmul_fn}(&enc, &self.hidden_buf, &self.layers[layer].k_weight, &self.k_buf, {kv_dim}, {hidden});"
+    )?;
+    writeln!(
+        code,
+        "                self.{matmul_fn}(&enc, &self.hidden_buf, &self.layers[layer].v_weight, &self.v_buf, {kv_dim}, {hidden});"
+    )?;
+    writeln!(
+        code,
+        "                self.dispatch_rope(&enc, &self.q_buf, {num_heads}, {head_dim}, pos);"
+    )?;
+    writeln!(
+        code,
+        "                self.dispatch_rope(&enc, &self.k_buf, {num_kv_heads}, {head_dim}, pos);"
+    )?;
+    writeln!(code, "                enc.end_encoding();")?;
+    writeln!(code, "            }}")?;
+    writeln!(code)?;
+
+    writeln!(code, "            // Blit encoder: update KV cache")?;
+    writeln!(code, "            {{")?;
+    writeln!(
+        code,
+        "                let kv_head_size = {num_kv_heads} * {head_dim};"
+    )?;
+    writeln!(
+        code,
+        "                let offset = (pos * kv_head_size) * 4;"
+    )?;
+    writeln!(
+        code,
+        "                let byte_len = (kv_head_size * 4) as u64;"
+    )?;
+    writeln!(
+        code,
+        "                let enc = cmd.new_blit_command_encoder();"
+    )?;
+    writeln!(
+        code,
+        "                enc.copy_from_buffer(&self.k_buf, 0, &self.k_cache[layer], offset as u64, byte_len);"
+    )?;
+    writeln!(
+        code,
+        "                enc.copy_from_buffer(&self.v_buf, 0, &self.v_cache[layer], offset as u64, byte_len);"
+    )?;
+    writeln!(code, "                enc.end_encoding();")?;
+    writeln!(code, "            }}")?;
+    writeln!(code)?;
+
+    writeln!(
+        code,
+        "            // Compute encoder: attention, O proj, residual, FFN"
+    )?;
+    writeln!(code, "            {{")?;
+    writeln!(
+        code,
+        "                let enc = cmd.new_compute_command_encoder();"
+    )?;
+    writeln!(
+        code,
+        "                self.dispatch_attention(&enc, &self.q_buf, &self.k_cache[layer], &self.v_cache[layer], &self.attn_out_buf, pos + 1);"
+    )?;
+    writeln!(
+        code,
+        "                self.{matmul_fn}(&enc, &self.attn_out_buf, &self.layers[layer].o_weight, &self.attn_proj_buf, {hidden}, {hidden});"
+    )?;
+    writeln!(
+        code,
+        "                self.dispatch_add_inplace(&enc, &self.residual_buf, &self.attn_proj_buf, {hidden});"
+    )?;
+    writeln!(
+        code,
+        "                self.dispatch_rms_norm(&enc, &self.layers[layer].ffn_norm);"
+    )?;
+    writeln!(
+        code,
+        "                self.{matmul_fn}(&enc, &self.hidden_buf, &self.layers[layer].gate_weight, &self.gate_buf, {intermediate}, {hidden});"
+    )?;
+    writeln!(
+        code,
+        "                self.{matmul_fn}(&enc, &self.hidden_buf, &self.layers[layer].up_weight, &self.up_buf, {intermediate}, {hidden});"
+    )?;
+    writeln!(
+        code,
+        "                self.dispatch_silu_mul(&enc, &self.gate_buf, &self.up_buf, &self.ffn_hidden_buf, {intermediate});"
+    )?;
+    writeln!(
+        code,
+        "                self.{matmul_fn}(&enc, &self.ffn_hidden_buf, &self.layers[layer].down_weight, &self.ffn_out_buf, {hidden}, {intermediate});"
+    )?;
+    writeln!(
+        code,
+        "                self.dispatch_add_inplace(&enc, &self.residual_buf, &self.ffn_out_buf, {hidden});"
+    )?;
+    writeln!(code, "                enc.end_encoding();")?;
+    writeln!(code, "            }}")?;
+    writeln!(code, "        }}")?;
+    writeln!(code)?;
+
+    // No final norm or logits projection needed for prefill intermediate tokens
+    // Commit without waiting — the next forward_prefill or forward will wait
+    writeln!(
+        code,
+        "        // Commit without waiting — overlap GPU work with next token's CPU encoding"
+    )?;
+    writeln!(code, "        cmd.commit();")?;
+    writeln!(code, "        self.prev_cmd = Some(cmd.to_owned());")?;
+    writeln!(code, "        self.pos += 1;")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
@@ -1776,10 +1997,37 @@ fn generate_main_rs(model_name: &str, config: &ModelConfig) -> Result<String, Me
     )?;
     writeln!(code, "    let prompt_tokens = encoding.get_ids();")?;
     writeln!(code)?;
-    writeln!(code, "    // Process prompt tokens (prefill)")?;
+    writeln!(
+        code,
+        "    // Process prompt tokens (prefill) with double-buffered command submission."
+    )?;
+    writeln!(
+        code,
+        "    // During prefill we only need logits from the last token, so we can"
+    )?;
+    writeln!(
+        code,
+        "    // overlap GPU execution of token N with CPU encoding of token N+1."
+    )?;
     writeln!(code, "    let mut logits = Vec::new();")?;
-    writeln!(code, "    for &token in prompt_tokens.iter() {{")?;
-    writeln!(code, "        logits = model.forward(token);")?;
+    writeln!(code, "    let prompt_len = prompt_tokens.len();")?;
+    writeln!(
+        code,
+        "    for (idx, &token) in prompt_tokens.iter().enumerate() {{"
+    )?;
+    writeln!(code, "        if idx == prompt_len - 1 {{")?;
+    writeln!(
+        code,
+        "            // Last token: need logits, use synchronous forward"
+    )?;
+    writeln!(code, "            logits = model.forward(token);")?;
+    writeln!(code, "        }} else {{")?;
+    writeln!(
+        code,
+        "            // Intermediate token: use async prefill (no logits readback)"
+    )?;
+    writeln!(code, "            model.forward_prefill(token);")?;
+    writeln!(code, "        }}")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
     writeln!(code, "    // Generate tokens")?;
@@ -2044,12 +2292,16 @@ mod tests {
         let config = minimal_config();
         let model_rs = generate_model_rs(&config).unwrap();
 
-        // The forward function should create exactly one command buffer
-        let forward_start = model_rs.find("pub fn forward").unwrap();
+        // The forward function should create exactly one command buffer.
+        // Use the exact signature to avoid matching forward_prefill.
+        let forward_start = model_rs
+            .find("pub fn forward(&mut self, token_id: u32) -> Vec<f32>")
+            .unwrap();
         let forward_body = &model_rs[forward_start..];
-        // Find the closing of forward (next "fn dispatch_" or end of impl)
+        // End at the next pub/private method
         let forward_end = forward_body
-            .find("\n    fn dispatch_")
+            .find("\n    pub fn forward_prefill")
+            .or_else(|| forward_body.find("\n    fn dispatch_"))
             .unwrap_or(forward_body.len());
         let forward_code = &forward_body[..forward_end];
 
@@ -2060,16 +2312,18 @@ mod tests {
             "forward() should create exactly 1 command buffer, found {cmd_buf_count}"
         );
 
-        // Should have exactly one commit + wait pair
+        // Should have exactly one commit call
         let commit_count = forward_code.matches("cmd.commit()").count();
-        let wait_count = forward_code.matches("wait_until_completed()").count();
         assert_eq!(
             commit_count, 1,
             "forward() should commit exactly once, found {commit_count}"
         );
-        assert_eq!(
-            wait_count, 1,
-            "forward() should wait exactly once, found {wait_count}"
+
+        // Should wait: once for cmd + possibly once for prev_cmd drain
+        let wait_count = forward_code.matches("wait_until_completed()").count();
+        assert!(
+            wait_count >= 1 && wait_count <= 2,
+            "forward() should wait 1-2 times (cmd + optional prev_cmd drain), found {wait_count}"
         );
     }
 
@@ -2161,11 +2415,14 @@ mod tests {
         let config = minimal_config();
         let model_rs = generate_model_rs(&config).unwrap();
 
-        // Find the forward function body
-        let forward_start = model_rs.find("pub fn forward").unwrap();
+        // Find the forward function body (exact signature to avoid matching forward_prefill)
+        let forward_start = model_rs
+            .find("pub fn forward(&mut self, token_id: u32) -> Vec<f32>")
+            .unwrap();
         let forward_body = &model_rs[forward_start..];
         let forward_end = forward_body
-            .find("\n    fn dispatch_")
+            .find("\n    pub fn forward_prefill")
+            .or_else(|| forward_body.find("\n    fn dispatch_"))
             .unwrap_or(forward_body.len());
         let forward_code = &forward_body[..forward_end];
 
@@ -2244,8 +2501,8 @@ mod tests {
             "matmul_vec_q8 should accept raw Q8_0 bytes"
         );
         assert!(
-            shaders.contains("int8_t val"),
-            "matmul_vec_q8 should read int8 quantized values"
+            shaders.contains("char4"),
+            "matmul_vec_q8 should use char4 vectorized loads for int8 data"
         );
         assert!(
             shaders.contains("device const half*"),
@@ -2330,8 +2587,10 @@ mod tests {
         let config = minimal_config();
         let model_rs = generate_model_rs(&config).unwrap();
 
-        // f32 model should NOT use Q8 dispatch in forward pass
-        let forward_start = model_rs.find("pub fn forward").unwrap();
+        // f32 model should NOT use Q8 dispatch in forward or forward_prefill
+        let forward_start = model_rs
+            .find("pub fn forward(&mut self, token_id: u32) -> Vec<f32>")
+            .unwrap();
         let forward_body = &model_rs[forward_start..];
         let forward_end = forward_body
             .find("\n    fn dispatch_")
@@ -2352,6 +2611,63 @@ mod tests {
         assert!(
             model_rs.contains("fn dispatch_matmul_q8(&self, enc: &ComputeCommandEncoderRef"),
             "dispatch_matmul_q8 should take ComputeCommandEncoderRef"
+        );
+    }
+
+    #[test]
+    fn generated_model_has_double_buffered_prefill() {
+        let config = minimal_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        // MetalModel should have prev_cmd field for double-buffered prefill
+        assert!(
+            model_rs.contains("prev_cmd: Option<CommandBuffer>"),
+            "MetalModel should have prev_cmd field for double-buffered prefill"
+        );
+
+        // Should have forward_prefill method
+        assert!(
+            model_rs.contains("pub fn forward_prefill(&mut self, token_id: u32)"),
+            "MetalModel should have forward_prefill method"
+        );
+
+        // forward() should drain prev_cmd at the start
+        assert!(
+            model_rs.contains("if let Some(prev) = self.prev_cmd.take()"),
+            "forward() should drain prev_cmd from previous prefill"
+        );
+    }
+
+    #[test]
+    fn generated_main_rs_uses_forward_prefill_for_prompt() {
+        let config = minimal_config();
+        let main_rs = generate_main_rs("test-model", &config).unwrap();
+
+        assert!(
+            main_rs.contains("forward_prefill"),
+            "main.rs should use forward_prefill for intermediate prompt tokens"
+        );
+        assert!(
+            main_rs.contains("double-buffered"),
+            "main.rs should document double-buffered prefill"
+        );
+    }
+
+    #[test]
+    fn generated_shaders_q8_uses_char4_vectorized_loads() {
+        let shaders = generate_metal_shaders();
+
+        assert!(
+            shaders.contains("char4"),
+            "matmul_vec_q8 should use char4 vectorized loads"
+        );
+        assert!(
+            shaders.contains("data_ptr[q]"),
+            "matmul_vec_q8 should index char4 pointer for vectorized reads"
+        );
+        assert!(
+            shaders.contains("vals.x"),
+            "matmul_vec_q8 should access char4 components"
         );
     }
 }
