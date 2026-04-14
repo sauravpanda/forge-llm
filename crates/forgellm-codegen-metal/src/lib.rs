@@ -447,10 +447,15 @@ kernel void add_inplace(
 // Q8_0 block: 2 bytes f16 scale + 32 bytes int8 data = 34 bytes per 32 elements.
 // Operates directly on quantized weights to halve memory bandwidth vs f32,
 // yielding ~1.5-2x speedup on bandwidth-bound GPU matmul.
-// Uses char4 vectorized loads (4 int8 values per load) to reduce memory
-// transactions by 4x compared to scalar reads.
-// Each simdgroup processes 8 rows for 8x vector reuse per shared memory load.
-// 8 simdgroups x 8 rows = 64 rows per threadgroup of 256 threads.
+//
+// Register-pressure-optimised: 4 rows per simdgroup (vs 8 for f32 matmul)
+// because int8->float conversion doubles register demand.  Fully unrolled
+// inner loop with float4 vector loads from shared memory eliminates loop
+// overhead and enables better instruction scheduling.
+// 8 simdgroups x 4 rows = 32 rows per threadgroup of 256 threads.
+constant constexpr uint Q8_ROWS_PER_SG = 4;
+constant constexpr uint Q8_ROWS_PER_TG = SIMDGROUPS_PER_TG * Q8_ROWS_PER_SG; // 32
+
 kernel void matmul_vec_q8(
     device const uchar* matrix   [[buffer(0)]],  // Q8_0 raw bytes
     device const float* vector   [[buffer(1)]],  // f32 input
@@ -469,8 +474,8 @@ kernel void matmul_vec_q8(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Each simdgroup handles 8 consecutive rows
-    uint row_base = tgid * ROWS_PER_TG + simd_id * ROWS_PER_SIMDGROUP;
+    // Each simdgroup handles 4 consecutive rows (lower register pressure)
+    uint row_base = tgid * Q8_ROWS_PER_TG + simd_id * Q8_ROWS_PER_SG;
     if (row_base >= rows) return;
 
     // Q8_0: each block is 34 bytes for 32 elements
@@ -482,71 +487,86 @@ kernel void matmul_vec_q8(
     device const uchar* r1 = matrix + (row_base + 1) * row_bytes;
     device const uchar* r2 = matrix + (row_base + 2) * row_bytes;
     device const uchar* r3 = matrix + (row_base + 3) * row_bytes;
-    device const uchar* r4 = matrix + (row_base + 4) * row_bytes;
-    device const uchar* r5 = matrix + (row_base + 5) * row_bytes;
-    device const uchar* r6 = matrix + (row_base + 6) * row_bytes;
-    device const uchar* r7 = matrix + (row_base + 7) * row_bytes;
 
     float sum0 = 0.0, sum1 = 0.0, sum2 = 0.0, sum3 = 0.0;
-    float sum4 = 0.0, sum5 = 0.0, sum6 = 0.0, sum7 = 0.0;
 
     for (uint blk = simd_lane; blk < blocks_per_row; blk += 32) {
-        uint blk_byte = blk * 34;
-        uint vec_base = blk * 32;
+        uint bb = blk * 34;
+        uint vb = blk * 32;
 
-        // Read scales for all 8 rows
-        float s0 = float(*(device const half*)(r0 + blk_byte));
-        float s1 = float(*(device const half*)(r1 + blk_byte));
-        float s2 = float(*(device const half*)(r2 + blk_byte));
-        float s3 = float(*(device const half*)(r3 + blk_byte));
-        float s4 = float(*(device const half*)(r4 + blk_byte));
-        float s5 = float(*(device const half*)(r5 + blk_byte));
-        float s6 = float(*(device const half*)(r6 + blk_byte));
-        float s7 = float(*(device const half*)(r7 + blk_byte));
+        // Prefetch all 4 scales
+        float sc0 = float(*(device const half*)(r0 + bb));
+        float sc1 = float(*(device const half*)(r1 + bb));
+        float sc2 = float(*(device const half*)(r2 + bb));
+        float sc3 = float(*(device const half*)(r3 + bb));
 
-        device const char4* d0 = (device const char4*)(r0 + blk_byte + 2);
-        device const char4* d1 = (device const char4*)(r1 + blk_byte + 2);
-        device const char4* d2 = (device const char4*)(r2 + blk_byte + 2);
-        device const char4* d3 = (device const char4*)(r3 + blk_byte + 2);
-        device const char4* d4 = (device const char4*)(r4 + blk_byte + 2);
-        device const char4* d5 = (device const char4*)(r5 + blk_byte + 2);
-        device const char4* d6 = (device const char4*)(r6 + blk_byte + 2);
-        device const char4* d7 = (device const char4*)(r7 + blk_byte + 2);
+        device const char4* d0 = (device const char4*)(r0 + bb + 2);
+        device const char4* d1 = (device const char4*)(r1 + bb + 2);
+        device const char4* d2 = (device const char4*)(r2 + bb + 2);
+        device const char4* d3 = (device const char4*)(r3 + bb + 2);
 
-        float bd0=0, bd1=0, bd2=0, bd3=0, bd4=0, bd5=0, bd6=0, bd7=0;
-        for (uint q = 0; q < 8; q++) {
-            uint vi = vec_base + q * 4;
-            float4 v = float4(vec_tile[vi], vec_tile[vi+1], vec_tile[vi+2], vec_tile[vi+3]);
+        // Load all 8 float4 vector values for this 32-element block from shared memory
+        float4 v0 = *(threadgroup const float4*)(vec_tile + vb);
+        float4 v1 = *(threadgroup const float4*)(vec_tile + vb + 4);
+        float4 v2 = *(threadgroup const float4*)(vec_tile + vb + 8);
+        float4 v3 = *(threadgroup const float4*)(vec_tile + vb + 12);
+        float4 v4 = *(threadgroup const float4*)(vec_tile + vb + 16);
+        float4 v5 = *(threadgroup const float4*)(vec_tile + vb + 20);
+        float4 v6 = *(threadgroup const float4*)(vec_tile + vb + 24);
+        float4 v7 = *(threadgroup const float4*)(vec_tile + vb + 28);
 
-            char4 c;
-            c = d0[q]; bd0 += float(c.x)*v.x + float(c.y)*v.y + float(c.z)*v.z + float(c.w)*v.w;
-            c = d1[q]; bd1 += float(c.x)*v.x + float(c.y)*v.y + float(c.z)*v.z + float(c.w)*v.w;
-            c = d2[q]; bd2 += float(c.x)*v.x + float(c.y)*v.y + float(c.z)*v.z + float(c.w)*v.w;
-            c = d3[q]; bd3 += float(c.x)*v.x + float(c.y)*v.y + float(c.z)*v.z + float(c.w)*v.w;
-            c = d4[q]; bd4 += float(c.x)*v.x + float(c.y)*v.y + float(c.z)*v.z + float(c.w)*v.w;
-            c = d5[q]; bd5 += float(c.x)*v.x + float(c.y)*v.y + float(c.z)*v.z + float(c.w)*v.w;
-            c = d6[q]; bd6 += float(c.x)*v.x + float(c.y)*v.y + float(c.z)*v.z + float(c.w)*v.w;
-            c = d7[q]; bd7 += float(c.x)*v.x + float(c.y)*v.y + float(c.z)*v.z + float(c.w)*v.w;
-        }
+        // Fully unrolled block dot products — 4 rows x 8 char4 reads
+        float bd0=0, bd1=0, bd2=0, bd3=0;
+        char4 c;
 
-        sum0 += s0 * bd0; sum1 += s1 * bd1; sum2 += s2 * bd2; sum3 += s3 * bd3;
-        sum4 += s4 * bd4; sum5 += s5 * bd5; sum6 += s6 * bd6; sum7 += s7 * bd7;
+        // Row 0
+        c=d0[0]; bd0+=float(c.x)*v0.x+float(c.y)*v0.y+float(c.z)*v0.z+float(c.w)*v0.w;
+        c=d0[1]; bd0+=float(c.x)*v1.x+float(c.y)*v1.y+float(c.z)*v1.z+float(c.w)*v1.w;
+        c=d0[2]; bd0+=float(c.x)*v2.x+float(c.y)*v2.y+float(c.z)*v2.z+float(c.w)*v2.w;
+        c=d0[3]; bd0+=float(c.x)*v3.x+float(c.y)*v3.y+float(c.z)*v3.z+float(c.w)*v3.w;
+        c=d0[4]; bd0+=float(c.x)*v4.x+float(c.y)*v4.y+float(c.z)*v4.z+float(c.w)*v4.w;
+        c=d0[5]; bd0+=float(c.x)*v5.x+float(c.y)*v5.y+float(c.z)*v5.z+float(c.w)*v5.w;
+        c=d0[6]; bd0+=float(c.x)*v6.x+float(c.y)*v6.y+float(c.z)*v6.z+float(c.w)*v6.w;
+        c=d0[7]; bd0+=float(c.x)*v7.x+float(c.y)*v7.y+float(c.z)*v7.z+float(c.w)*v7.w;
+        // Row 1
+        c=d1[0]; bd1+=float(c.x)*v0.x+float(c.y)*v0.y+float(c.z)*v0.z+float(c.w)*v0.w;
+        c=d1[1]; bd1+=float(c.x)*v1.x+float(c.y)*v1.y+float(c.z)*v1.z+float(c.w)*v1.w;
+        c=d1[2]; bd1+=float(c.x)*v2.x+float(c.y)*v2.y+float(c.z)*v2.z+float(c.w)*v2.w;
+        c=d1[3]; bd1+=float(c.x)*v3.x+float(c.y)*v3.y+float(c.z)*v3.z+float(c.w)*v3.w;
+        c=d1[4]; bd1+=float(c.x)*v4.x+float(c.y)*v4.y+float(c.z)*v4.z+float(c.w)*v4.w;
+        c=d1[5]; bd1+=float(c.x)*v5.x+float(c.y)*v5.y+float(c.z)*v5.z+float(c.w)*v5.w;
+        c=d1[6]; bd1+=float(c.x)*v6.x+float(c.y)*v6.y+float(c.z)*v6.z+float(c.w)*v6.w;
+        c=d1[7]; bd1+=float(c.x)*v7.x+float(c.y)*v7.y+float(c.z)*v7.z+float(c.w)*v7.w;
+        // Row 2
+        c=d2[0]; bd2+=float(c.x)*v0.x+float(c.y)*v0.y+float(c.z)*v0.z+float(c.w)*v0.w;
+        c=d2[1]; bd2+=float(c.x)*v1.x+float(c.y)*v1.y+float(c.z)*v1.z+float(c.w)*v1.w;
+        c=d2[2]; bd2+=float(c.x)*v2.x+float(c.y)*v2.y+float(c.z)*v2.z+float(c.w)*v2.w;
+        c=d2[3]; bd2+=float(c.x)*v3.x+float(c.y)*v3.y+float(c.z)*v3.z+float(c.w)*v3.w;
+        c=d2[4]; bd2+=float(c.x)*v4.x+float(c.y)*v4.y+float(c.z)*v4.z+float(c.w)*v4.w;
+        c=d2[5]; bd2+=float(c.x)*v5.x+float(c.y)*v5.y+float(c.z)*v5.z+float(c.w)*v5.w;
+        c=d2[6]; bd2+=float(c.x)*v6.x+float(c.y)*v6.y+float(c.z)*v6.z+float(c.w)*v6.w;
+        c=d2[7]; bd2+=float(c.x)*v7.x+float(c.y)*v7.y+float(c.z)*v7.z+float(c.w)*v7.w;
+        // Row 3
+        c=d3[0]; bd3+=float(c.x)*v0.x+float(c.y)*v0.y+float(c.z)*v0.z+float(c.w)*v0.w;
+        c=d3[1]; bd3+=float(c.x)*v1.x+float(c.y)*v1.y+float(c.z)*v1.z+float(c.w)*v1.w;
+        c=d3[2]; bd3+=float(c.x)*v2.x+float(c.y)*v2.y+float(c.z)*v2.z+float(c.w)*v2.w;
+        c=d3[3]; bd3+=float(c.x)*v3.x+float(c.y)*v3.y+float(c.z)*v3.z+float(c.w)*v3.w;
+        c=d3[4]; bd3+=float(c.x)*v4.x+float(c.y)*v4.y+float(c.z)*v4.z+float(c.w)*v4.w;
+        c=d3[5]; bd3+=float(c.x)*v5.x+float(c.y)*v5.y+float(c.z)*v5.z+float(c.w)*v5.w;
+        c=d3[6]; bd3+=float(c.x)*v6.x+float(c.y)*v6.y+float(c.z)*v6.z+float(c.w)*v6.w;
+        c=d3[7]; bd3+=float(c.x)*v7.x+float(c.y)*v7.y+float(c.z)*v7.z+float(c.w)*v7.w;
+
+        sum0 += sc0 * bd0; sum1 += sc1 * bd1; sum2 += sc2 * bd2; sum3 += sc3 * bd3;
     }
 
     sum0 = simd_sum(sum0); sum1 = simd_sum(sum1);
     sum2 = simd_sum(sum2); sum3 = simd_sum(sum3);
-    sum4 = simd_sum(sum4); sum5 = simd_sum(sum5);
-    sum6 = simd_sum(sum6); sum7 = simd_sum(sum7);
 
     if (simd_lane == 0) {
         if (row_base     < rows) output[row_base]     = sum0;
         if (row_base + 1 < rows) output[row_base + 1] = sum1;
         if (row_base + 2 < rows) output[row_base + 2] = sum2;
         if (row_base + 3 < rows) output[row_base + 3] = sum3;
-        if (row_base + 4 < rows) output[row_base + 4] = sum4;
-        if (row_base + 5 < rows) output[row_base + 5] = sum5;
-        if (row_base + 6 < rows) output[row_base + 6] = sum6;
-        if (row_base + 7 < rows) output[row_base + 7] = sum7;
     }
 }
 
@@ -1798,10 +1818,10 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     )?;
     writeln!(
         code,
-        "        // 64 rows per threadgroup (8 simdgroups x 8 rows each = 256 threads)"
+        "        // 32 rows per threadgroup (8 simdgroups x 4 rows each = 256 threads)"
     )?;
     writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
-    writeln!(code, "        let num_tg = ((rows + 63) / 64) as u64;")?;
+    writeln!(code, "        let num_tg = ((rows + 31) / 32) as u64;")?;
     writeln!(code, "        let grid_size = MTLSize::new(num_tg, 1, 1);")?;
     writeln!(
         code,
@@ -3168,7 +3188,7 @@ mod tests {
             "matmul_vec_q8 should use char4 vectorized loads"
         );
         assert!(
-            shaders.contains("d0[q]"),
+            shaders.contains("d0[0]"),
             "matmul_vec_q8 should index char4 pointer for vectorized reads"
         );
         assert!(
