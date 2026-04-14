@@ -650,6 +650,9 @@ fn cmd_compile(args: CompileArgs<'_>) -> Result<()> {
     } = args;
     println!("Loading model config from {model_path}...");
     let config = load_model_config(model_path)?;
+    config
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid model config: {e}"))?;
 
     println!(
         "Model: {} | {} layers | hidden={} | heads={} | kv_heads={} | vocab={}",
@@ -1965,7 +1968,7 @@ fn cmd_export_weights_impl(
         // Q8_0/Q4_0 raw bytes are written directly; F32 projection weights
         // (e.g. from mixed-quant GGUF files where some tensors are Q4_1)
         // are quantized to Q4_0 to match the generated code's expectations.
-        let write_mixed = |data: &mut Vec<u8>, name: &str| {
+        let write_mixed = |data: &mut Vec<u8>, name: &str| -> Result<()> {
             match weights.get(name) {
                 Some(WeightData::F32(v)) if is_q4 && v.len() > config.hidden_size => {
                     // F32 projection weight in a Q4_0 model — quantize to Q4_0.
@@ -2016,19 +2019,20 @@ fn cmd_export_weights_impl(
                             Some(WeightData::Q4_0Raw(b)) => {
                                 data.extend_from_slice(b);
                             }
-                            None => panic!("neither lm_head nor embed_tokens found"),
+                            None => bail!("neither lm_head nor embed_tokens found"),
                         }
                     } else {
-                        panic!("weight not found: {name}");
+                        bail!("weight not found: {name}");
                     }
                 }
             }
+            Ok(())
         };
 
         // Write embed_tokens always as F32 — the generated main.rs reads it as a flat f32 slice
         // for token lookup (not a bulk matmul), so there is no benefit to keeping it quantized.
         // Norms are also always F32 (they come from the GGUF as F32 in all quantized models).
-        let write_embed_as_f32 = |data: &mut Vec<u8>, name: &str| {
+        let write_embed_as_f32 = |data: &mut Vec<u8>, name: &str| -> Result<()> {
             let numel = config.vocab_size * config.hidden_size;
             match weights.get(name) {
                 Some(WeightData::F32(v)) => {
@@ -2043,47 +2047,48 @@ fn cmd_export_weights_impl(
                     }
                 }
                 Some(WeightData::Q4_0Raw(_)) => {
-                    panic!("Q4_0 embed_tokens: dequantization not yet implemented for export");
+                    bail!("Q4_0 embed_tokens: dequantization not yet implemented for export");
                 }
-                None => panic!("embed_tokens weight not found: {name}"),
+                None => bail!("embed_tokens weight not found: {name}"),
             }
+            Ok(())
         };
 
-        write_embed_as_f32(&mut output_data, "model.embed_tokens.weight");
+        write_embed_as_f32(&mut output_data, "model.embed_tokens.weight")?;
 
         for layer_idx in 0..config.num_layers {
             let prefix = format!("model.layers.{layer_idx}");
             write_mixed(
                 &mut output_data,
                 &format!("{prefix}.input_layernorm.weight"),
-            );
+            )?;
             write_mixed(
                 &mut output_data,
                 &format!("{prefix}.self_attn.q_proj.weight"),
-            );
+            )?;
             write_mixed(
                 &mut output_data,
                 &format!("{prefix}.self_attn.k_proj.weight"),
-            );
+            )?;
             write_mixed(
                 &mut output_data,
                 &format!("{prefix}.self_attn.v_proj.weight"),
-            );
+            )?;
             write_mixed(
                 &mut output_data,
                 &format!("{prefix}.self_attn.o_proj.weight"),
-            );
+            )?;
             write_mixed(
                 &mut output_data,
                 &format!("{prefix}.post_attention_layernorm.weight"),
-            );
-            write_mixed(&mut output_data, &format!("{prefix}.mlp.gate_proj.weight"));
-            write_mixed(&mut output_data, &format!("{prefix}.mlp.up_proj.weight"));
-            write_mixed(&mut output_data, &format!("{prefix}.mlp.down_proj.weight"));
+            )?;
+            write_mixed(&mut output_data, &format!("{prefix}.mlp.gate_proj.weight"))?;
+            write_mixed(&mut output_data, &format!("{prefix}.mlp.up_proj.weight"))?;
+            write_mixed(&mut output_data, &format!("{prefix}.mlp.down_proj.weight"))?;
         }
 
-        write_mixed(&mut output_data, "model.norm.weight");
-        write_mixed(&mut output_data, "lm_head.weight");
+        write_mixed(&mut output_data, "model.norm.weight")?;
+        write_mixed(&mut output_data, "lm_head.weight")?;
 
         fs::write(output_path, &output_data)
             .with_context(|| format!("failed to write {output_path}"))?;
@@ -2134,22 +2139,21 @@ fn cmd_export_weights_impl(
         let mut output_data: Vec<u8> = Vec::with_capacity(weights.memory_bytes());
 
         let write_tensor =
-            |data: &mut Vec<u8>, name: &str, weights: &weight_loader::ModelWeights| {
-                let tensor = weights.get(name).unwrap_or_else(|| {
-                    if name == "lm_head.weight" {
-                        weights
-                            .get("model.embed_tokens.weight")
-                            .expect("neither lm_head nor embed_tokens found")
-                    } else {
-                        panic!("weight not found: {name}")
-                    }
-                });
+            |data: &mut Vec<u8>, name: &str, weights: &weight_loader::ModelWeights| -> Result<()> {
+                let tensor = match weights.get(name) {
+                    Some(t) => t,
+                    None if name == "lm_head.weight" => weights
+                        .get("model.embed_tokens.weight")
+                        .ok_or_else(|| anyhow::anyhow!("neither lm_head nor embed_tokens found"))?,
+                    None => bail!("weight not found: {name}"),
+                };
                 for &val in tensor {
                     data.extend_from_slice(&val.to_le_bytes());
                 }
+                Ok(())
             };
 
-        write_tensor(&mut output_data, "model.embed_tokens.weight", &weights);
+        write_tensor(&mut output_data, "model.embed_tokens.weight", &weights)?;
 
         for layer_idx in 0..config.num_layers {
             let prefix = format!("model.layers.{layer_idx}");
@@ -2157,51 +2161,51 @@ fn cmd_export_weights_impl(
                 &mut output_data,
                 &format!("{prefix}.input_layernorm.weight"),
                 &weights,
-            );
+            )?;
             write_tensor(
                 &mut output_data,
                 &format!("{prefix}.self_attn.q_proj.weight"),
                 &weights,
-            );
+            )?;
             write_tensor(
                 &mut output_data,
                 &format!("{prefix}.self_attn.k_proj.weight"),
                 &weights,
-            );
+            )?;
             write_tensor(
                 &mut output_data,
                 &format!("{prefix}.self_attn.v_proj.weight"),
                 &weights,
-            );
+            )?;
             write_tensor(
                 &mut output_data,
                 &format!("{prefix}.self_attn.o_proj.weight"),
                 &weights,
-            );
+            )?;
             write_tensor(
                 &mut output_data,
                 &format!("{prefix}.post_attention_layernorm.weight"),
                 &weights,
-            );
+            )?;
             write_tensor(
                 &mut output_data,
                 &format!("{prefix}.mlp.gate_proj.weight"),
                 &weights,
-            );
+            )?;
             write_tensor(
                 &mut output_data,
                 &format!("{prefix}.mlp.up_proj.weight"),
                 &weights,
-            );
+            )?;
             write_tensor(
                 &mut output_data,
                 &format!("{prefix}.mlp.down_proj.weight"),
                 &weights,
-            );
+            )?;
         }
 
-        write_tensor(&mut output_data, "model.norm.weight", &weights);
-        write_tensor(&mut output_data, "lm_head.weight", &weights);
+        write_tensor(&mut output_data, "model.norm.weight", &weights)?;
+        write_tensor(&mut output_data, "lm_head.weight", &weights)?;
 
         fs::write(output_path, &output_data)
             .with_context(|| format!("failed to write {output_path}"))?;

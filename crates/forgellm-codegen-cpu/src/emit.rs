@@ -411,7 +411,7 @@ pub fn softmax(values: &mut [f32]) {
     let mut sum = 0.0f32;
     for v in values.iter_mut() { *v = (*v - max_val).exp(); sum += *v; }
     // Normalize with NEON
-    let inv = 1.0 / sum;
+    let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
     unsafe {
         let vinv = vdupq_n_f32(inv);
         let chunks = n / 4;
@@ -429,7 +429,7 @@ pub fn softmax(values: &mut [f32]) {
     let max_val = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0f32;
     for v in values.iter_mut() { *v = (*v - max_val).exp(); sum += *v; }
-    let inv = 1.0 / sum;
+    let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
     for v in values.iter_mut() { *v *= inv; }
 }
 
@@ -4364,7 +4364,7 @@ mod tests {
                     *s = (*s - max_s).exp();
                     sum += *s;
                 }
-                let inv = 1.0 / sum;
+                let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
                 for s in scores[..seq_len].iter_mut() {
                     *s *= inv;
                 }
