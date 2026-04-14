@@ -375,6 +375,22 @@ kernel void silu_mul(
     output[id] = (g / (1.0f + fast::exp(-g))) * up[id];
 }
 
+// ── silu_mul_fused ─────────────────────────────────────────────────────
+// Fused SiLU-multiply reading gate and up from a single concatenated buffer:
+//   gate = gate_up[0..n], up = gate_up[n..2*n]
+//   output[i] = silu(gate_up[i]) * gate_up[n + i]
+kernel void silu_mul_fused(
+    device const float* gate_up [[buffer(0)]],
+    device float* output        [[buffer(1)]],
+    constant uint& n            [[buffer(2)]],
+    uint id [[thread_position_in_grid]])
+{
+    if (id >= n) return;
+    float g = gate_up[id];
+    float u = gate_up[n + id];
+    output[id] = (g / (1.0f + fast::exp(-g))) * u;
+}
+
 // ── elementwise_add ─────────────────────────────────────────────────────
 // Residual connection: output[i] = a[i] + b[i]
 kernel void elementwise_add(
@@ -762,6 +778,7 @@ fn emit_metal_model_struct(
     writeln!(code, "    rope_pipeline: ComputePipelineState,")?;
     writeln!(code, "    softmax_pipeline: ComputePipelineState,")?;
     writeln!(code, "    silu_mul_pipeline: ComputePipelineState,")?;
+    writeln!(code, "    silu_mul_fused_pipeline: ComputePipelineState,")?;
     writeln!(code, "    add_pipeline: ComputePipelineState,")?;
     writeln!(code, "    attention_pipeline: ComputePipelineState,")?;
     writeln!(code, "    add_inplace_pipeline: ComputePipelineState,")?;
@@ -794,13 +811,18 @@ fn emit_metal_model_struct(
     writeln!(code, "    hidden_buf: Buffer,")?;
     writeln!(code, "    residual_buf: Buffer,")?;
     writeln!(code, "    normed_buf: Buffer,")?;
-    writeln!(code, "    q_buf: Buffer,")?;
-    writeln!(code, "    k_buf: Buffer,")?;
-    writeln!(code, "    v_buf: Buffer,")?;
+    writeln!(
+        code,
+        "    /// Fused QKV output buffer [hidden + 2*kv_dim] — Q, K, V are contiguous slices"
+    )?;
+    writeln!(code, "    qkv_buf: Buffer,")?;
     writeln!(code, "    attn_out_buf: Buffer,")?;
     writeln!(code, "    attn_proj_buf: Buffer,")?;
-    writeln!(code, "    gate_buf: Buffer,")?;
-    writeln!(code, "    up_buf: Buffer,")?;
+    writeln!(
+        code,
+        "    /// Fused gate+up output buffer [2*intermediate] — gate and up are contiguous slices"
+    )?;
+    writeln!(code, "    gate_up_buf: Buffer,")?;
     writeln!(code, "    ffn_hidden_buf: Buffer,")?;
     writeln!(code, "    ffn_out_buf: Buffer,")?;
     writeln!(code, "    add_tmp_buf: Buffer,")?;
@@ -835,13 +857,18 @@ fn emit_layer_buffers_struct(code: &mut String) -> Result<(), MetalCodegenError>
     )?;
     writeln!(code, "struct LayerBuffers {{")?;
     writeln!(code, "    attn_norm: Buffer,")?;
-    writeln!(code, "    q_weight: Buffer,")?;
-    writeln!(code, "    k_weight: Buffer,")?;
-    writeln!(code, "    v_weight: Buffer,")?;
+    writeln!(
+        code,
+        "    /// Fused Q+K+V weight [hidden+2*kv_dim, hidden] (concatenated rows)"
+    )?;
+    writeln!(code, "    qkv_weight: Buffer,")?;
     writeln!(code, "    o_weight: Buffer,")?;
     writeln!(code, "    ffn_norm: Buffer,")?;
-    writeln!(code, "    gate_weight: Buffer,")?;
-    writeln!(code, "    up_weight: Buffer,")?;
+    writeln!(
+        code,
+        "    /// Fused gate+up weight [2*intermediate, hidden] (concatenated rows)"
+    )?;
+    writeln!(code, "    gate_up_weight: Buffer,")?;
     writeln!(code, "    down_weight: Buffer,")?;
     writeln!(code, "}}")?;
     writeln!(code)?;
@@ -909,6 +936,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         ("rope_pipeline", "rope"),
         ("softmax_pipeline", "softmax"),
         ("silu_mul_pipeline", "silu_mul"),
+        ("silu_mul_fused_pipeline", "silu_mul_fused"),
         ("add_pipeline", "elementwise_add"),
         ("attention_pipeline", "attention"),
         ("add_inplace_pipeline", "add_inplace"),
@@ -1002,6 +1030,41 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         writeln!(code, "            )")?;
         writeln!(code, "        }};")?;
         writeln!(code)?;
+        writeln!(
+            code,
+            "        // Helper: read consecutive Q8_0 weight matrices as a single fused buffer."
+        )?;
+        writeln!(
+            code,
+            "        // Reads `total_rows` rows of Q8_0 data (each row has `cols` elements)."
+        )?;
+        writeln!(
+            code,
+            "        // Used for fused QKV and gate+up projections where weights are adjacent in the file."
+        )?;
+        writeln!(
+            code,
+            "        let next_q8_fused_buffer = |device: &Device, total_rows: usize, cols: usize| -> Buffer {{"
+        )?;
+        writeln!(code, "            let blocks_per_row = cols.div_ceil(32);")?;
+        writeln!(code, "            let row_bytes = blocks_per_row * 34;")?;
+        writeln!(code, "            let total_raw = total_rows * row_bytes;")?;
+        writeln!(code, "            let cur = cursor.get();")?;
+        writeln!(
+            code,
+            "            let data = &weights[cur..cur + total_raw];"
+        )?;
+        writeln!(code, "            cursor.set(cur + total_raw);")?;
+        writeln!(code, "            device.new_buffer_with_data(")?;
+        writeln!(code, "                data.as_ptr() as *const _,")?;
+        writeln!(code, "                total_raw as u64,")?;
+        writeln!(
+            code,
+            "                MTLResourceOptions::StorageModeShared,"
+        )?;
+        writeln!(code, "            )")?;
+        writeln!(code, "        }};")?;
+        writeln!(code)?;
     }
 
     writeln!(
@@ -1023,36 +1086,22 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         "            let attn_norm = next_f32_buffer(&device, hidden_elems);"
     )?;
 
+    let qkv_rows = hidden + 2 * kv_dim;
     if is_q8 {
-        // Q8_0 projection weights
+        // Fused Q+K+V weight: read all three consecutive Q8_0 matrices as one buffer
         writeln!(
             code,
-            "            let q_weight = next_q8_buffer(&device, {hidden}, {hidden});"
-        )?;
-        writeln!(
-            code,
-            "            let k_weight = next_q8_buffer(&device, {kv_dim}, {hidden});"
-        )?;
-        writeln!(
-            code,
-            "            let v_weight = next_q8_buffer(&device, {kv_dim}, {hidden});"
+            "            let qkv_weight = next_q8_fused_buffer(&device, {qkv_rows}, {hidden});"
         )?;
         writeln!(
             code,
             "            let o_weight = next_q8_buffer(&device, {hidden}, {hidden});"
         )?;
     } else {
+        // Fused Q+K+V weight: read all three as a single contiguous f32 buffer
         writeln!(
             code,
-            "            let q_weight = next_f32_buffer(&device, {hidden} * {hidden});"
-        )?;
-        writeln!(
-            code,
-            "            let k_weight = next_f32_buffer(&device, {kv_dim} * {hidden});"
-        )?;
-        writeln!(
-            code,
-            "            let v_weight = next_f32_buffer(&device, {kv_dim} * {hidden});"
+            "            let qkv_weight = next_f32_buffer(&device, {qkv_rows} * {hidden});"
         )?;
         writeln!(
             code,
@@ -1066,27 +1115,22 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         "            let ffn_norm = next_f32_buffer(&device, hidden_elems);"
     )?;
 
+    let gate_up_rows = 2 * intermediate;
     if is_q8 {
+        // Fused gate+up weight: read both consecutive Q8_0 matrices as one buffer
         writeln!(
             code,
-            "            let gate_weight = next_q8_buffer(&device, {intermediate}, {hidden});"
-        )?;
-        writeln!(
-            code,
-            "            let up_weight = next_q8_buffer(&device, {intermediate}, {hidden});"
+            "            let gate_up_weight = next_q8_fused_buffer(&device, {gate_up_rows}, {hidden});"
         )?;
         writeln!(
             code,
             "            let down_weight = next_q8_buffer(&device, {hidden}, {intermediate});"
         )?;
     } else {
+        // Fused gate+up weight: read both as a single contiguous f32 buffer
         writeln!(
             code,
-            "            let gate_weight = next_f32_buffer(&device, {intermediate} * {hidden});"
-        )?;
-        writeln!(
-            code,
-            "            let up_weight = next_f32_buffer(&device, {intermediate} * {hidden});"
+            "            let gate_up_weight = next_f32_buffer(&device, {gate_up_rows} * {hidden});"
         )?;
         writeln!(
             code,
@@ -1096,13 +1140,10 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
 
     writeln!(code, "            layers.push(LayerBuffers {{")?;
     writeln!(code, "                attn_norm,")?;
-    writeln!(code, "                q_weight,")?;
-    writeln!(code, "                k_weight,")?;
-    writeln!(code, "                v_weight,")?;
+    writeln!(code, "                qkv_weight,")?;
     writeln!(code, "                o_weight,")?;
     writeln!(code, "                ffn_norm,")?;
-    writeln!(code, "                gate_weight,")?;
-    writeln!(code, "                up_weight,")?;
+    writeln!(code, "                gate_up_weight,")?;
     writeln!(code, "                down_weight,")?;
     writeln!(code, "            }});")?;
     writeln!(code, "        }}")?;
@@ -1131,7 +1172,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
 
     // Working buffers
     let hidden_bytes = hidden * 4;
-    let kv_dim_bytes = kv_dim * 4;
+    let _kv_dim_bytes = kv_dim * 4;
     let intermediate_bytes = intermediate * 4;
     let vocab_bytes = vocab * 4;
     let kv_cache_bytes = effective_seq_len * num_kv_heads * head_dim * 4;
@@ -1152,21 +1193,18 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "        let residual_buf = device.new_buffer({hidden_bytes} as u64, opts);"
     )?;
+    let qkv_buf_bytes = (hidden + 2 * kv_dim) * 4;
     writeln!(
         code,
         "        let normed_buf = device.new_buffer({hidden_bytes} as u64, opts);"
     )?;
     writeln!(
         code,
-        "        let q_buf = device.new_buffer({hidden_bytes} as u64, opts);"
+        "        // Fused QKV output: [Q ({hidden}), K ({kv_dim}), V ({kv_dim})] = {qkv_rows} f32s"
     )?;
     writeln!(
         code,
-        "        let k_buf = device.new_buffer({kv_dim_bytes} as u64, opts);"
-    )?;
-    writeln!(
-        code,
-        "        let v_buf = device.new_buffer({kv_dim_bytes} as u64, opts);"
+        "        let qkv_buf = device.new_buffer({qkv_buf_bytes} as u64, opts);"
     )?;
     writeln!(
         code,
@@ -1176,13 +1214,14 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "        let attn_proj_buf = device.new_buffer({hidden_bytes} as u64, opts);"
     )?;
+    let gate_up_buf_bytes = 2 * intermediate * 4;
     writeln!(
         code,
-        "        let gate_buf = device.new_buffer({intermediate_bytes} as u64, opts);"
+        "        // Fused gate+up output: [gate ({intermediate}), up ({intermediate})] = {gate_up_rows} f32s"
     )?;
     writeln!(
         code,
-        "        let up_buf = device.new_buffer({intermediate_bytes} as u64, opts);"
+        "        let gate_up_buf = device.new_buffer({gate_up_buf_bytes} as u64, opts);"
     )?;
     writeln!(
         code,
@@ -1233,6 +1272,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            rope_pipeline,")?;
     writeln!(code, "            softmax_pipeline,")?;
     writeln!(code, "            silu_mul_pipeline,")?;
+    writeln!(code, "            silu_mul_fused_pipeline,")?;
     writeln!(code, "            add_pipeline,")?;
     writeln!(code, "            attention_pipeline,")?;
     writeln!(code, "            add_inplace_pipeline,")?;
@@ -1245,13 +1285,10 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            hidden_buf,")?;
     writeln!(code, "            residual_buf,")?;
     writeln!(code, "            normed_buf,")?;
-    writeln!(code, "            q_buf,")?;
-    writeln!(code, "            k_buf,")?;
-    writeln!(code, "            v_buf,")?;
+    writeln!(code, "            qkv_buf,")?;
     writeln!(code, "            attn_out_buf,")?;
     writeln!(code, "            attn_proj_buf,")?;
-    writeln!(code, "            gate_buf,")?;
-    writeln!(code, "            up_buf,")?;
+    writeln!(code, "            gate_up_buf,")?;
     writeln!(code, "            ffn_hidden_buf,")?;
     writeln!(code, "            ffn_out_buf,")?;
     writeln!(code, "            add_tmp_buf,")?;
@@ -1337,9 +1374,13 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            // 2. Transformer layers")?;
     writeln!(code, "            for layer in 0..NUM_LAYERS {{")?;
     writeln!(code)?;
+    let q_byte_offset = 0usize;
+    let k_byte_offset = hidden * 4;
+    let v_byte_offset = (hidden + kv_dim) * 4;
+
     writeln!(
         code,
-        "                // Pre-attention: rms_norm, Q/K/V projections, RoPE"
+        "                // Pre-attention: rms_norm, fused QKV projection, RoPE"
     )?;
     writeln!(
         code,
@@ -1347,46 +1388,46 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     )?;
     writeln!(
         code,
-        "                self.{matmul_fn}(&enc, &self.hidden_buf, &self.layers[layer].q_weight, &self.q_buf, {hidden}, {hidden});"
+        "                // Fused Q+K+V matmul: single dispatch for all three projections"
     )?;
     writeln!(
         code,
-        "                self.{matmul_fn}(&enc, &self.hidden_buf, &self.layers[layer].k_weight, &self.k_buf, {kv_dim}, {hidden});"
+        "                self.{matmul_fn}(&enc, &self.hidden_buf, &self.layers[layer].qkv_weight, &self.qkv_buf, {qkv_rows}, {hidden});"
     )?;
     writeln!(
         code,
-        "                self.{matmul_fn}(&enc, &self.hidden_buf, &self.layers[layer].v_weight, &self.v_buf, {kv_dim}, {hidden});"
+        "                // RoPE on Q portion (qkv_buf offset 0) and K portion (qkv_buf offset {k_byte_offset})"
     )?;
     writeln!(
         code,
-        "                self.dispatch_rope(&enc, &self.q_buf, {num_heads}, {head_dim}, pos);"
+        "                self.dispatch_rope_offset(&enc, &self.qkv_buf, {q_byte_offset}, {num_heads}, {head_dim}, pos);"
     )?;
     writeln!(
         code,
-        "                self.dispatch_rope(&enc, &self.k_buf, {num_kv_heads}, {head_dim}, pos);"
+        "                self.dispatch_rope_offset(&enc, &self.qkv_buf, {k_byte_offset}, {num_kv_heads}, {head_dim}, pos);"
     )?;
     writeln!(code)?;
     writeln!(
         code,
-        "                // KV cache update via compute copy (no blit encoder needed)"
+        "                // KV cache update from fused qkv_buf (K at offset {k_byte_offset}, V at offset {v_byte_offset})"
     )?;
     writeln!(code, "                let kv_offset = pos * {kv_dim};")?;
     writeln!(
         code,
-        "                self.dispatch_copy_to_offset(&enc, &self.k_buf, &self.k_cache[layer], kv_offset, {kv_dim});"
+        "                self.dispatch_copy_from_offset(&enc, &self.qkv_buf, {k_byte_offset}, &self.k_cache[layer], kv_offset, {kv_dim});"
     )?;
     writeln!(
         code,
-        "                self.dispatch_copy_to_offset(&enc, &self.v_buf, &self.v_cache[layer], kv_offset, {kv_dim});"
+        "                self.dispatch_copy_from_offset(&enc, &self.qkv_buf, {v_byte_offset}, &self.v_cache[layer], kv_offset, {kv_dim});"
     )?;
     writeln!(code)?;
     writeln!(
         code,
-        "                // Post-attention: attention, O proj, residual, FFN"
+        "                // Attention using Q from qkv_buf (offset 0)"
     )?;
     writeln!(
         code,
-        "                self.dispatch_attention(&enc, &self.q_buf, &self.k_cache[layer], &self.v_cache[layer], &self.attn_out_buf, pos + 1);"
+        "                self.dispatch_attention_offset(&enc, &self.qkv_buf, {q_byte_offset}, &self.k_cache[layer], &self.v_cache[layer], &self.attn_out_buf, pos + 1);"
     )?;
     writeln!(
         code,
@@ -1398,19 +1439,23 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     )?;
     writeln!(
         code,
+        "                // FFN: rms_norm, fused gate+up projection, silu_mul, down projection"
+    )?;
+    writeln!(
+        code,
         "                self.dispatch_rms_norm(&enc, &self.layers[layer].ffn_norm);"
     )?;
     writeln!(
         code,
-        "                self.{matmul_fn}(&enc, &self.hidden_buf, &self.layers[layer].gate_weight, &self.gate_buf, {intermediate}, {hidden});"
+        "                // Fused gate+up matmul: single dispatch for both projections"
     )?;
     writeln!(
         code,
-        "                self.{matmul_fn}(&enc, &self.hidden_buf, &self.layers[layer].up_weight, &self.up_buf, {intermediate}, {hidden});"
+        "                self.{matmul_fn}(&enc, &self.hidden_buf, &self.layers[layer].gate_up_weight, &self.gate_up_buf, {gate_up_rows}, {hidden});"
     )?;
     writeln!(
         code,
-        "                self.dispatch_silu_mul(&enc, &self.gate_buf, &self.up_buf, &self.ffn_hidden_buf, {intermediate});"
+        "                self.dispatch_silu_mul_fused(&enc, &self.gate_up_buf, &self.ffn_hidden_buf, {intermediate});"
     )?;
     writeln!(
         code,
@@ -1527,7 +1572,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code)?;
     writeln!(
         code,
-        "                // Pre-attention: rms_norm, Q/K/V projections, RoPE"
+        "                // Pre-attention: rms_norm, fused QKV projection, RoPE"
     )?;
     writeln!(
         code,
@@ -1535,46 +1580,42 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     )?;
     writeln!(
         code,
-        "                self.{matmul_fn}(&enc, &self.hidden_buf, &self.layers[layer].q_weight, &self.q_buf, {hidden}, {hidden});"
+        "                // Fused Q+K+V matmul: single dispatch for all three projections"
     )?;
     writeln!(
         code,
-        "                self.{matmul_fn}(&enc, &self.hidden_buf, &self.layers[layer].k_weight, &self.k_buf, {kv_dim}, {hidden});"
+        "                self.{matmul_fn}(&enc, &self.hidden_buf, &self.layers[layer].qkv_weight, &self.qkv_buf, {qkv_rows}, {hidden});"
     )?;
     writeln!(
         code,
-        "                self.{matmul_fn}(&enc, &self.hidden_buf, &self.layers[layer].v_weight, &self.v_buf, {kv_dim}, {hidden});"
+        "                self.dispatch_rope_offset(&enc, &self.qkv_buf, {q_byte_offset}, {num_heads}, {head_dim}, pos);"
     )?;
     writeln!(
         code,
-        "                self.dispatch_rope(&enc, &self.q_buf, {num_heads}, {head_dim}, pos);"
-    )?;
-    writeln!(
-        code,
-        "                self.dispatch_rope(&enc, &self.k_buf, {num_kv_heads}, {head_dim}, pos);"
+        "                self.dispatch_rope_offset(&enc, &self.qkv_buf, {k_byte_offset}, {num_kv_heads}, {head_dim}, pos);"
     )?;
     writeln!(code)?;
     writeln!(
         code,
-        "                // KV cache update via compute copy (no blit encoder needed)"
+        "                // KV cache update from fused qkv_buf"
     )?;
     writeln!(code, "                let kv_offset = pos * {kv_dim};")?;
     writeln!(
         code,
-        "                self.dispatch_copy_to_offset(&enc, &self.k_buf, &self.k_cache[layer], kv_offset, {kv_dim});"
+        "                self.dispatch_copy_from_offset(&enc, &self.qkv_buf, {k_byte_offset}, &self.k_cache[layer], kv_offset, {kv_dim});"
     )?;
     writeln!(
         code,
-        "                self.dispatch_copy_to_offset(&enc, &self.v_buf, &self.v_cache[layer], kv_offset, {kv_dim});"
+        "                self.dispatch_copy_from_offset(&enc, &self.qkv_buf, {v_byte_offset}, &self.v_cache[layer], kv_offset, {kv_dim});"
     )?;
     writeln!(code)?;
     writeln!(
         code,
-        "                // Post-attention: attention, O proj, residual, FFN"
+        "                // Attention using Q from qkv_buf (offset 0)"
     )?;
     writeln!(
         code,
-        "                self.dispatch_attention(&enc, &self.q_buf, &self.k_cache[layer], &self.v_cache[layer], &self.attn_out_buf, pos + 1);"
+        "                self.dispatch_attention_offset(&enc, &self.qkv_buf, {q_byte_offset}, &self.k_cache[layer], &self.v_cache[layer], &self.attn_out_buf, pos + 1);"
     )?;
     writeln!(
         code,
@@ -1586,19 +1627,19 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     )?;
     writeln!(
         code,
+        "                // FFN: rms_norm, fused gate+up projection, silu_mul, down projection"
+    )?;
+    writeln!(
+        code,
         "                self.dispatch_rms_norm(&enc, &self.layers[layer].ffn_norm);"
     )?;
     writeln!(
         code,
-        "                self.{matmul_fn}(&enc, &self.hidden_buf, &self.layers[layer].gate_weight, &self.gate_buf, {intermediate}, {hidden});"
+        "                self.{matmul_fn}(&enc, &self.hidden_buf, &self.layers[layer].gate_up_weight, &self.gate_up_buf, {gate_up_rows}, {hidden});"
     )?;
     writeln!(
         code,
-        "                self.{matmul_fn}(&enc, &self.hidden_buf, &self.layers[layer].up_weight, &self.up_buf, {intermediate}, {hidden});"
-    )?;
-    writeln!(
-        code,
-        "                self.dispatch_silu_mul(&enc, &self.gate_buf, &self.up_buf, &self.ffn_hidden_buf, {intermediate});"
+        "                self.dispatch_silu_mul_fused(&enc, &self.gate_up_buf, &self.ffn_hidden_buf, {intermediate});"
     )?;
     writeln!(
         code,
@@ -1816,6 +1857,59 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
+    // dispatch_rope_offset
+    writeln!(
+        code,
+        "    /// Dispatch RoPE on a buffer at a given byte offset (for fused QKV buffer)."
+    )?;
+    writeln!(
+        code,
+        "    fn dispatch_rope_offset(&self, enc: &ComputeCommandEncoderRef, buf: &Buffer, byte_offset: usize, num_heads: usize, head_dim: usize, pos: usize) {{"
+    )?;
+    writeln!(code, "        let nh: u32 = num_heads as u32;")?;
+    writeln!(code, "        let hd: u32 = head_dim as u32;")?;
+    writeln!(code, "        let p: u32 = pos as u32;")?;
+    writeln!(code, "        let theta: f32 = ROPE_THETA;")?;
+    writeln!(
+        code,
+        "        let total_pairs = num_heads * (head_dim / 2);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_compute_pipeline_state(&self.rope_pipeline);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_buffer(0, Some(buf), byte_offset as u64);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(1, mem::size_of::<u32>() as u64, &nh as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(2, mem::size_of::<u32>() as u64, &hd as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(3, mem::size_of::<u32>() as u64, &p as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(4, mem::size_of::<f32>() as u64, &theta as *const f32 as *const _);"
+    )?;
+    writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
+    writeln!(
+        code,
+        "        let grid_size = MTLSize::new(((total_pairs + 255) / 256) as u64, 1, 1);"
+    )?;
+    writeln!(
+        code,
+        "        enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
+
     // dispatch_attention
     writeln!(
         code,
@@ -1869,6 +1963,58 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
+    // dispatch_attention_offset
+    writeln!(
+        code,
+        "    /// Dispatch attention with Q at a byte offset in the source buffer (for fused QKV)."
+    )?;
+    writeln!(
+        code,
+        "    fn dispatch_attention_offset(&self, enc: &ComputeCommandEncoderRef, q_buf: &Buffer, q_byte_offset: usize, k_cache: &Buffer, v_cache: &Buffer, output: &Buffer, seq_len: usize) {{"
+    )?;
+    writeln!(code, "        let sl: u32 = seq_len as u32;")?;
+    writeln!(code, "        let nh: u32 = NUM_HEADS as u32;")?;
+    writeln!(code, "        let nkv: u32 = NUM_KV_HEADS as u32;")?;
+    writeln!(code, "        let hd: u32 = HEAD_DIM as u32;")?;
+    writeln!(
+        code,
+        "        enc.set_compute_pipeline_state(&self.attention_pipeline);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_buffer(0, Some(q_buf), q_byte_offset as u64);"
+    )?;
+    writeln!(code, "        enc.set_buffer(1, Some(k_cache), 0);")?;
+    writeln!(code, "        enc.set_buffer(2, Some(v_cache), 0);")?;
+    writeln!(code, "        enc.set_buffer(3, Some(output), 0);")?;
+    writeln!(
+        code,
+        "        enc.set_bytes(4, mem::size_of::<u32>() as u64, &sl as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(5, mem::size_of::<u32>() as u64, &nh as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(6, mem::size_of::<u32>() as u64, &nkv as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(7, mem::size_of::<u32>() as u64, &hd as *const u32 as *const _);"
+    )?;
+    writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
+    writeln!(
+        code,
+        "        let grid_size = MTLSize::new(NUM_HEADS as u64, 1, 1);"
+    )?;
+    writeln!(
+        code,
+        "        enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
+
     // dispatch_silu_mul
     writeln!(code, "    /// Dispatch fused SiLU-multiply kernel.")?;
     writeln!(
@@ -1886,6 +2032,42 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(
         code,
         "        enc.set_bytes(3, mem::size_of::<u32>() as u64, &count as *const u32 as *const _);"
+    )?;
+    writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
+    writeln!(
+        code,
+        "        let grid_size = MTLSize::new(((n + 255) / 256) as u64, 1, 1);"
+    )?;
+    writeln!(
+        code,
+        "        enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
+
+    // dispatch_silu_mul_fused
+    writeln!(
+        code,
+        "    /// Dispatch fused SiLU-multiply reading gate and up from a single concatenated buffer."
+    )?;
+    writeln!(
+        code,
+        "    /// gate_up_buf contains [gate(n), up(n)] contiguously."
+    )?;
+    writeln!(
+        code,
+        "    fn dispatch_silu_mul_fused(&self, enc: &ComputeCommandEncoderRef, gate_up: &Buffer, output: &Buffer, n: usize) {{"
+    )?;
+    writeln!(code, "        let count: u32 = n as u32;")?;
+    writeln!(
+        code,
+        "        enc.set_compute_pipeline_state(&self.silu_mul_fused_pipeline);"
+    )?;
+    writeln!(code, "        enc.set_buffer(0, Some(gate_up), 0);")?;
+    writeln!(code, "        enc.set_buffer(1, Some(output), 0);")?;
+    writeln!(
+        code,
+        "        enc.set_bytes(2, mem::size_of::<u32>() as u64, &count as *const u32 as *const _);"
     )?;
     writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
     writeln!(
@@ -1959,6 +2141,48 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(
         code,
         "        enc.set_bytes(3, mem::size_of::<u32>() as u64, &n as *const u32 as *const _);"
+    )?;
+    writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
+    writeln!(
+        code,
+        "        let grid_size = MTLSize::new(((count + 255) / 256) as u64, 1, 1);"
+    )?;
+    writeln!(
+        code,
+        "        enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
+
+    // dispatch_copy_from_offset (copy from src at byte offset to dst at float offset)
+    writeln!(
+        code,
+        "    /// Dispatch copy from source at byte offset to destination at float offset."
+    )?;
+    writeln!(
+        code,
+        "    /// Used for KV cache updates from fused QKV buffer."
+    )?;
+    writeln!(
+        code,
+        "    fn dispatch_copy_from_offset(&self, enc: &ComputeCommandEncoderRef, src: &Buffer, src_byte_offset: usize, dst: &Buffer, dst_float_offset: usize, count: usize) {{"
+    )?;
+    writeln!(code, "        let n: u32 = count as u32;")?;
+    writeln!(
+        code,
+        "        enc.set_compute_pipeline_state(&self.copy_pipeline);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_buffer(0, Some(src), src_byte_offset as u64);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_buffer(1, Some(dst), (dst_float_offset * mem::size_of::<f32>()) as u64);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(2, mem::size_of::<u32>() as u64, &n as *const u32 as *const _);"
     )?;
     writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
     writeln!(
@@ -2370,8 +2594,12 @@ mod tests {
             "shaders should contain softmax kernel"
         );
         assert!(
-            shaders.contains("kernel void silu_mul"),
+            shaders.contains("kernel void silu_mul("),
             "shaders should contain silu_mul kernel"
+        );
+        assert!(
+            shaders.contains("kernel void silu_mul_fused"),
+            "shaders should contain silu_mul_fused kernel"
         );
         assert!(
             shaders.contains("kernel void elementwise_add"),
@@ -2521,13 +2749,10 @@ mod tests {
 
         for buf_name in &[
             "normed_buf",
-            "q_buf",
-            "k_buf",
-            "v_buf",
+            "qkv_buf",
             "attn_out_buf",
             "attn_proj_buf",
-            "gate_buf",
-            "up_buf",
+            "gate_up_buf",
             "ffn_hidden_buf",
             "ffn_out_buf",
             "add_tmp_buf",
@@ -2548,11 +2773,15 @@ mod tests {
             "fn dispatch_rms_norm(&self, enc: &ComputeCommandEncoderRef",
             "fn dispatch_matmul(&self, enc: &ComputeCommandEncoderRef",
             "fn dispatch_rope(&self, enc: &ComputeCommandEncoderRef",
+            "fn dispatch_rope_offset(&self, enc: &ComputeCommandEncoderRef",
             "fn dispatch_attention(&self, enc: &ComputeCommandEncoderRef",
+            "fn dispatch_attention_offset(&self, enc: &ComputeCommandEncoderRef",
             "fn dispatch_silu_mul(&self, enc: &ComputeCommandEncoderRef",
+            "fn dispatch_silu_mul_fused(&self, enc: &ComputeCommandEncoderRef",
             "fn dispatch_add_inplace(&self, enc: &ComputeCommandEncoderRef",
             "fn dispatch_copy(&self, enc: &ComputeCommandEncoderRef",
             "fn dispatch_copy_offset(&self, enc: &ComputeCommandEncoderRef",
+            "fn dispatch_copy_from_offset(&self, enc: &ComputeCommandEncoderRef",
             "fn dispatch_copy_to_offset(&self, enc: &ComputeCommandEncoderRef",
         ] {
             assert!(
@@ -2698,6 +2927,70 @@ mod tests {
     }
 
     #[test]
+    fn generated_model_uses_fused_qkv_projections() {
+        let config = minimal_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        // Should have fused QKV weight in layer buffers
+        assert!(
+            model_rs.contains("qkv_weight: Buffer"),
+            "LayerBuffers should have fused qkv_weight field"
+        );
+        // Should NOT have separate Q/K/V weight fields (check with leading whitespace to avoid substring matches)
+        assert!(
+            !model_rs.contains("    q_weight: Buffer"),
+            "LayerBuffers should not have separate q_weight field"
+        );
+        assert!(
+            !model_rs.contains("    k_weight: Buffer"),
+            "LayerBuffers should not have separate k_weight field"
+        );
+        assert!(
+            !model_rs.contains("    v_weight: Buffer"),
+            "LayerBuffers should not have separate v_weight field"
+        );
+
+        // Should have fused gate_up_weight
+        assert!(
+            model_rs.contains("gate_up_weight: Buffer"),
+            "LayerBuffers should have fused gate_up_weight field"
+        );
+        // Should NOT have separate gate/up weight fields
+        assert!(
+            !model_rs.contains("    gate_weight: Buffer"),
+            "LayerBuffers should not have separate gate_weight field"
+        );
+        assert!(
+            !model_rs.contains("    up_weight: Buffer"),
+            "LayerBuffers should not have separate up_weight field"
+        );
+
+        // Should have fused working buffers
+        assert!(
+            model_rs.contains("qkv_buf: Buffer"),
+            "MetalModel should have fused qkv_buf"
+        );
+        assert!(
+            model_rs.contains("gate_up_buf: Buffer"),
+            "MetalModel should have fused gate_up_buf"
+        );
+
+        // Forward pass should use fused dispatch
+        assert!(
+            model_rs.contains("dispatch_silu_mul_fused"),
+            "forward pass should use dispatch_silu_mul_fused"
+        );
+        assert!(
+            model_rs.contains("dispatch_rope_offset"),
+            "forward pass should use dispatch_rope_offset for fused QKV"
+        );
+        assert!(
+            model_rs.contains("dispatch_attention_offset"),
+            "forward pass should use dispatch_attention_offset for fused QKV"
+        );
+    }
+
+    #[test]
     fn q8_model_has_matmul_q8_pipeline() {
         let config = minimal_q8_config();
         let model_rs = generate_model_rs(&config).unwrap();
@@ -2766,6 +3059,32 @@ mod tests {
         assert!(
             model_rs.contains("let norm_buf = next_f32_buffer"),
             "final norm should use f32 buffer even for Q8_0 models"
+        );
+    }
+
+    #[test]
+    fn q8_model_uses_fused_weight_loading() {
+        let config = minimal_q8_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        // Should use fused Q8 buffer loading for QKV
+        assert!(
+            model_rs.contains("let qkv_weight = next_q8_fused_buffer"),
+            "Q8_0 model should use next_q8_fused_buffer for fused QKV weights"
+        );
+        // Should use fused Q8 buffer loading for gate+up
+        assert!(
+            model_rs.contains("let gate_up_weight = next_q8_fused_buffer"),
+            "Q8_0 model should use next_q8_fused_buffer for fused gate+up weights"
+        );
+        // Should still use regular q8 buffer for individual weights
+        assert!(
+            model_rs.contains("let o_weight = next_q8_buffer"),
+            "Q8_0 model should use next_q8_buffer for O weight"
+        );
+        assert!(
+            model_rs.contains("let down_weight = next_q8_buffer"),
+            "Q8_0 model should use next_q8_buffer for down weight"
         );
     }
 
