@@ -1158,6 +1158,21 @@ fn dot4_q8_0_q8_0(
     let mut r2 = 0.0f32;
     let mut r3 = 0.0f32;
 
+    // Prefetch the first block of each weight row into L1 cache.
+    unsafe {
+        core::arch::asm!(
+            "prfm pldl1keep, [{b0}]",
+            "prfm pldl1keep, [{b1}]",
+            "prfm pldl1keep, [{b2}]",
+            "prfm pldl1keep, [{b3}]",
+            b0 = in(reg) b0_q8.as_ptr(),
+            b1 = in(reg) b1_q8.as_ptr(),
+            b2 = in(reg) b2_q8.as_ptr(),
+            b3 = in(reg) b3_q8.as_ptr(),
+            options(nostack, readonly),
+        );
+    }
+
     for b in 0..num_blocks {
         let abs = b * TYPE_SIZE;
         let a_scale = f16_bits_to_f32(u16::from_le_bytes([a_q8[abs], a_q8[abs + 1]]));
@@ -1202,6 +1217,21 @@ fn dot4_q8_0_q8_0(
                 b30 = in(vreg) w30,   b31 = in(vreg) w31,
                 options(nostack),
             );
+            // Prefetch weight data 2 blocks ahead to hide memory latency.
+            if b + 2 < num_blocks {
+                let pf_off = (b + 2) * TYPE_SIZE;
+                core::arch::asm!(
+                    "prfm pldl1keep, [{b0}]",
+                    "prfm pldl1keep, [{b1}]",
+                    "prfm pldl1keep, [{b2}]",
+                    "prfm pldl1keep, [{b3}]",
+                    b0 = in(reg) b0_q8.as_ptr().add(pf_off),
+                    b1 = in(reg) b1_q8.as_ptr().add(pf_off),
+                    b2 = in(reg) b2_q8.as_ptr().add(pf_off),
+                    b3 = in(reg) b3_q8.as_ptr().add(pf_off),
+                    options(nostack, readonly),
+                );
+            }
             r0 += s0 * vaddvq_s32(acc0) as f32;
             r1 += s1 * vaddvq_s32(acc1) as f32;
             r2 += s2 * vaddvq_s32(acc2) as f32;
@@ -1256,6 +1286,30 @@ fn dot8_q8_0_q8_0(
     let mut r2 = 0.0f32; let mut r3 = 0.0f32;
     let mut r4 = 0.0f32; let mut r5 = 0.0f32;
     let mut r6 = 0.0f32; let mut r7 = 0.0f32;
+
+    // Prefetch the first block of each weight row into L1 cache.
+    // This hides initial memory latency before the loop begins.
+    unsafe {
+        core::arch::asm!(
+            "prfm pldl1keep, [{b0}]",
+            "prfm pldl1keep, [{b1}]",
+            "prfm pldl1keep, [{b2}]",
+            "prfm pldl1keep, [{b3}]",
+            "prfm pldl1keep, [{b4}]",
+            "prfm pldl1keep, [{b5}]",
+            "prfm pldl1keep, [{b6}]",
+            "prfm pldl1keep, [{b7}]",
+            b0 = in(reg) b0_q8.as_ptr(),
+            b1 = in(reg) b1_q8.as_ptr(),
+            b2 = in(reg) b2_q8.as_ptr(),
+            b3 = in(reg) b3_q8.as_ptr(),
+            b4 = in(reg) b4_q8.as_ptr(),
+            b5 = in(reg) b5_q8.as_ptr(),
+            b6 = in(reg) b6_q8.as_ptr(),
+            b7 = in(reg) b7_q8.as_ptr(),
+            options(nostack, readonly),
+        );
+    }
 
     for b in 0..num_blocks {
         let abs = b * TYPE_SIZE;
@@ -1331,6 +1385,31 @@ fn dot8_q8_0_q8_0(
                 b70 = in(vreg) w70,   b71 = in(vreg) w71,
                 options(nostack),
             );
+            // Prefetch weight data 2 blocks ahead to hide memory latency.
+            // The sdot pipeline depth is ~4 cycles; prefetching 2 blocks ahead
+            // ensures data arrives in L1 before the load instructions need it.
+            if b + 2 < num_blocks {
+                let pf_off = (b + 2) * TYPE_SIZE;
+                core::arch::asm!(
+                    "prfm pldl1keep, [{b0}]",
+                    "prfm pldl1keep, [{b1}]",
+                    "prfm pldl1keep, [{b2}]",
+                    "prfm pldl1keep, [{b3}]",
+                    "prfm pldl1keep, [{b4}]",
+                    "prfm pldl1keep, [{b5}]",
+                    "prfm pldl1keep, [{b6}]",
+                    "prfm pldl1keep, [{b7}]",
+                    b0 = in(reg) b0_q8.as_ptr().add(pf_off),
+                    b1 = in(reg) b1_q8.as_ptr().add(pf_off),
+                    b2 = in(reg) b2_q8.as_ptr().add(pf_off),
+                    b3 = in(reg) b3_q8.as_ptr().add(pf_off),
+                    b4 = in(reg) b4_q8.as_ptr().add(pf_off),
+                    b5 = in(reg) b5_q8.as_ptr().add(pf_off),
+                    b6 = in(reg) b6_q8.as_ptr().add(pf_off),
+                    b7 = in(reg) b7_q8.as_ptr().add(pf_off),
+                    options(nostack, readonly),
+                );
+            }
             r0 += s0 * vaddvq_s32(acc0) as f32;
             r1 += s1 * vaddvq_s32(acc1) as f32;
             r2 += s2 * vaddvq_s32(acc2) as f32;
