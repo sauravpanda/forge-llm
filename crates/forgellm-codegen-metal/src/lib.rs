@@ -120,14 +120,18 @@ fn generate_metal_shaders() -> String {
 using namespace metal;
 
 // ── Constants ───────────────────────────────────────────────────────────
-// 8 simdgroups per threadgroup = 256 threads, each simdgroup handles 1 row
+// 8 simdgroups per threadgroup = 256 threads, each simdgroup handles 4 rows
+// = 32 rows per threadgroup. Multi-row processing improves vector reuse.
 constant constexpr uint SIMDGROUPS_PER_TG = 8;
+constant constexpr uint ROWS_PER_SIMDGROUP = 4;
+constant constexpr uint ROWS_PER_TG = SIMDGROUPS_PER_TG * ROWS_PER_SIMDGROUP; // 32
 
 // ── matmul_vec ──────────────────────────────────────────────────────────
 // Matrix-vector multiply: output[row] = dot(matrix[row, :], vector[:])
 // Uses simdgroup cooperative dot product with shared memory vector caching
-// and float4 vectorized loads. Each threadgroup processes 8 rows (one per
-// simdgroup of 32 lanes).
+// and float4 vectorized loads. Each simdgroup processes 4 rows for better
+// shared memory reuse and instruction-level parallelism.
+// 8 simdgroups x 4 rows = 32 rows per threadgroup of 256 threads.
 kernel void matmul_vec(
     device const float* matrix [[buffer(0)]],
     device const float* vector [[buffer(1)]],
@@ -146,32 +150,56 @@ kernel void matmul_vec(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    uint row = tgid * SIMDGROUPS_PER_TG + simd_id;
-    if (row >= rows) return;
+    // Each simdgroup handles 4 consecutive rows
+    uint row_base = tgid * ROWS_PER_TG + simd_id * ROWS_PER_SIMDGROUP;
+    if (row_base >= rows) return;
 
-    uint base = row * cols;
+    uint base0 = row_base * cols;
+    uint base1 = (row_base + 1) * cols;
+    uint base2 = (row_base + 2) * cols;
+    uint base3 = (row_base + 3) * cols;
 
-    // float4 vectorized accumulation: each lane handles every 32nd group of 4
+    // float4 vectorized accumulation across 4 rows
     uint cols_vec4 = cols & ~127u;  // largest multiple of 128 <= cols
-    float4 sum4 = float4(0.0f);
+    float4 sum4_0 = float4(0.0f);
+    float4 sum4_1 = float4(0.0f);
+    float4 sum4_2 = float4(0.0f);
+    float4 sum4_3 = float4(0.0f);
+
     for (uint j = simd_lane * 4; j < cols_vec4; j += 128) {
-        float4 m = *reinterpret_cast<device const float4*>(matrix + base + j);
         float4 v = *reinterpret_cast<threadgroup const float4*>(vec_tile + j);
-        sum4 += m * v;
+        sum4_0 += *reinterpret_cast<device const float4*>(matrix + base0 + j) * v;
+        if (row_base + 1 < rows) sum4_1 += *reinterpret_cast<device const float4*>(matrix + base1 + j) * v;
+        if (row_base + 2 < rows) sum4_2 += *reinterpret_cast<device const float4*>(matrix + base2 + j) * v;
+        if (row_base + 3 < rows) sum4_3 += *reinterpret_cast<device const float4*>(matrix + base3 + j) * v;
     }
-    float sum = sum4.x + sum4.y + sum4.z + sum4.w;
+
+    float sum0 = sum4_0.x + sum4_0.y + sum4_0.z + sum4_0.w;
+    float sum1 = sum4_1.x + sum4_1.y + sum4_1.z + sum4_1.w;
+    float sum2 = sum4_2.x + sum4_2.y + sum4_2.z + sum4_2.w;
+    float sum3 = sum4_3.x + sum4_3.y + sum4_3.z + sum4_3.w;
 
     // Handle remaining elements (cols not divisible by 128)
     for (uint j = cols_vec4 + simd_lane; j < cols; j += 32) {
-        sum += matrix[base + j] * vec_tile[j];
+        float vv = vec_tile[j];
+        sum0 += matrix[base0 + j] * vv;
+        if (row_base + 1 < rows) sum1 += matrix[base1 + j] * vv;
+        if (row_base + 2 < rows) sum2 += matrix[base2 + j] * vv;
+        if (row_base + 3 < rows) sum3 += matrix[base3 + j] * vv;
     }
 
     // Simdgroup hardware warp-level reduction
-    sum = simd_sum(sum);
+    sum0 = simd_sum(sum0);
+    sum1 = simd_sum(sum1);
+    sum2 = simd_sum(sum2);
+    sum3 = simd_sum(sum3);
 
-    // Only first lane writes the result
+    // Only first lane writes the results
     if (simd_lane == 0) {
-        output[row] = sum;
+        if (row_base < rows)     output[row_base]     = sum0;
+        if (row_base + 1 < rows) output[row_base + 1] = sum1;
+        if (row_base + 2 < rows) output[row_base + 2] = sum2;
+        if (row_base + 3 < rows) output[row_base + 3] = sum3;
     }
 }
 
@@ -355,7 +383,8 @@ kernel void add_inplace(
 // yielding ~1.5-2x speedup on bandwidth-bound GPU matmul.
 // Uses char4 vectorized loads (4 int8 values per load) to reduce memory
 // transactions by 4x compared to scalar reads.
-// Each threadgroup processes 8 rows (one per simdgroup of 32 lanes).
+// Each simdgroup processes 4 rows for better vector reuse and ILP.
+// 8 simdgroups x 4 rows = 32 rows per threadgroup of 256 threads.
 kernel void matmul_vec_q8(
     device const uchar* matrix   [[buffer(0)]],  // Q8_0 raw bytes
     device const float* vector   [[buffer(1)]],  // f32 input
@@ -367,15 +396,6 @@ kernel void matmul_vec_q8(
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_id [[simdgroup_index_in_threadgroup]])
 {
-    // 8 rows per threadgroup (8 simdgroups x 32 lanes)
-    uint row = tgid * SIMDGROUPS_PER_TG + simd_id;
-    if (row >= rows) return;
-
-    // Q8_0: each block is 34 bytes for 32 elements
-    uint blocks_per_row = cols / 32;
-    uint row_bytes = blocks_per_row * 34;
-    device const uchar* row_data = matrix + row * row_bytes;
-
     // Load vector into shared memory
     threadgroup float vec_tile[4096];
     for (uint i = tid; i < cols; i += 256) {
@@ -383,73 +403,72 @@ kernel void matmul_vec_q8(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float sum = 0.0;
+    // Each simdgroup handles 4 consecutive rows
+    uint row_base = tgid * ROWS_PER_TG + simd_id * ROWS_PER_SIMDGROUP;
+    if (row_base >= rows) return;
 
-    // Multi-block processing: each lane processes 2 blocks per iteration
-    // for better instruction-level parallelism and SIMD lane occupancy.
-    uint blk = simd_lane;
-    while (blk + 32 < blocks_per_row) {
-        // Process first block
-        {
-            uint blk_byte = blk * 34;
-            device const half* scale_ptr = (device const half*)(row_data + blk_byte);
-            float scale = float(*scale_ptr);
-            uint vec_base = blk * 32;
-            float block_dot = 0.0;
-            device const char4* data_ptr = (device const char4*)(row_data + blk_byte + 2);
-            for (uint q = 0; q < 8; q++) {
-                char4 vals = data_ptr[q];
-                uint vi = vec_base + q * 4;
-                block_dot += float(vals.x) * vec_tile[vi]
-                           + float(vals.y) * vec_tile[vi + 1]
-                           + float(vals.z) * vec_tile[vi + 2]
-                           + float(vals.w) * vec_tile[vi + 3];
-            }
-            sum += scale * block_dot;
-        }
-        // Process second block (blk + 32) in same iteration
-        {
-            uint blk2 = blk + 32;
-            uint blk_byte = blk2 * 34;
-            device const half* scale_ptr = (device const half*)(row_data + blk_byte);
-            float scale = float(*scale_ptr);
-            uint vec_base = blk2 * 32;
-            float block_dot = 0.0;
-            device const char4* data_ptr = (device const char4*)(row_data + blk_byte + 2);
-            for (uint q = 0; q < 8; q++) {
-                char4 vals = data_ptr[q];
-                uint vi = vec_base + q * 4;
-                block_dot += float(vals.x) * vec_tile[vi]
-                           + float(vals.y) * vec_tile[vi + 1]
-                           + float(vals.z) * vec_tile[vi + 2]
-                           + float(vals.w) * vec_tile[vi + 3];
-            }
-            sum += scale * block_dot;
-        }
-        blk += 64;
-    }
-    // Handle remaining block (when blocks_per_row is not evenly divisible)
-    if (blk < blocks_per_row) {
+    // Q8_0: each block is 34 bytes for 32 elements
+    uint blocks_per_row = cols / 32;
+    uint row_bytes = blocks_per_row * 34;
+
+    // Pointers to each row's Q8_0 data
+    device const uchar* r0 = matrix + row_base * row_bytes;
+    device const uchar* r1 = (row_base + 1 < rows) ? matrix + (row_base + 1) * row_bytes : r0;
+    device const uchar* r2 = (row_base + 2 < rows) ? matrix + (row_base + 2) * row_bytes : r0;
+    device const uchar* r3 = (row_base + 3 < rows) ? matrix + (row_base + 3) * row_bytes : r0;
+
+    float sum0 = 0.0, sum1 = 0.0, sum2 = 0.0, sum3 = 0.0;
+
+    for (uint blk = simd_lane; blk < blocks_per_row; blk += 32) {
         uint blk_byte = blk * 34;
-        device const half* scale_ptr = (device const half*)(row_data + blk_byte);
-        float scale = float(*scale_ptr);
         uint vec_base = blk * 32;
-        float block_dot = 0.0;
-        device const char4* data_ptr = (device const char4*)(row_data + blk_byte + 2);
+
+        // Row 0
+        float s0 = float(*(device const half*)(r0 + blk_byte));
+        float bd0 = 0.0;
+        device const char4* d0 = (device const char4*)(r0 + blk_byte + 2);
+
+        // Row 1
+        float s1 = float(*(device const half*)(r1 + blk_byte));
+        float bd1 = 0.0;
+        device const char4* d1 = (device const char4*)(r1 + blk_byte + 2);
+
+        // Row 2
+        float s2 = float(*(device const half*)(r2 + blk_byte));
+        float bd2 = 0.0;
+        device const char4* d2 = (device const char4*)(r2 + blk_byte + 2);
+
+        // Row 3
+        float s3 = float(*(device const half*)(r3 + blk_byte));
+        float bd3 = 0.0;
+        device const char4* d3 = (device const char4*)(r3 + blk_byte + 2);
+
         for (uint q = 0; q < 8; q++) {
-            char4 vals = data_ptr[q];
             uint vi = vec_base + q * 4;
-            block_dot += float(vals.x) * vec_tile[vi]
-                       + float(vals.y) * vec_tile[vi + 1]
-                       + float(vals.z) * vec_tile[vi + 2]
-                       + float(vals.w) * vec_tile[vi + 3];
+            float4 v = float4(vec_tile[vi], vec_tile[vi+1], vec_tile[vi+2], vec_tile[vi+3]);
+
+            char4 c0 = d0[q]; bd0 += float(c0.x)*v.x + float(c0.y)*v.y + float(c0.z)*v.z + float(c0.w)*v.w;
+            char4 c1 = d1[q]; bd1 += float(c1.x)*v.x + float(c1.y)*v.y + float(c1.z)*v.z + float(c1.w)*v.w;
+            char4 c2 = d2[q]; bd2 += float(c2.x)*v.x + float(c2.y)*v.y + float(c2.z)*v.z + float(c2.w)*v.w;
+            char4 c3 = d3[q]; bd3 += float(c3.x)*v.x + float(c3.y)*v.y + float(c3.z)*v.z + float(c3.w)*v.w;
         }
-        sum += scale * block_dot;
+
+        sum0 += s0 * bd0;
+        sum1 += s1 * bd1;
+        sum2 += s2 * bd2;
+        sum3 += s3 * bd3;
     }
 
-    sum = simd_sum(sum);
+    sum0 = simd_sum(sum0);
+    sum1 = simd_sum(sum1);
+    sum2 = simd_sum(sum2);
+    sum3 = simd_sum(sum3);
+
     if (simd_lane == 0) {
-        output[row] = sum;
+        if (row_base < rows)     output[row_base]     = sum0;
+        if (row_base + 1 < rows) output[row_base + 1] = sum1;
+        if (row_base + 2 < rows) output[row_base + 2] = sum2;
+        if (row_base + 3 < rows) output[row_base + 3] = sum3;
     }
 }
 
@@ -1684,10 +1703,10 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     )?;
     writeln!(
         code,
-        "        // 8 rows per threadgroup (8 simdgroups x 32 lanes = 256 threads)"
+        "        // 32 rows per threadgroup (8 simdgroups x 4 rows each = 256 threads)"
     )?;
     writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
-    writeln!(code, "        let num_tg = ((rows + 7) / 8) as u64;")?;
+    writeln!(code, "        let num_tg = ((rows + 31) / 32) as u64;")?;
     writeln!(code, "        let grid_size = MTLSize::new(num_tg, 1, 1);")?;
     writeln!(
         code,
@@ -1728,10 +1747,10 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     )?;
     writeln!(
         code,
-        "        // 8 rows per threadgroup (8 simdgroups x 32 lanes = 256 threads)"
+        "        // 32 rows per threadgroup (8 simdgroups x 4 rows each = 256 threads)"
     )?;
     writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
-    writeln!(code, "        let num_tg = ((rows + 7) / 8) as u64;")?;
+    writeln!(code, "        let num_tg = ((rows + 31) / 32) as u64;")?;
     writeln!(code, "        let grid_size = MTLSize::new(num_tg, 1, 1);")?;
     writeln!(
         code,
@@ -2700,11 +2719,11 @@ mod tests {
             "matmul_vec_q8 should use char4 vectorized loads"
         );
         assert!(
-            shaders.contains("data_ptr[q]"),
+            shaders.contains("d0[q]"),
             "matmul_vec_q8 should index char4 pointer for vectorized reads"
         );
         assert!(
-            shaders.contains("vals.x"),
+            shaders.contains("c0.x"),
             "matmul_vec_q8 should access char4 components"
         );
     }
