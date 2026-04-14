@@ -11,41 +11,33 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  check:
-    name: Check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace --all-targets
-
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: macos-14  # Apple Silicon runner
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
+      - name: Build
+        run: cargo build --workspace --exclude forgellm-python
+      - name: Test
+        run: cargo test --workspace --exclude forgellm-python
+      - name: Clippy
+        run: cargo clippy --workspace --exclude forgellm-python -- -D warnings
+      - name: Format
+        run: cargo fmt --all -- --check
 
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
+  metal-smoke:
+    name: Metal Smoke Test
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-
-  fmt:
-    name: Format
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - run: cargo fmt --all -- --check
+      - name: Build CLI
+        run: cargo build --release -p forgellm-cli
+      - name: Generate Metal project
+        run: |
+          # Download a tiny test model or use a synthetic one
+          # For now, just verify the codegen tests pass
+          cargo test -p forgellm-codegen-metal

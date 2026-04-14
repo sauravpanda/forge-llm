@@ -1,5 +1,7 @@
 # ForgeLLM
 
+[![CI](https://github.com/sauravpanda/forge-llm/actions/workflows/ci.yml/badge.svg)](https://github.com/sauravpanda/forge-llm/actions/workflows/ci.yml)
+
 **Compile your LLMs, don't interpret them.**
 
 ForgeLLM is a Rust-native ahead-of-time (AOT) ML compiler for language models (1M-7B parameters). It compiles GGUF models into optimized, self-contained binaries with native Metal GPU acceleration — no runtime interpreter, no Python dependencies, no dynamic dispatch.

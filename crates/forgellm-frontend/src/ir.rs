@@ -344,7 +344,7 @@ impl ModelConfig {
         if self.num_attention_heads == 0 {
             return Err("num_attention_heads must be > 0".into());
         }
-        if self.hidden_size % self.num_attention_heads != 0 {
+        if !self.hidden_size.is_multiple_of(self.num_attention_heads) {
             return Err(format!(
                 "hidden_size ({}) must be divisible by num_attention_heads ({})",
                 self.hidden_size, self.num_attention_heads
@@ -353,7 +353,7 @@ impl ModelConfig {
         if self.num_kv_heads == 0 {
             return Err("num_kv_heads must be > 0".into());
         }
-        if self.num_attention_heads % self.num_kv_heads != 0 {
+        if !self.num_attention_heads.is_multiple_of(self.num_kv_heads) {
             return Err(format!(
                 "num_attention_heads ({}) must be divisible by num_kv_heads ({})",
                 self.num_attention_heads, self.num_kv_heads
