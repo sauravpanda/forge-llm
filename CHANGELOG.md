@@ -2,6 +2,63 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.5.1] — 2026-04-14 — Batched Prefill + Correctness Fixes
+
+**ForgeLLM is now the fastest LLM inference on Apple Silicon for generation across all tested model sizes, and fastest for prefill on small-to-medium models.**
+
+### Performance — Beat MLX on Generation, Beat llama.cpp on Prefill
+
+Apple M5 Pro, 8-bit quantization, 64-token generation:
+
+| Model | ForgeLLM Gen | MLX Gen | llama.cpp Gen |
+|-------|------------:|--------:|--------------:|
+| SmolLM2-135M | **496 tok/s** | 414 | 481 |
+| SmolLM2-360M | **289 tok/s** | 264 | 267 |
+| Llama-3.2-1B | **178 tok/s** | 111 | 130 |
+
+Prefill (long prompt):
+
+| Model | ForgeLLM | MLX | llama.cpp |
+|-------|---------:|----:|----------:|
+| 135M (130 tok) | **3,173** | 1,507 | 2,812 |
+| 135M (1250 tok) | **9,335** | — | — |
+| 1B (325 tok) | 475 | 2,718 | 556 |
+
+### Added
+- **Batched prefill Metal pipeline** (`perf`): `forward_prefill_batch()` processes all prompt tokens' matmuls in single GPU dispatches. 7 new batch kernels: `matmul_vec_batch` (f32/Q8/Q4), `rms_norm_batch`, `silu_mul_fused_batch`, `add_inplace_batch`, `copy_embedding_batch`. Batch-sequential attention with causal dependency (#179)
+- **Batched causal attention kernel** (`perf`): `attention_batch` processes all M tokens in ONE dispatch (M × num_heads threadgroups) with per-token causal masking. Plus `copy_kv_both_batch` for fused KV cache updates (#158)
+- **Weight-reuse GEMM kernel** (`perf`): `matmul_q8_gemm_batch` processes 4 tokens per threadgroup, reusing weight reads across the tile. 2x prefill speedup on 1B at long context
+- **Q4_0 native Metal kernel** (`feat`): `matmul_vec_q4` shader with nibble unpacking, uchar4 vectorized loads, simdgroup reduction (#175)
+- **OpenAI API server in Metal binaries** (`feat`): `--serve --port N` starts HTTP server with `/v1/chat/completions` (streaming + non-streaming), `/v1/models`, `/health`. Uses `tiny_http` for zero-dep HTTP (#176)
+- **Built-in timing + `--quiet` flag** (`feat`): Generated binaries print prefill/generate tok/s to stderr. `--quiet` suppresses text output for benchmarks (#177)
+- **`ModelConfig::validate()`** (`feat`): Checks head_dim divisibility, GQA ratio, hidden_size > 0 at compile time
+
+### Performance
+- **`packed_short4` wide loads in Q8_0 kernels** (`perf`): 64-bit (8 int8) loads via `packed_short4` + `as_type<char2>` unpack. 2x fewer memory transactions per Q8_0 block. +61% prefill on 135M, +2x on 1B long prompts
+- **`fast::rsqrt`/`fast::exp`** (`perf`): Hardware fast-math in rms_norm, softmax, silu, attention
+- **Multi-block Q8_0 per SIMD lane** (`perf`): Each lane processes 2 blocks per iteration for better ILP
+- **float4 V·scores in attention** (`perf`): 4 dimensions per thread instead of 1 in V output loop
+- **Fused `rope_qk_batch`** (`perf`): Single dispatch for Q+K RoPE instead of two (saves 30 dispatches per prefill)
+- **Fused `copy_kv_both_batch`** (`perf`): Single dispatch for K+V cache copy (saves 30 dispatches)
+
+### Fixed
+- **Packed char4 alignment bug** (`fix`): Q8_0/Q4_0 data starts at +2 byte offset from block (after f16 scale), not 4-byte aligned. Replaced `char4*` with `packed_char4*`. Fixed garbled output on SmolLM2-360M (#183)
+- **Dynamic `vec_tile` size** (`fix`): Was hardcoded to 4096, overflowed for Llama-3.2-1B (intermediate=8192). Now computed from model config (#184)
+- **Metal memory barriers** (`fix`): Added `memoryBarrierWithScope:MTLBarrierScopeBuffers` between dispatches to prevent data races
+- **Weight export panics replaced with error handling** (`fix`): `write_mixed`, `write_embed_as_f32`, `write_tensor` now return `Result<()>` with `bail!` instead of `panic!` (#185)
+- **`ModelConfig::validate()` called in `cmd_compile`** (`fix`): Catches invalid configs before codegen (#186)
+- **Softmax zero-denominator NaN guard** (`fix`): All 5 softmax locations now use `if sum > 0.0 { 1.0/sum } else { 0.0 }` (#188)
+
+### Prefill Performance Journey
+```
+Step                              Prefill tok/s   Gain
+Token-by-token (v0.5.0)                   ~150    1x
+Batched matmuls                          1,219    8x
++ Batched causal attention               1,657    11x
++ float4 + fused RoPE/KV                 2,250    15x
++ packed_short4 wide loads               3,173    21x
+```
+
 ## [0.5.0] — 2026-04-13 — Metal GPU Release: Faster than llama.cpp
 
 **Built a complete Metal GPU inference engine from scratch and beat llama.cpp.**
