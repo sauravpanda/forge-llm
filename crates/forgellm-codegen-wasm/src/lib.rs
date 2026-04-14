@@ -255,7 +255,7 @@ pub fn softmax(values: &mut [f32]) {
     let max_val = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0.0f32;
     for v in values.iter_mut() { *v = (*v - max_val).exp(); sum += *v; }
-    let inv = 1.0 / sum;
+    let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
     for v in values.iter_mut() { *v *= inv; }
 }
 

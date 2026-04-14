@@ -335,6 +335,34 @@ pub struct ModelConfig {
     pub qkv_bias: bool,
 }
 
+impl ModelConfig {
+    /// Validate that model dimensions are consistent.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.hidden_size == 0 {
+            return Err("hidden_size must be > 0".into());
+        }
+        if self.num_attention_heads == 0 {
+            return Err("num_attention_heads must be > 0".into());
+        }
+        if self.hidden_size % self.num_attention_heads != 0 {
+            return Err(format!(
+                "hidden_size ({}) must be divisible by num_attention_heads ({})",
+                self.hidden_size, self.num_attention_heads
+            ));
+        }
+        if self.num_kv_heads == 0 {
+            return Err("num_kv_heads must be > 0".into());
+        }
+        if self.num_attention_heads % self.num_kv_heads != 0 {
+            return Err(format!(
+                "num_attention_heads ({}) must be divisible by num_kv_heads ({})",
+                self.num_attention_heads, self.num_kv_heads
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The computation graph — the central IR artifact.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Graph {
