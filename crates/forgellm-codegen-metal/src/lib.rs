@@ -885,6 +885,8 @@ fn emit_model_header(code: &mut String, config: &ModelConfig) -> Result<(), Meta
     writeln!(code, "#![allow(dead_code)]")?;
     writeln!(code)?;
     writeln!(code, "use metal::*;")?;
+    writeln!(code, "#[allow(unused_imports)]")?;
+    writeln!(code, "use metal::objc::{{sel, sel_impl}};")?;
     writeln!(code, "use std::mem;")?;
     writeln!(code)?;
 
@@ -2016,6 +2018,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "        enc.dispatch_thread_groups(grid_size, tg_size);"
     )?;
+    writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
@@ -2056,6 +2059,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "        enc.dispatch_thread_groups(grid_size, tg_size);"
     )?;
+    writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
@@ -2100,6 +2104,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "        enc.dispatch_thread_groups(grid_size, tg_size);"
     )?;
+    writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
@@ -2144,6 +2149,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "        enc.dispatch_thread_groups(grid_size, tg_size);"
     )?;
+    writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
@@ -2191,6 +2197,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "        enc.dispatch_thread_groups(grid_size, tg_size);"
     )?;
+    writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
@@ -2244,6 +2251,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "        enc.dispatch_thread_groups(grid_size, tg_size);"
     )?;
+    writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
@@ -2297,6 +2305,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "        enc.dispatch_thread_groups(grid_size, tg_size);"
     )?;
+    writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
@@ -2349,6 +2358,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "        enc.dispatch_thread_groups(grid_size, tg_size);"
     )?;
+    writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
@@ -2379,6 +2389,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "        enc.dispatch_thread_groups(grid_size, tg_size);"
     )?;
+    writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
@@ -2415,6 +2426,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "        enc.dispatch_thread_groups(grid_size, tg_size);"
     )?;
+    writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
@@ -2447,6 +2459,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "        enc.dispatch_thread_groups(grid_size, tg_size);"
     )?;
+    writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
@@ -2488,6 +2501,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "        enc.dispatch_thread_groups(grid_size, tg_size);"
     )?;
+    writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
@@ -2530,6 +2544,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "        enc.dispatch_thread_groups(grid_size, tg_size);"
     )?;
+    writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
@@ -2569,6 +2584,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "        enc.dispatch_thread_groups(grid_size, tg_size);"
     )?;
+    writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
@@ -2601,6 +2617,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "        enc.dispatch_thread_groups(grid_size, tg_size);"
     )?;
+    writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
     writeln!(code, "    }}")?;
 
     writeln!(code, "}}")?;
