@@ -47,13 +47,20 @@ See [benchmarks/HISTORY.md](benchmarks/HISTORY.md) and [blog/beating-llama-cpp.m
 
 ## Quick Start
 
+### Install
+
+```bash
+# From crates.io (recommended)
+cargo install forgellm-cli
+
+# Or build from source
+git clone https://github.com/sauravpanda/forge-llm.git
+cd forge-llm && cargo build --release
+```
+
 ### Metal GPU (Apple Silicon)
 
 ```bash
-# Build from source
-git clone https://github.com/sauravpanda/forge-llm.git
-cd forge-llm && cargo build --release
-
 # Compile model to Metal binary
 forge compile --model model.gguf --output ./my-model --target metal
 forge export-weights --model model.gguf --output ./my-model/weights.bin
