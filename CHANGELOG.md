@@ -2,6 +2,18 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [Unreleased] — Hardware Matrix-Multiply Prefill
+
+### Performance
+- **`matmul_q8_mma` kernel** (`perf`): New Metal compute kernel using Apple Silicon `simdgroup_matrix<float, 8, 8>` hardware matrix-multiply accumulate. Q8_0 weights are cooperatively dequantized into threadgroup memory once per 32-K chunk and reused across a 16×16 token/row tile by 4 simdgroups (one 8×8 output sub-tile each). Four `simdgroup_multiply_accumulate` calls complete one K=32 tile — full hardware MMA throughput vs. scalar dot products.
+- **Prefill speedup on Llama-3.2-1B Q8_0** (Apple M5 Pro):
+  - 108 tokens: 406 → **958 tok/s** (2.4x)
+  - 321 tokens: ~475 → **1,415 tok/s** (3.0x)
+  - 801 tokens: 721 → **2,349 tok/s** (3.3x)
+  - 1,501 tokens: 1,354 → **4,347 tok/s** (3.2x) — ~8.7 TFLOPS sustained
+- **SmolLM2-135M**: 1,250-token prefill 9,335 → **19,103 tok/s** (2.0x)
+- Dispatch path routes Q8 matmuls with `M >= 16` and `rows % 16 == 0` to the MMA kernel; the existing `matmul_q8_gemm_batch` remains as the fallback for `4 ≤ M < 16`.
+
 ## [0.5.1] — 2026-04-14 — Batched Prefill + Correctness Fixes
 
 **ForgeLLM is now the fastest LLM inference on Apple Silicon for generation across all tested model sizes, and fastest for prefill on small-to-medium models.**

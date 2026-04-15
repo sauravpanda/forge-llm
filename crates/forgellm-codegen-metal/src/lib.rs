@@ -128,6 +128,7 @@ fn generate_metal_shaders(config: &ModelConfig) -> String {
 //
 
 #include <metal_stdlib>
+#include <metal_simdgroup_matrix>
 using namespace metal;
 
 // ── Constants ───────────────────────────────────────────────────────────
@@ -1455,6 +1456,135 @@ kernel void matmul_q8_gemm_batch(
     }
 }
 
+// ── matmul_q8_mma ──────────────────────────────────────────────────────
+// Hardware matrix-multiply GEMM for Q8_0 weights, using Apple Silicon
+// simdgroup_matrix tiles (simdgroup_multiply_accumulate).  This dispatches
+// far higher FLOP/cycle than the scalar dot-product GEMM and is the primary
+// driver of prompt-prefill throughput on M >= MMA_TOK_TILE inputs.
+//
+// Tile: 16 tokens × 16 rows per threadgroup, K=32 per iteration (one Q8 block).
+// 4 simdgroups per TG, each computing a single 8×8 output sub-tile via one
+// simdgroup_matrix<float, 8, 8> accumulator.  Weight bytes are cooperatively
+// dequantized into threadgroup memory once per block and reused by all
+// simdgroups in the tile.
+//
+// Assumptions (verified in the dispatch helper, falls back otherwise):
+//   * cols  % 32 == 0   (one Q8_0 block per K chunk)
+//   * rows  % 16 == 0   (tile-aligned; true for all supported architectures)
+//   * num_tokens may be any value; partial row at the tile boundary is handled
+//     via a scratch copy path.
+constant constexpr uint MMA_TOK_TILE = 16;
+constant constexpr uint MMA_ROW_TILE = 16;
+
+kernel void matmul_q8_mma(
+    device const uchar* matrix   [[buffer(0)]],  // Q8_0 [rows, cols/32 * 34]
+    device const float* inputs   [[buffer(1)]],  // [M, cols]
+    device float* outputs        [[buffer(2)]],  // [M, rows]
+    constant uint& num_tokens    [[buffer(3)]],
+    constant uint& rows          [[buffer(4)]],
+    constant uint& cols          [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]])
+{
+    uint row_base = tgid.x * MMA_ROW_TILE;
+    uint tok_base = tgid.y * MMA_TOK_TILE;
+    if (row_base >= rows || tok_base >= num_tokens) return;
+
+    // Shared dequant tiles (16*32 = 512 floats = 2 KB each, 4 KB total).
+    threadgroup float w_tile[MMA_ROW_TILE * 32];
+    threadgroup float t_tile[MMA_TOK_TILE * 32];
+
+    // 4 simdgroups → 2×2 grid of 8×8 sub-tiles inside the 16×16 output.
+    uint sg_tok_base = (simd_id / 2) * 8;  // row within output tile (token dim)
+    uint sg_row_base = (simd_id % 2) * 8;  // col within output tile (row dim)
+
+    simdgroup_matrix<float, 8, 8> C = simdgroup_matrix<float, 8, 8>(0.0f);
+
+    uint blocks_per_row = cols / 32;
+    uint row_bytes = blocks_per_row * 34;
+
+    for (uint blk = 0; blk < blocks_per_row; blk++) {
+        // ── Cooperatively dequantize 16 weight rows × 32 K into w_tile ──
+        // 512 floats / 128 threads = 4 floats per thread.
+        {
+            uint base = tid * 4;
+            for (uint ii = 0; ii < 4; ii++) {
+                uint idx = base + ii;
+                uint r = idx / 32;
+                uint k = idx % 32;
+                device const uchar* rp = matrix + (row_base + r) * row_bytes + blk * 34;
+                float sc = float(*(device const half*)rp);
+                int ival = int(*(device const int8_t*)(rp + 2 + k));
+                w_tile[r * 32 + k] = float(ival) * sc;
+            }
+        }
+
+        // ── Cooperatively load 16 token vectors × 32 K into t_tile ──
+        {
+            uint base = tid * 4;
+            for (uint ii = 0; ii < 4; ii++) {
+                uint idx = base + ii;
+                uint m = idx / 32;
+                uint k = idx % 32;
+                uint tok = tok_base + m;
+                t_tile[m * 32 + k] = (tok < num_tokens)
+                    ? inputs[tok * cols + blk * 32 + k]
+                    : 0.0f;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ── 4 × (8×8×8) MMA over the K=32 chunk ──
+        // A[m, k] = t_tile[(sg_tok_base + m) * 32 + k_sub*8 + k]  (M×K, no transpose)
+        // B[k, r] = w_tile[(sg_row_base + r) * 32 + k_sub*8 + k]  (loaded transposed → K×R)
+        // C[m, r] += A[m, k] * B[k, r]
+        for (uint k_sub = 0; k_sub < 4; k_sub++) {
+            simdgroup_matrix<float, 8, 8> A, B;
+            simdgroup_load(A,
+                t_tile + sg_tok_base * 32 + k_sub * 8,
+                32,
+                ulong2(0, 0),
+                false);
+            simdgroup_load(B,
+                w_tile + sg_row_base * 32 + k_sub * 8,
+                32,
+                ulong2(0, 0),
+                true);
+            simdgroup_multiply_accumulate(C, A, B, C);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ── Store C to outputs[(tok_base+sg_tok_base)+m, (row_base+sg_row_base)+r] ──
+    // Output layout: outputs[tok * rows + row], stride = rows (always tile-aligned).
+    uint out_tok = tok_base + sg_tok_base;
+    uint out_row = row_base + sg_row_base;
+    bool full_tok = (out_tok + 8 <= num_tokens);
+    if (full_tok) {
+        // Fast path: entire 8×8 sub-tile is in-bounds.
+        simdgroup_store(C, outputs + out_tok * rows + out_row, rows);
+    } else if (out_tok < num_tokens) {
+        // Partial row at the last token tile: stage in per-simdgroup scratch
+        // and scalar-copy the valid rows.
+        threadgroup float scratch[4 * 64];
+        simdgroup_store(C, scratch + simd_id * 64, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        uint lane = tid % 32;
+        if (lane == 0) {
+            uint valid = num_tokens - out_tok;  // 1..7
+            for (uint m = 0; m < valid; m++) {
+                device float* dst = outputs + (out_tok + m) * rows + out_row;
+                threadgroup const float* src = scratch + simd_id * 64 + m * 8;
+                dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = src[3];
+                dst[4] = src[4]; dst[5] = src[5]; dst[6] = src[6]; dst[7] = src[7];
+            }
+        }
+    }
+}
+
 // ── matmul_vec_q4_batch ────────────────────────────────────────────────
 // Batched Q4_0 matrix-vector multiply for M input vectors.
 // Grid: ceil(rows/Q4_ROWS_PER_TG) * M threadgroups.
@@ -1923,6 +2053,10 @@ fn emit_metal_model_struct(
         code,
         "    matmul_q8_gemm_batch_pipeline: ComputePipelineState,"
     )?;
+    writeln!(
+        code,
+        "    matmul_q8_mma_pipeline: ComputePipelineState,"
+    )?;
     writeln!(code, "    matmul_q4_batch_pipeline: ComputePipelineState,")?;
     writeln!(code, "    rms_norm_batch_pipeline: ComputePipelineState,")?;
     writeln!(code, "    rope_batch_pipeline: ComputePipelineState,")?;
@@ -2145,6 +2279,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         ("matmul_batch_pipeline", "matmul_vec_batch"),
         ("matmul_q8_batch_pipeline", "matmul_vec_q8_batch"),
         ("matmul_q8_gemm_batch_pipeline", "matmul_q8_gemm_batch"),
+        ("matmul_q8_mma_pipeline", "matmul_q8_mma"),
         ("matmul_q4_batch_pipeline", "matmul_vec_q4_batch"),
         ("rms_norm_batch_pipeline", "rms_norm_batch"),
         ("rope_batch_pipeline", "rope_batch"),
@@ -2648,6 +2783,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            matmul_batch_pipeline,")?;
     writeln!(code, "            matmul_q8_batch_pipeline,")?;
     writeln!(code, "            matmul_q8_gemm_batch_pipeline,")?;
+    writeln!(code, "            matmul_q8_mma_pipeline,")?;
     writeln!(code, "            matmul_q4_batch_pipeline,")?;
     writeln!(code, "            rms_norm_batch_pipeline,")?;
     writeln!(code, "            rope_batch_pipeline,")?;
@@ -4199,10 +4335,63 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "        let c: u32 = cols as u32;")?;
     writeln!(
         code,
-        "        // Tile size must match TOKENS_PER_TG_Q8 in shaders."
+        "        // Tile sizes must match the Metal shader constants."
     )?;
     writeln!(code, "        const TOKENS_PER_TG_Q8: usize = 4;")?;
-    writeln!(code, "        if num_tokens >= TOKENS_PER_TG_Q8 {{")?;
+    writeln!(code, "        const MMA_TOK_TILE: usize = 16;")?;
+    writeln!(code, "        const MMA_ROW_TILE: usize = 16;")?;
+    writeln!(
+        code,
+        "        // Hardware matrix-multiply path (simdgroup_matrix): use for large"
+    )?;
+    writeln!(
+        code,
+        "        // prefill batches when rows align to the MMA row tile (16)."
+    )?;
+    writeln!(
+        code,
+        "        if num_tokens >= MMA_TOK_TILE && rows % MMA_ROW_TILE == 0 && cols % 32 == 0 {{"
+    )?;
+    writeln!(
+        code,
+        "            enc.set_compute_pipeline_state(&self.matmul_q8_mma_pipeline);"
+    )?;
+    writeln!(code, "            enc.set_buffer(0, Some(weight), 0);")?;
+    writeln!(code, "            enc.set_buffer(1, Some(input), 0);")?;
+    writeln!(code, "            enc.set_buffer(2, Some(output), 0);")?;
+    writeln!(
+        code,
+        "            enc.set_bytes(3, mem::size_of::<u32>() as u64, &nt as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "            enc.set_bytes(4, mem::size_of::<u32>() as u64, &r as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "            enc.set_bytes(5, mem::size_of::<u32>() as u64, &c as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "            let row_tgs = rows / MMA_ROW_TILE;"
+    )?;
+    writeln!(
+        code,
+        "            let tok_tgs = (num_tokens + MMA_TOK_TILE - 1) / MMA_TOK_TILE;"
+    )?;
+    writeln!(
+        code,
+        "            let tg_size = MTLSize::new(128, 1, 1);  // 4 simdgroups × 32 lanes"
+    )?;
+    writeln!(
+        code,
+        "            let grid_size = MTLSize::new(row_tgs as u64, tok_tgs as u64, 1);"
+    )?;
+    writeln!(
+        code,
+        "            enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(code, "        }} else if num_tokens >= TOKENS_PER_TG_Q8 {{")?;
     writeln!(
         code,
         "            enc.set_compute_pipeline_state(&self.matmul_q8_gemm_batch_pipeline);"
