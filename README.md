@@ -29,13 +29,13 @@ Benchmarks on Apple M5 Pro, 8-bit quantization, 64-token generation.
 |-------|---------------|-------------|-------------------|
 | SmolLM2-135M (~100 tok) | **4,900** | 1,507 | 2,812 |
 | SmolLM2-135M (~1250 tok) | **23,300** | — | — |
-| Llama-3.2-1B (~321 tok) | 1,675 | **2,718** | 556 |
-| Llama-3.2-1B (~801 tok) | **2,820** | — | — |
-| Llama-3.2-1B (~1501 tok) | **5,300** | — | — |
+| Llama-3.2-1B (~321 tok) | 1,805 | **2,718** | 556 |
+| Llama-3.2-1B (~801 tok) | **2,965** | — | — |
+| Llama-3.2-1B (~1501 tok) | **5,500** | — | — |
 | Llama-3.2-3B (~401 tok) | **660** | — | — |
 | Llama-3.2-3B (~1501 tok) | **2,000** | — | — |
 
-Prefill uses hardware matrix-multiply via `simdgroup_matrix<float, 8, 8>`. The large-tile MMA kernel (`matmul_q8_mma32`, 32×32 tile, 8 simdgroups × 2 accumulators) hits **~10.6 TFLOPS sustained** on Llama-3.2-1B at 1,501 tokens.
+Prefill uses hardware matrix-multiply via `simdgroup_matrix<float, 8, 8>`. The large-tile MMA kernel (`matmul_q8_mma32`, 32×32 tile, 8 simdgroups × 2 accumulators) hits **~11 TFLOPS sustained** on Llama-3.2-1B at 1,501 tokens. For 1B/3B a FP16-tile variant (`matmul_q8_mma32_h`) halves threadgroup memory to 4 KB, doubling concurrent-TG occupancy at moderate lengths (+15% at 100 tok, +8% at 321 tok on 1B).
 
 ### Deploy Size
 
