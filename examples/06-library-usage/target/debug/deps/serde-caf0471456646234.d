@@ -1,0 +1,12 @@
+/Users/sauravpanda/Documents/GitHub/forge-llm/.claude/worktrees/agent-af5e937c/examples/06-library-usage/target/debug/deps/serde-caf0471456646234.d: /Users/sauravpanda/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/sauravpanda/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/sauravpanda/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/sauravpanda/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/sauravpanda/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/sauravpanda/Documents/GitHub/forge-llm/.claude/worktrees/agent-af5e937c/examples/06-library-usage/target/debug/build/serde-a981bcd7b9b3fd08/out/private.rs
+
+/Users/sauravpanda/Documents/GitHub/forge-llm/.claude/worktrees/agent-af5e937c/examples/06-library-usage/target/debug/deps/libserde-caf0471456646234.rmeta: /Users/sauravpanda/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/sauravpanda/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/sauravpanda/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/sauravpanda/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/sauravpanda/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/sauravpanda/Documents/GitHub/forge-llm/.claude/worktrees/agent-af5e937c/examples/06-library-usage/target/debug/build/serde-a981bcd7b9b3fd08/out/private.rs
+
+/Users/sauravpanda/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/Users/sauravpanda/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/Users/sauravpanda/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/Users/sauravpanda/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/Users/sauravpanda/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/Users/sauravpanda/Documents/GitHub/forge-llm/.claude/worktrees/agent-af5e937c/examples/06-library-usage/target/debug/build/serde-a981bcd7b9b3fd08/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/sauravpanda/Documents/GitHub/forge-llm/.claude/worktrees/agent-af5e937c/examples/06-library-usage/target/debug/build/serde-a981bcd7b9b3fd08/out

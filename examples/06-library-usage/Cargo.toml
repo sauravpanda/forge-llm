@@ -1,0 +1,24 @@
+[package]
+name = "forgellm-library-example"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# This example is intentionally NOT a member of the workspace so it can be
+# built independently: `cd examples/06-library-usage && cargo run --release`.
+[workspace]
+
+[[bin]]
+name = "forgellm-library-example"
+path = "src/main.rs"
+
+# Sibling example 07 is also built through this project so a single
+# `cargo build --release` produces both binaries.
+[[bin]]
+name = "custom-sampling"
+path = "../07-custom-sampling.rs"
+
+[dependencies]
+forgellm-frontend = { path = "../../crates/forgellm-frontend" }
+forgellm-runtime = { path = "../../crates/forgellm-runtime" }
+anyhow = "1"
