@@ -10,26 +10,28 @@ All notable changes to ForgeLLM are documented here.
 
 **`matmul_q8_mma32` kernel (32×32 tile, 8 simdgroups × 2 accumulators)** (`perf`): Large-tile variant that halves dispatch count and reuses each token-matrix `simdgroup_load` across two row accumulators per simdgroup, improving ILP and weight reuse. Preferred when `num_tokens >= 32` and `rows % 32 == 0`.
 
-**`matmul_q8_mma32_h` (FP16-tile) variant** (`perf`): Dequantized weights and token activations are staged as `half` in threadgroup memory — 4 KB total vs 8 KB for the FP32 tile — doubling concurrent-threadgroup occupancy per GPU core. `simdgroup_multiply_accumulate` runs mixed precision: `half` inputs with a `float` accumulator, preserving the Q8_0 dynamic range (int8 × f32-scale already fits in f16). Selected when `cols >= 2048`, so 1B/3B get the occupancy win while small-hidden models (135M / 360M) stay on the FP32 path and avoid f32→f16 conversion overhead. Adds +15% at 100 tok and +8% at 321 tok on Llama-3.2-1B.
+**`matmul_q8_mma32_h` (FP16-tile) variant** (`perf`): Dequantized weights and token activations are staged as `half` in threadgroup memory — 4 KB total vs 8 KB for the FP32 tile — doubling concurrent-threadgroup occupancy per GPU core. `simdgroup_multiply_accumulate` runs mixed precision: `half` inputs with a `float` accumulator, preserving the Q8_0 dynamic range (int8 × f32-scale already fits in f16). Selected when `cols >= 2048`, so 1B/3B get the occupancy win while small-hidden models (135M / 360M) stay on the FP32 path and avoid f32→f16 conversion overhead.
+
+**`matmul_q8_mma32_h4` (4-simdgroup, 2×2-accumulator) variant** (`perf`): The dispatch default for `cols >= 2048`. Uses 128 threads (4 simdgroups) per threadgroup and each simdgroup owns a 2×2 grid of 8×8 `simdgroup_matrix` accumulators (C_00/C_01/C_10/C_11). Per K-sub iteration we load two A fragments and two B fragments, then run **four** `simdgroup_multiply_accumulate` instructions reusing each A and each B across the 2×2 output. Doubles FLOP-per-simdgroup-load vs the 2-accumulator kernel and halves thread-per-TG, which improves occupancy when the GPU is thread-budget-limited rather than shared-memory-limited.
 
 **Prefill speedup on Apple M5 Pro (Q8_0):**
 
 | Model | Prompt | Before | After (MMA+MMA32) | Speedup |
 |-------|-------:|-------:|------------------:|--------:|
 | Llama-3.2-1B | 108 | 406 | **980 tok/s** | 2.4x |
-| Llama-3.2-1B | 321 | ~475 | **1,805 tok/s** | 3.8x |
-| Llama-3.2-1B | 801 | 721 | **2,965 tok/s** | 4.1x |
-| Llama-3.2-1B | 1,501 | 1,354 | **5,500 tok/s** | 4.1x |
+| Llama-3.2-1B | 321 | ~475 | **1,880 tok/s** | 4.0x |
+| Llama-3.2-1B | 801 | 721 | **3,150 tok/s** | 4.4x |
+| Llama-3.2-1B | 1,501 | 1,354 | **6,070 tok/s** | 4.5x |
 | SmolLM2-135M | 1,250 | 9,335 | **23,300 tok/s** | 2.5x |
-| Llama-3.2-3B | 401 | ~546 | **660 tok/s** | 1.2x |
-| Llama-3.2-3B | 1,501 | ~1,597 | **2,000 tok/s** | 1.3x |
+| Llama-3.2-3B | 401 | ~546 | **740 tok/s** | 1.4x |
+| Llama-3.2-3B | 1,501 | ~1,597 | **2,200 tok/s** | 1.4x |
 
-At 1,501 tokens Llama-3.2-1B sustains ~11 TFLOPS (~85% of the M5 Pro FP32 peak).
+At 1,501 tokens Llama-3.2-1B sustains **~12.1 TFLOPS** — roughly 93% of the M5 Pro FP32 peak.
 
 Dispatch tiering for Q8 matmul:
 - `num_tokens >= 32` and `rows % 32 == 0`:
-  - `cols >= 2048` → `matmul_q8_mma32_h` (FP16-tile)
-  - otherwise   → `matmul_q8_mma32` (FP32-tile)
+  - `cols >= 2048` → `matmul_q8_mma32_h4` (FP16-tile, 4 simdgroups × 4 accumulators)
+  - otherwise   → `matmul_q8_mma32` (FP32-tile, 8 simdgroups × 2 accumulators)
 - `16 <= num_tokens < 32` and `rows % 16 == 0` → `matmul_q8_mma`
 - `4 <= num_tokens < 16` → existing `matmul_q8_gemm_batch`
 - `num_tokens < 4` → per-token mat-vec kernel
