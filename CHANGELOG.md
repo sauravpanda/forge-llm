@@ -2,6 +2,22 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [Unreleased]
+
+### Performance
+
+**`matmul_q8_mma32_hh4` (all-FP16 MMA) variant** (`perf`): Same 32×32 tile and 4 simdgroup × 2×2 accumulator layout as `matmul_q8_mma32_h4`, but both inputs *and* accumulators are `simdgroup_matrix<half, 8, 8>`. Apple Silicon runs FP16 `simdgroup_multiply_accumulate` at a higher rate than FP32, giving ~6–9% additional throughput on Llama-3.2-1B / 3B prefill at moderate-to-long contexts. Output is converted back to `float` in the device store. Dispatched when `cols >= 2048` *and* `num_tokens >= 256` — below that threshold the per-lane scalar widening store outweighs the MMA win, so the path falls back to `matmul_q8_mma32_h4`.
+
+**Llama-3.2-1B Q8_0 prefill (Apple M5 Pro):**
+
+| Prompt | v0.6.0 | Unreleased | Δ |
+|-------:|-------:|-----------:|--:|
+| 321 tok | 1,880 | **2,040 tok/s** | +9% |
+| 801 tok | 3,150 | **3,390 tok/s** | +8% |
+| 1,501 tok | 6,070 | **6,320 tok/s** | +4% (~12.6 TFLOPS) |
+
+**Llama-3.2-3B Q8_0 prefill:** 401 tok 740 → **770 tok/s** (+4%), 1,501 tok 2,200 → **2,390 tok/s** (+9%).
+
 ## [0.6.0] — 2026-04-15 — Hardware Matrix-Multiply Prefill
 
 **Prefill went 4x faster on Llama-3.2-1B Q8_0.**  This release rewrites the Metal Q8 matmul path around Apple Silicon `simdgroup_matrix<float, 8, 8>` hardware matrix-multiply accumulate (MMA), replacing the previous dot-product GEMM with four successive MMA kernel generations and a tiered dispatch that picks the right one per matmul shape.

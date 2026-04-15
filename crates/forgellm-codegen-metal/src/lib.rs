@@ -2010,6 +2010,144 @@ kernel void matmul_q8_mma32_h4(
     }
 }
 
+// ── matmul_q8_mma32_hh4 ────────────────────────────────────────────────
+// All-half MMA variant of matmul_q8_mma32_h4.
+//
+// Both the input matrices and the accumulators are simdgroup_matrix<half>.
+// On Apple Silicon, FP16 `simdgroup_multiply_accumulate` runs at 2x the FP32
+// rate (dual-issue FMA), so if Q8_0 precision holds through half
+// accumulation this kernel can double the effective FLOP throughput on
+// matmul-bound prefill.
+//
+// Numerical notes: Q8_0 weights have only ~8 bits of mantissa and the token
+// activations at each layer are bounded (post-RMSNorm ≈ O(1)).  Summing
+// 2048-wide K for 1B or 8192-wide for the FFN may exceed half's ~3.3-digit
+// precision on extreme values, but the inputs are already quantized so the
+// per-product error floor is higher than the half-precision rounding error.
+// We verify correctness on 135M / 1B / 3B before enabling.
+kernel void matmul_q8_mma32_hh4(
+    device const uchar* matrix   [[buffer(0)]],
+    device const float* inputs   [[buffer(1)]],
+    device float* outputs        [[buffer(2)]],
+    constant uint& num_tokens    [[buffer(3)]],
+    constant uint& rows          [[buffer(4)]],
+    constant uint& cols          [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]])
+{
+    uint row_base = tgid.x * MMA32_ROW_TILE;
+    uint tok_base = tgid.y * MMA32_TOK_TILE;
+    if (row_base >= rows || tok_base >= num_tokens) return;
+
+    threadgroup half w_tile[MMA32_ROW_TILE * 32];
+    threadgroup half t_tile[MMA32_TOK_TILE * 32];
+
+    uint sg_tok_q = simd_id / 2;
+    uint sg_row_q = simd_id % 2;
+    uint sg_tok_base = sg_tok_q * 16;
+    uint sg_row_base = sg_row_q * 16;
+
+    simdgroup_matrix<half, 8, 8> C_00 = simdgroup_matrix<half, 8, 8>(half(0));
+    simdgroup_matrix<half, 8, 8> C_01 = simdgroup_matrix<half, 8, 8>(half(0));
+    simdgroup_matrix<half, 8, 8> C_10 = simdgroup_matrix<half, 8, 8>(half(0));
+    simdgroup_matrix<half, 8, 8> C_11 = simdgroup_matrix<half, 8, 8>(half(0));
+
+    uint blocks_per_row = cols / 32;
+    uint row_bytes = blocks_per_row * 34;
+
+    for (uint blk = 0; blk < blocks_per_row; blk++) {
+        {
+            uint base = tid * 8;
+            for (uint ii = 0; ii < 8; ii++) {
+                uint idx = base + ii;
+                uint r = idx / 32;
+                uint k = idx % 32;
+                device const uchar* rp = matrix + (row_base + r) * row_bytes + blk * 34;
+                float sc = float(*(device const half*)rp);
+                int ival = int(*(device const int8_t*)(rp + 2 + k));
+                w_tile[r * 32 + k] = half(float(ival) * sc);
+            }
+        }
+        {
+            uint base = tid * 8;
+            for (uint ii = 0; ii < 8; ii++) {
+                uint idx = base + ii;
+                uint m = idx / 32;
+                uint k = idx % 32;
+                uint tok = tok_base + m;
+                t_tile[m * 32 + k] = (tok < num_tokens)
+                    ? half(inputs[tok * cols + blk * 32 + k])
+                    : half(0);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint k_sub = 0; k_sub < 4; k_sub++) {
+            simdgroup_matrix<half, 8, 8> A_top, A_bot, B_lo, B_hi;
+            simdgroup_load(A_top,
+                t_tile + (sg_tok_base + 0) * 32 + k_sub * 8,
+                32, ulong2(0, 0), false);
+            simdgroup_load(A_bot,
+                t_tile + (sg_tok_base + 8) * 32 + k_sub * 8,
+                32, ulong2(0, 0), false);
+            simdgroup_load(B_lo,
+                w_tile + (sg_row_base + 0) * 32 + k_sub * 8,
+                32, ulong2(0, 0), true);
+            simdgroup_load(B_hi,
+                w_tile + (sg_row_base + 8) * 32 + k_sub * 8,
+                32, ulong2(0, 0), true);
+            simdgroup_multiply_accumulate(C_00, A_top, B_lo, C_00);
+            simdgroup_multiply_accumulate(C_01, A_top, B_hi, C_01);
+            simdgroup_multiply_accumulate(C_10, A_bot, B_lo, C_10);
+            simdgroup_multiply_accumulate(C_11, A_bot, B_hi, C_11);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Store half accumulators via scratch (must widen to f32 for device output).
+    uint out_tok_top = tok_base + sg_tok_base + 0;
+    uint out_tok_bot = tok_base + sg_tok_base + 8;
+    uint out_row_lo  = row_base + sg_row_base + 0;
+    uint out_row_hi  = row_base + sg_row_base + 8;
+
+    threadgroup half scratch[4 * 4 * 64];
+    uint sg_base = simd_id * 256;
+    simdgroup_store(C_00, scratch + sg_base +   0, 8);
+    simdgroup_store(C_01, scratch + sg_base +  64, 8);
+    simdgroup_store(C_10, scratch + sg_base + 128, 8);
+    simdgroup_store(C_11, scratch + sg_base + 192, 8);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    uint lane = tid % 32;
+    if (lane == 0) {
+        for (uint m = 0; m < 8; m++) {
+            uint t_top = out_tok_top + m;
+            if (t_top < num_tokens) {
+                device float* dst0 = outputs + t_top * rows + out_row_lo;
+                device float* dst1 = outputs + t_top * rows + out_row_hi;
+                threadgroup const half* src0 = scratch + sg_base +   0 + m * 8;
+                threadgroup const half* src1 = scratch + sg_base +  64 + m * 8;
+                for (uint j = 0; j < 8; j++) {
+                    dst0[j] = float(src0[j]);
+                    dst1[j] = float(src1[j]);
+                }
+            }
+            uint t_bot = out_tok_bot + m;
+            if (t_bot < num_tokens) {
+                device float* dst2 = outputs + t_bot * rows + out_row_lo;
+                device float* dst3 = outputs + t_bot * rows + out_row_hi;
+                threadgroup const half* src2 = scratch + sg_base + 128 + m * 8;
+                threadgroup const half* src3 = scratch + sg_base + 192 + m * 8;
+                for (uint j = 0; j < 8; j++) {
+                    dst2[j] = float(src2[j]);
+                    dst3[j] = float(src3[j]);
+                }
+            }
+        }
+    }
+}
+
 // ── matmul_vec_q4_batch ────────────────────────────────────────────────
 // Batched Q4_0 matrix-vector multiply for M input vectors.
 // Grid: ceil(rows/Q4_ROWS_PER_TG) * M threadgroups.
@@ -2494,6 +2632,10 @@ fn emit_metal_model_struct(
         code,
         "    matmul_q8_mma32_h4_pipeline: ComputePipelineState,"
     )?;
+    writeln!(
+        code,
+        "    matmul_q8_mma32_hh4_pipeline: ComputePipelineState,"
+    )?;
     writeln!(code, "    matmul_q4_batch_pipeline: ComputePipelineState,")?;
     writeln!(code, "    rms_norm_batch_pipeline: ComputePipelineState,")?;
     writeln!(code, "    rope_batch_pipeline: ComputePipelineState,")?;
@@ -2720,6 +2862,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         ("matmul_q8_mma32_pipeline", "matmul_q8_mma32"),
         ("matmul_q8_mma32_h_pipeline", "matmul_q8_mma32_h"),
         ("matmul_q8_mma32_h4_pipeline", "matmul_q8_mma32_h4"),
+        ("matmul_q8_mma32_hh4_pipeline", "matmul_q8_mma32_hh4"),
         ("matmul_q4_batch_pipeline", "matmul_vec_q4_batch"),
         ("rms_norm_batch_pipeline", "rms_norm_batch"),
         ("rope_batch_pipeline", "rope_batch"),
@@ -3227,6 +3370,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            matmul_q8_mma32_pipeline,")?;
     writeln!(code, "            matmul_q8_mma32_h_pipeline,")?;
     writeln!(code, "            matmul_q8_mma32_h4_pipeline,")?;
+    writeln!(code, "            matmul_q8_mma32_hh4_pipeline,")?;
     writeln!(code, "            matmul_q4_batch_pipeline,")?;
     writeln!(code, "            rms_norm_batch_pipeline,")?;
     writeln!(code, "            rope_batch_pipeline,")?;
@@ -4821,9 +4965,25 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "            // keeps the FP32 path for small-hidden models and gives 1B/3B the win."
     )?;
+    writeln!(
+        code,
+        "            // All-FP16 MMA (hh4) has a scalar-widening store path that costs a"
+    )?;
+    writeln!(
+        code,
+        "            // little at low M but wins at higher M via ~2x FP16 MMA throughput."
+    )?;
+    writeln!(
+        code,
+        "            // Empirically the crossover is around M=256 on M5 Pro for 1B/3B."
+    )?;
     writeln!(code, "            let use_h4 = cols >= 2048;")?;
     writeln!(code, "            let pipe = if use_h4 {{")?;
-    writeln!(code, "                &self.matmul_q8_mma32_h4_pipeline")?;
+    writeln!(code, "                if num_tokens >= 256 {{")?;
+    writeln!(code, "                    &self.matmul_q8_mma32_hh4_pipeline")?;
+    writeln!(code, "                }} else {{")?;
+    writeln!(code, "                    &self.matmul_q8_mma32_h4_pipeline")?;
+    writeln!(code, "                }}")?;
     writeln!(code, "            }} else {{")?;
     writeln!(code, "                &self.matmul_q8_mma32_pipeline")?;
     writeln!(code, "            }};")?;

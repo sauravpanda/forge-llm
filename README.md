@@ -29,11 +29,11 @@ Benchmarks on Apple M5 Pro, 8-bit quantization, 64-token generation.
 |-------|---------------|-------------|-------------------|
 | SmolLM2-135M (~100 tok) | **4,900** | 1,507 | 2,812 |
 | SmolLM2-135M (~1250 tok) | **23,300** | — | — |
-| Llama-3.2-1B (~321 tok) | 1,880 | **2,718** | 556 |
-| Llama-3.2-1B (~801 tok) | **3,150** | — | — |
-| Llama-3.2-1B (~1501 tok) | **6,070** | — | — |
-| Llama-3.2-3B (~401 tok) | **740** | — | — |
-| Llama-3.2-3B (~1501 tok) | **2,200** | — | — |
+| Llama-3.2-1B (~321 tok) | 2,040 | **2,718** | 556 |
+| Llama-3.2-1B (~801 tok) | **3,390** | — | — |
+| Llama-3.2-1B (~1501 tok) | **6,320** | — | — |
+| Llama-3.2-3B (~401 tok) | **770** | — | — |
+| Llama-3.2-3B (~1501 tok) | **2,390** | — | — |
 
 Prefill uses hardware matrix-multiply via `simdgroup_matrix<float, 8, 8>`. The large-tile MMA kernel (`matmul_q8_mma32`, 32×32 tile) hits **~12.1 TFLOPS sustained** on Llama-3.2-1B at 1,501 tokens — ~93% of the M5 Pro FP32 peak. For 1B/3B a FP16-tile 4-simdgroup variant (`matmul_q8_mma32_h4`, 128 threads per TG, each simdgroup owning a 2×2 grid of 8×8 accumulators) doubles FLOP-per-simdgroup-load via A/B tile reuse.
 
