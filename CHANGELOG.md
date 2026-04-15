@@ -2,7 +2,7 @@
 
 All notable changes to ForgeLLM are documented here.
 
-## [Unreleased]
+## [0.6.1] — 2026-04-15 — All-FP16 MMA for Long Contexts
 
 ### Performance
 
