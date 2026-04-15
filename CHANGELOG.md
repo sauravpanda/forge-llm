@@ -5,14 +5,30 @@ All notable changes to ForgeLLM are documented here.
 ## [Unreleased] — Hardware Matrix-Multiply Prefill
 
 ### Performance
-- **`matmul_q8_mma` kernel** (`perf`): New Metal compute kernel using Apple Silicon `simdgroup_matrix<float, 8, 8>` hardware matrix-multiply accumulate. Q8_0 weights are cooperatively dequantized into threadgroup memory once per 32-K chunk and reused across a 16×16 token/row tile by 4 simdgroups (one 8×8 output sub-tile each). Four `simdgroup_multiply_accumulate` calls complete one K=32 tile — full hardware MMA throughput vs. scalar dot products.
-- **Prefill speedup on Llama-3.2-1B Q8_0** (Apple M5 Pro):
-  - 108 tokens: 406 → **958 tok/s** (2.4x)
-  - 321 tokens: ~475 → **1,415 tok/s** (3.0x)
-  - 801 tokens: 721 → **2,349 tok/s** (3.3x)
-  - 1,501 tokens: 1,354 → **4,347 tok/s** (3.2x) — ~8.7 TFLOPS sustained
-- **SmolLM2-135M**: 1,250-token prefill 9,335 → **19,103 tok/s** (2.0x)
-- Dispatch path routes Q8 matmuls with `M >= 16` and `rows % 16 == 0` to the MMA kernel; the existing `matmul_q8_gemm_batch` remains as the fallback for `4 ≤ M < 16`.
+
+**`matmul_q8_mma` kernel (16×16 tile, 4 simdgroups)** (`perf`): New Metal compute kernel using Apple Silicon `simdgroup_matrix<float, 8, 8>` hardware matrix-multiply accumulate. Q8_0 weights are cooperatively dequantized into threadgroup memory once per 32-K chunk and reused across the token/row tile. Four `simdgroup_multiply_accumulate` calls complete one K=32 tile — full hardware MMA throughput vs. scalar dot products.
+
+**`matmul_q8_mma32` kernel (32×32 tile, 8 simdgroups × 2 accumulators)** (`perf`): Large-tile variant that halves dispatch count and reuses each token-matrix `simdgroup_load` across two row accumulators per simdgroup, improving ILP and weight reuse. Preferred when `num_tokens >= 32` and `rows % 32 == 0`.
+
+**Prefill speedup on Apple M5 Pro (Q8_0):**
+
+| Model | Prompt | Before | After (MMA+MMA32) | Speedup |
+|-------|-------:|-------:|------------------:|--------:|
+| Llama-3.2-1B | 108 | 406 | **980 tok/s** | 2.4x |
+| Llama-3.2-1B | 321 | ~475 | **1,675 tok/s** | 3.5x |
+| Llama-3.2-1B | 801 | 721 | **2,820 tok/s** | 3.9x |
+| Llama-3.2-1B | 1,501 | 1,354 | **5,300 tok/s** | 3.9x |
+| SmolLM2-135M | 1,250 | 9,335 | **23,300 tok/s** | 2.5x |
+| Llama-3.2-3B | 401 | ~546 | **660 tok/s** | 1.2x |
+| Llama-3.2-3B | 1,501 | ~1,597 | **2,000 tok/s** | 1.3x |
+
+At 1,501 tokens Llama-3.2-1B sustains ~10.6 TFLOPS (82% of the M5 Pro FP32 peak).
+
+Dispatch tiering for Q8 matmul:
+- `num_tokens >= 32` and `rows % 32 == 0` → `matmul_q8_mma32`
+- `16 <= num_tokens < 32` and `rows % 16 == 0` → `matmul_q8_mma`
+- `4 <= num_tokens < 16` → existing `matmul_q8_gemm_batch`
+- `num_tokens < 4` → per-token mat-vec kernel
 
 ## [0.5.1] — 2026-04-14 — Batched Prefill + Correctness Fixes
 

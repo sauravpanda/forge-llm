@@ -27,13 +27,15 @@ Benchmarks on Apple M5 Pro, 8-bit quantization, 64-token generation.
 
 | Model | ForgeLLM Metal | MLX (8-bit) | llama.cpp (Q8_0) |
 |-------|---------------|-------------|-------------------|
-| SmolLM2-135M (~100 tok) | **4,406** | 1,507 | 2,812 |
-| SmolLM2-135M (~1250 tok) | **19,103** | — | — |
-| Llama-3.2-1B (~321 tok) | 1,415 | **2,718** | 556 |
-| Llama-3.2-1B (~1501 tok) | **4,347** | — | — |
-| Llama-3.2-3B (~1501 tok) | **1,597** | — | — |
+| SmolLM2-135M (~100 tok) | **4,900** | 1,507 | 2,812 |
+| SmolLM2-135M (~1250 tok) | **23,300** | — | — |
+| Llama-3.2-1B (~321 tok) | 1,675 | **2,718** | 556 |
+| Llama-3.2-1B (~801 tok) | **2,820** | — | — |
+| Llama-3.2-1B (~1501 tok) | **5,300** | — | — |
+| Llama-3.2-3B (~401 tok) | **660** | — | — |
+| Llama-3.2-3B (~1501 tok) | **2,000** | — | — |
 
-Prefill now uses hardware matrix-multiply via `simdgroup_matrix` (4× Q8 MMA tile per threadgroup), reaching ~8.7 TFLOPS sustained on Llama-3.2-1B at long contexts.
+Prefill uses hardware matrix-multiply via `simdgroup_matrix<float, 8, 8>`. The large-tile MMA kernel (`matmul_q8_mma32`, 32×32 tile, 8 simdgroups × 2 accumulators) hits **~10.6 TFLOPS sustained** on Llama-3.2-1B at 1,501 tokens.
 
 ### Deploy Size
 

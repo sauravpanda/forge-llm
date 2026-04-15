@@ -1585,6 +1585,147 @@ kernel void matmul_q8_mma(
     }
 }
 
+// ── matmul_q8_mma32 ────────────────────────────────────────────────────
+// Larger-tile variant of matmul_q8_mma for long-context prefill.
+//
+// Tile: 32 tokens × 32 rows per threadgroup, K=32 per iteration.
+// 8 simdgroups (256 threads) cover the 16-tile 4×4 output grid, with each
+// simdgroup owning *two* stacked 8×8 accumulators along the row axis:
+//
+//     simd_id = 2*sg_tok_idx + sg_row_half          (sg_tok_idx∈[0,3], sg_row_half∈[0,1])
+//     output sub-tiles (tok, row):
+//         (sg_tok_idx*8, sg_row_half*16 +  0)  -> C_a
+//         (sg_tok_idx*8, sg_row_half*16 +  8)  -> C_b
+//
+// This layout reuses the loaded A (token) simdgroup_matrix twice per K_sub
+// iteration — better FLOP/load ratio than the 16×16 single-accumulator
+// kernel — and halves the number of threadgroups vs the 16×16 tile.
+//
+// Assumptions (verified in dispatch helper, fallback otherwise):
+//   * cols % 32 == 0
+//   * rows % 32 == 0
+constant constexpr uint MMA32_TOK_TILE = 32;
+constant constexpr uint MMA32_ROW_TILE = 32;
+
+kernel void matmul_q8_mma32(
+    device const uchar* matrix   [[buffer(0)]],
+    device const float* inputs   [[buffer(1)]],
+    device float* outputs        [[buffer(2)]],
+    constant uint& num_tokens    [[buffer(3)]],
+    constant uint& rows          [[buffer(4)]],
+    constant uint& cols          [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]])
+{
+    uint row_base = tgid.x * MMA32_ROW_TILE;
+    uint tok_base = tgid.y * MMA32_TOK_TILE;
+    if (row_base >= rows || tok_base >= num_tokens) return;
+
+    // 32×32 float tiles in threadgroup memory = 4 KB each, 8 KB total.
+    threadgroup float w_tile[MMA32_ROW_TILE * 32];
+    threadgroup float t_tile[MMA32_TOK_TILE * 32];
+
+    uint sg_tok_idx  = simd_id / 2;      // 0..3
+    uint sg_row_half = simd_id % 2;      // 0..1
+    uint sg_tok_base = sg_tok_idx * 8;
+    uint sg_row_base_a = sg_row_half * 16 + 0;
+    uint sg_row_base_b = sg_row_half * 16 + 8;
+
+    simdgroup_matrix<float, 8, 8> C_a = simdgroup_matrix<float, 8, 8>(0.0f);
+    simdgroup_matrix<float, 8, 8> C_b = simdgroup_matrix<float, 8, 8>(0.0f);
+
+    uint blocks_per_row = cols / 32;
+    uint row_bytes = blocks_per_row * 34;
+
+    for (uint blk = 0; blk < blocks_per_row; blk++) {
+        // Cooperative weight dequantization: 32*32 floats / 256 threads = 4 floats each.
+        {
+            uint base = tid * 4;
+            for (uint ii = 0; ii < 4; ii++) {
+                uint idx = base + ii;
+                uint r = idx / 32;
+                uint k = idx % 32;
+                device const uchar* rp = matrix + (row_base + r) * row_bytes + blk * 34;
+                float sc = float(*(device const half*)rp);
+                int ival = int(*(device const int8_t*)(rp + 2 + k));
+                w_tile[r * 32 + k] = float(ival) * sc;
+            }
+        }
+
+        // Cooperative token tile load.
+        {
+            uint base = tid * 4;
+            for (uint ii = 0; ii < 4; ii++) {
+                uint idx = base + ii;
+                uint m = idx / 32;
+                uint k = idx % 32;
+                uint tok = tok_base + m;
+                t_tile[m * 32 + k] = (tok < num_tokens)
+                    ? inputs[tok * cols + blk * 32 + k]
+                    : 0.0f;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 4 K-sub chunks of 8 each. For each, reuse A across both row accumulators.
+        for (uint k_sub = 0; k_sub < 4; k_sub++) {
+            simdgroup_matrix<float, 8, 8> A, B_a, B_b;
+            simdgroup_load(A,
+                t_tile + sg_tok_base * 32 + k_sub * 8,
+                32,
+                ulong2(0, 0),
+                false);
+            simdgroup_load(B_a,
+                w_tile + sg_row_base_a * 32 + k_sub * 8,
+                32,
+                ulong2(0, 0),
+                true);
+            simdgroup_load(B_b,
+                w_tile + sg_row_base_b * 32 + k_sub * 8,
+                32,
+                ulong2(0, 0),
+                true);
+            simdgroup_multiply_accumulate(C_a, A, B_a, C_a);
+            simdgroup_multiply_accumulate(C_b, A, B_b, C_b);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Store both 8×8 accumulators.  rows is always MMA32_ROW_TILE-aligned
+    // (verified in dispatch), so full simdgroup_store is safe for the row
+    // dimension; only the last token tile may be partial.
+    uint out_tok = tok_base + sg_tok_base;
+    uint out_row_a = row_base + sg_row_base_a;
+    uint out_row_b = row_base + sg_row_base_b;
+    bool full_tok = (out_tok + 8 <= num_tokens);
+    if (full_tok) {
+        simdgroup_store(C_a, outputs + out_tok * rows + out_row_a, rows);
+        simdgroup_store(C_b, outputs + out_tok * rows + out_row_b, rows);
+    } else if (out_tok < num_tokens) {
+        threadgroup float scratch[8 * 2 * 64];  // 8 simdgroups × 2 accs × 64 floats
+        simdgroup_store(C_a, scratch + simd_id * 128, 8);
+        simdgroup_store(C_b, scratch + simd_id * 128 + 64, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        uint lane = tid % 32;
+        if (lane == 0) {
+            uint valid = num_tokens - out_tok;  // 1..7
+            for (uint m = 0; m < valid; m++) {
+                device float* dst_a = outputs + (out_tok + m) * rows + out_row_a;
+                device float* dst_b = outputs + (out_tok + m) * rows + out_row_b;
+                threadgroup const float* src_a = scratch + simd_id * 128 + m * 8;
+                threadgroup const float* src_b = scratch + simd_id * 128 + 64 + m * 8;
+                for (uint j = 0; j < 8; j++) {
+                    dst_a[j] = src_a[j];
+                    dst_b[j] = src_b[j];
+                }
+            }
+        }
+    }
+}
+
 // ── matmul_vec_q4_batch ────────────────────────────────────────────────
 // Batched Q4_0 matrix-vector multiply for M input vectors.
 // Grid: ceil(rows/Q4_ROWS_PER_TG) * M threadgroups.
@@ -2057,6 +2198,10 @@ fn emit_metal_model_struct(
         code,
         "    matmul_q8_mma_pipeline: ComputePipelineState,"
     )?;
+    writeln!(
+        code,
+        "    matmul_q8_mma32_pipeline: ComputePipelineState,"
+    )?;
     writeln!(code, "    matmul_q4_batch_pipeline: ComputePipelineState,")?;
     writeln!(code, "    rms_norm_batch_pipeline: ComputePipelineState,")?;
     writeln!(code, "    rope_batch_pipeline: ComputePipelineState,")?;
@@ -2280,6 +2425,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         ("matmul_q8_batch_pipeline", "matmul_vec_q8_batch"),
         ("matmul_q8_gemm_batch_pipeline", "matmul_q8_gemm_batch"),
         ("matmul_q8_mma_pipeline", "matmul_q8_mma"),
+        ("matmul_q8_mma32_pipeline", "matmul_q8_mma32"),
         ("matmul_q4_batch_pipeline", "matmul_vec_q4_batch"),
         ("rms_norm_batch_pipeline", "rms_norm_batch"),
         ("rope_batch_pipeline", "rope_batch"),
@@ -2784,6 +2930,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            matmul_q8_batch_pipeline,")?;
     writeln!(code, "            matmul_q8_gemm_batch_pipeline,")?;
     writeln!(code, "            matmul_q8_mma_pipeline,")?;
+    writeln!(code, "            matmul_q8_mma32_pipeline,")?;
     writeln!(code, "            matmul_q4_batch_pipeline,")?;
     writeln!(code, "            rms_norm_batch_pipeline,")?;
     writeln!(code, "            rope_batch_pipeline,")?;
@@ -4340,17 +4487,66 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "        const TOKENS_PER_TG_Q8: usize = 4;")?;
     writeln!(code, "        const MMA_TOK_TILE: usize = 16;")?;
     writeln!(code, "        const MMA_ROW_TILE: usize = 16;")?;
+    writeln!(code, "        const MMA32_TOK_TILE: usize = 32;")?;
+    writeln!(code, "        const MMA32_ROW_TILE: usize = 32;")?;
     writeln!(
         code,
-        "        // Hardware matrix-multiply path (simdgroup_matrix): use for large"
+        "        // Hardware matrix-multiply paths (simdgroup_matrix)."
     )?;
     writeln!(
         code,
-        "        // prefill batches when rows align to the MMA row tile (16)."
+        "        // Prefer the large 32×32 tile when the problem supports it — halves"
     )?;
     writeln!(
         code,
-        "        if num_tokens >= MMA_TOK_TILE && rows % MMA_ROW_TILE == 0 && cols % 32 == 0 {{"
+        "        // dispatch count and reuses each weight load across 32 tokens."
+    )?;
+    writeln!(
+        code,
+        "        if num_tokens >= MMA32_TOK_TILE && rows % MMA32_ROW_TILE == 0 && cols % 32 == 0 {{"
+    )?;
+    writeln!(
+        code,
+        "            enc.set_compute_pipeline_state(&self.matmul_q8_mma32_pipeline);"
+    )?;
+    writeln!(code, "            enc.set_buffer(0, Some(weight), 0);")?;
+    writeln!(code, "            enc.set_buffer(1, Some(input), 0);")?;
+    writeln!(code, "            enc.set_buffer(2, Some(output), 0);")?;
+    writeln!(
+        code,
+        "            enc.set_bytes(3, mem::size_of::<u32>() as u64, &nt as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "            enc.set_bytes(4, mem::size_of::<u32>() as u64, &r as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "            enc.set_bytes(5, mem::size_of::<u32>() as u64, &c as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "            let row_tgs = rows / MMA32_ROW_TILE;"
+    )?;
+    writeln!(
+        code,
+        "            let tok_tgs = (num_tokens + MMA32_TOK_TILE - 1) / MMA32_TOK_TILE;"
+    )?;
+    writeln!(
+        code,
+        "            let tg_size = MTLSize::new(256, 1, 1);  // 8 simdgroups × 32 lanes"
+    )?;
+    writeln!(
+        code,
+        "            let grid_size = MTLSize::new(row_tgs as u64, tok_tgs as u64, 1);"
+    )?;
+    writeln!(
+        code,
+        "            enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(
+        code,
+        "        }} else if num_tokens >= MMA_TOK_TILE && rows % MMA_ROW_TILE == 0 && cols % 32 == 0 {{"
     )?;
     writeln!(
         code,
