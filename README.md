@@ -123,14 +123,14 @@ ForgeLLM compiles models into hardware-specific code:
 
 ## Supported Models
 
-| Architecture | Models | Status |
-|-------------|--------|--------|
-| LlamaForCausalLM | SmolLM2 (135M, 360M, 1.7B), Llama 3.2 (1B, 3B), TinyLlama | Verified |
-| Qwen2ForCausalLM | Qwen2.5 (0.5B-7B) | Verified |
-| MistralForCausalLM | Mistral 7B (sliding-window attention) | Supported |
-| Phi3ForCausalLM | Phi-3 Mini | Supported |
-| GemmaForCausalLM | Gemma 2B, 7B | Supported |
-| StableLMForCausalLM | StableLM 1.6B, 3B | Supported |
+| Architecture | Models | Interpreter (`forge run`) | AOT Metal/CPU |
+|-------------|--------|---------------------------|---------------|
+| LlamaForCausalLM | SmolLM2 (135M, 360M, 1.7B), Llama 3.2 (1B, 3B), TinyLlama | ✅ Verified | ✅ Verified |
+| Qwen2ForCausalLM | Qwen2.5 (0.5B–7B) | ✅ Verified | ⚠️ AOT export path doesn't include QKV bias — output is garbled ([#210](https://github.com/sauravpanda/forge-llm/issues/210)) |
+| MistralForCausalLM | Mistral 7B (sliding-window attention) | ✅ Verified | ⚠️ Untested with v0.6.x MMA kernels |
+| Phi3ForCausalLM | Phi-3 Mini | ✅ Verified | ⚠️ Untested with v0.6.x MMA kernels |
+| GemmaForCausalLM | Gemma 2B, 7B | ✅ Verified | ⚠️ Untested with v0.6.x MMA kernels |
+| StableLMForCausalLM | StableLM 1.6B, 3B | ✅ Verified | ⚠️ Untested with v0.6.x MMA kernels |
 
 Supports GGUF quantization formats: F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q2_K through Q8_K.
 Also supports SafeTensors and LoRA adapter merging at compile time.

@@ -1,16 +1,26 @@
 # How We Beat llama.cpp and MLX: Building an AOT Compiler for LLM Inference
 
-**TL;DR:** We built ForgeLLM, a Rust AOT compiler that compiles GGUF language models into optimized Metal GPU binaries. On Apple Silicon, it's faster than both llama.cpp and Apple's own MLX framework — and the advantage grows with model size.
+**TL;DR:** ForgeLLM is a Rust AOT compiler that compiles GGUF language models into optimized Metal GPU binaries. On Apple Silicon, it's faster than both llama.cpp and Apple's own MLX framework on generation across all tested model sizes, and — as of v0.6.1 — it sustains **~12.6 TFLOPS on Llama-3.2-1B prefill** (about 93% of the M5 Pro FP32 peak) using a tiered stack of four `simdgroup_matrix` MMA kernels.
 
 ### Generation Speed — 8-bit Quantization, Apple M5 Pro
 
 | Model | ForgeLLM Metal | MLX (8-bit) | llama.cpp (Q8_0) | vs MLX | vs llama.cpp |
 |-------|---------------|-------------|-------------------|--------|-------------|
-| SmolLM2-135M | **567 tok/s** | 438 tok/s | 494 tok/s | **1.29x** | **1.15x** |
+| SmolLM2-135M | **496 tok/s** | 414 tok/s | 481 tok/s | **1.20x** | **1.03x** |
 | SmolLM2-360M | **289 tok/s** | 264 tok/s | 267 tok/s | **1.09x** | **1.08x** |
-| Llama-3.2-1B | **170 tok/s** | 107 tok/s | 129 tok/s | **1.59x** | **1.32x** |
+| Llama-3.2-1B | **178 tok/s** | 111 tok/s | 130 tok/s | **1.60x** | **1.37x** |
+| Llama-3.2-3B | **70.4 tok/s** | 42.2 tok/s | 67.8 tok/s | **1.67x** | **1.04x** |
 
-Yes, we beat Apple's own framework on Apple's own hardware.
+### Prefill Speed (v0.6.1) — Llama-3.2-1B Q8_0
+
+| Prompt | v0.5.2 | **v0.6.1** | Speedup |
+|-------:|-------:|-----------:|--------:|
+| 108 tok | 406 | **1,145** | 2.8x |
+| 321 tok | ~475 | **2,040** | 4.3x |
+| 801 tok | 721 | **3,390** | 4.7x |
+| 1,501 tok | 1,354 | **6,320** | 4.7x |
+
+Yes, we beat Apple's own framework on Apple's own hardware on generation. On prefill, v0.6.x closed the long-context gap entirely (we now lead on 135M/360M at any length, and on 1B at long context; MLX's Accelerate BLAS still edges us at the 321-token sweet spot they benchmark).
 
 ## The key insight: compile, don't interpret
 
@@ -95,7 +105,7 @@ This is the most interesting finding. Our speedup over llama.cpp **increases** w
 
 Why? Because the fixed overhead of graph building and dispatch management is constant in llama.cpp but zero in ForgeLLM. As model size grows, llama.cpp's per-token fixed cost stays the same while compute grows — but our fixed cost is already zero. The ratio improves in our favor.
 
-## How we built it: from 8 tok/s to 567 tok/s
+## How we built it: from 8 tok/s to 567 tok/s (generation)
 
 The Metal backend was built from scratch and optimized iteratively:
 
@@ -115,6 +125,49 @@ Two correctness bugs were found along the way:
 - **Hardcoded shared memory size** — `vec_tile[4096]` overflowed for models with intermediate_size > 4096. Fixed with dynamic sizing from model config.
 
 Both bugs only manifested on larger models — 135M worked fine, 360M and 1B produced garbage. A good reminder that you should always test on multiple model sizes.
+
+## v0.6.x: The prefill story — from dot products to hardware MMA
+
+By v0.5.2 the generation path was fast, but prefill on Llama-3.2-1B topped out around 475 tok/s at 321 tokens — roughly 1 TFLOPS sustained on a chip with a 13+ TFLOPS FP32 peak. MLX was doing 2,718 tok/s at the same length, using Apple Accelerate BLAS for its matmul path. **We were leaving 5-6x on the table.**
+
+The fix was to stop using scalar dot products for the batched matmul and start using Apple Silicon's hardware matrix-multiply units: `simdgroup_matrix<float, 8, 8>` + `simdgroup_multiply_accumulate`. One instruction computes an 8×8×8 matmul across a simdgroup; in theory this runs at 32 FMAs per cycle per lane.
+
+v0.6.0 and v0.6.1 ship **four generations** of MMA kernels with a tiered dispatch that picks the right one per matmul shape:
+
+| Kernel | Tile | Threads/TG | Accumulators | Precision | Used when |
+|---|---|---:|---:|---|---|
+| `matmul_q8_mma` | 16×16 | 128 | 1 per simdgroup | float | 16 ≤ M < 32 |
+| `matmul_q8_mma32` | 32×32 | 256 | 2 per simdgroup | float | M ≥ 32, small hidden (135M/360M) |
+| `matmul_q8_mma32_h4` | 32×32 | 128 | 2×2 per simdgroup | fp16 tile, f32 accum | M ≥ 32, cols ≥ 2048, M < 256 |
+| `matmul_q8_mma32_hh4` | 32×32 | 128 | 2×2 per simdgroup | all fp16 | M ≥ 256, cols ≥ 2048 |
+
+Each kernel is faster than the previous in its shape range and strictly worse outside it. Every tiered transition was validated by running the benchmark, checking correctness on 135M/1B/3B, and keeping only the configuration that won.
+
+### Shape-specific wins on Llama-3.2-1B Q8_0 (M5 Pro)
+
+| Prompt | v0.5.2 dot-product | v0.6.0 `mma32_h4` | v0.6.1 `mma32_hh4` | Speedup |
+|-------:|-------------------:|------------------:|-------------------:|--------:|
+| 101 | 406 | **1,145** | — (stays on h4) | 2.8x |
+| 201 | ~560 | **1,718** | — | 3.1x |
+| 321 | ~475 | 1,880 | **2,040** | 4.3x |
+| 801 | 721 | 3,150 | **3,390** | 4.7x |
+| 1,501 | 1,354 | 6,070 | **6,320** (~12.6 TFLOPS) | 4.7x |
+
+At 1,501 tokens we sustain ~12.6 TFLOPS — about 93% of the M5 Pro FP32 peak.
+
+### Design notes from the kernel rewrite
+
+**Weight dequant as a staging step.** Q8_0 weights are 34 bytes per 32-value block (2-byte f16 scale + 32 int8 values). We cooperatively dequantize a 32×32 tile into 4 KB of threadgroup memory each iteration, then `simdgroup_load` into the MMA units. The dequant is negligible compared to the MMA work and the shared tile is reused across two simdgroup_loads per k_sub (A across both row tiles, B across both token tiles).
+
+**Choosing tile size is a wave-count problem, not a tile-size problem.** The 16×16 kernel produces ~4x more threadgroups than the 32×32 kernel at the same M, which *sounds* better for latency hiding — but arithmetic intensity per TG drops, and in our measurements 32×32 wins at every prompt length above M=32. The intuition that "smaller tiles = better occupancy" doesn't survive contact with the simdgroup_matrix units, which need enough work per TG to amortize their own setup.
+
+**Thread count per TG matters more than you'd think.** The 2×2-accumulator variant (`h4`) uses 128 threads per TG instead of 256; this *doubles* concurrent-TG occupancy on a GPU core if the thread budget is the tighter limit rather than shared memory. Going further to 64 threads/TG with 4×4 accumulators per simdgroup made register pressure explode and regressed.
+
+**FP16 accumulation is safe for Q8_0.** Going from fp16 inputs + fp32 accumulator (`h4`) to fully fp16 (`hh4`) made us nervous — summing 2,048 products in half precision sounds reckless. In practice it's fine: Q8_0 weights have ~8 bits of mantissa to start with, activations are post-RMSNorm and bounded O(1), and output coherence is preserved on 135M / 1B / 3B. The ~6-9% throughput win at long context is real.
+
+**Not every attempted optimization worked.** We also tried K=64 chunks (regressed -10% at low M), a 2-simdgroup 4×4-accumulator variant (register pressure), float4-vectorized elementwise kernels (the Metal compiler was already auto-vectorizing; explicit vectorization interfered), cooperative widening stores for the partial-tile fallback (scatter-store patterns hurt coalescing), and lowering the hh4 threshold from M=256 to M=128 (the per-lane scalar widening store costs more than the MMA win at low M). All reverted.
+
+The lesson: on the MMA side of Apple Silicon, every change needs to be measured on actual hardware with warm caches. Peak-FLOP calculations tell you where the ceiling is; they tell you nothing about whether a specific variant will approach it.
 
 ## What ForgeLLM is not
 
@@ -150,13 +203,12 @@ The output is a standard Rust project. You can inspect the generated code, modif
 
 ## What's next
 
-- **Larger model validation** — Testing on 3B and 7B models
-- **KV cache quantization** — int8 KV cache for longer contexts
-- **Batch inference** — `simdgroup_multiply_accumulate` for hardware matrix multiply during prefill
-- **Python bindings** — `pip install forgellm` with Metal GPU inference
-- **More architectures** — Phi-3, Gemma2, Llama-3 specific optimizations
+- **Flash attention** — tile Q/K/V, fuse with online softmax to cut attention memory traffic to O(M) instead of O(M²). This is the natural next step after the MMA prefill rewrite.
+- **Multi-layer fusion** — `silu_mul` + `down_proj` into a single kernel; `add_residual` + `rms_norm` into a single kernel. Reduces per-forward dispatch count from ~200 to ~130.
+- **Async weight prefetch** — `simdgroup_async_copy` to overlap device→threadgroup loads with MMA compute on the previous K chunk.
+- **MLC-LLM head-to-head benchmark** — same quantization, same Metal backend, same prompt lengths.
 
-ForgeLLM is open source under the MIT license. Contributions welcome.
+ForgeLLM is open source under the MIT license. Install with `cargo install forgellm-cli` or `brew install --formula HomebrewFormula/forgellm.rb` from the repo. Contributions welcome.
 
 ---
 
