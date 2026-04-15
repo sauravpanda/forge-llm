@@ -2,7 +2,9 @@
 
 All notable changes to ForgeLLM are documented here.
 
-## [Unreleased] — Hardware Matrix-Multiply Prefill
+## [0.6.0] — 2026-04-15 — Hardware Matrix-Multiply Prefill
+
+**Prefill went 4x faster on Llama-3.2-1B Q8_0.**  This release rewrites the Metal Q8 matmul path around Apple Silicon `simdgroup_matrix<float, 8, 8>` hardware matrix-multiply accumulate (MMA), replacing the previous dot-product GEMM with four successive MMA kernel generations and a tiered dispatch that picks the right one per matmul shape.
 
 ### Performance
 
