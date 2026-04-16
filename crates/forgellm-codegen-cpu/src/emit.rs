@@ -4088,9 +4088,7 @@ mod tests {
             "Qwen2 forward() should add k_bias"
         );
         // forward_prefill must also apply the bias (issue #210: previously missing).
-        let fwd_idx = code
-            .find("pub fn forward(")
-            .expect("forward() must exist");
+        let fwd_idx = code.find("pub fn forward(").expect("forward() must exist");
         let prefill_idx = code
             .find("pub fn forward_prefill(")
             .expect("forward_prefill() must exist");

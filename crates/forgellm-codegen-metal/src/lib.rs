@@ -2805,14 +2805,8 @@ fn emit_metal_model_struct(
         code,
         "    matmul_q8_gemm_batch_pipeline: ComputePipelineState,"
     )?;
-    writeln!(
-        code,
-        "    matmul_q8_mma_pipeline: ComputePipelineState,"
-    )?;
-    writeln!(
-        code,
-        "    matmul_q8_mma32_pipeline: ComputePipelineState,"
-    )?;
+    writeln!(code, "    matmul_q8_mma_pipeline: ComputePipelineState,")?;
+    writeln!(code, "    matmul_q8_mma32_pipeline: ComputePipelineState,")?;
     writeln!(
         code,
         "    matmul_q8_mma32_h_pipeline: ComputePipelineState,"
@@ -2826,10 +2820,7 @@ fn emit_metal_model_struct(
         "    matmul_q8_mma32_hh4_pipeline: ComputePipelineState,"
     )?;
     if config.qkv_bias {
-        writeln!(
-            code,
-            "    add_bias_batch_pipeline: ComputePipelineState,"
-        )?;
+        writeln!(code, "    add_bias_batch_pipeline: ComputePipelineState,")?;
     }
     writeln!(code, "    matmul_q4_batch_pipeline: ComputePipelineState,")?;
     writeln!(code, "    rms_norm_batch_pipeline: ComputePipelineState,")?;
@@ -4179,11 +4170,11 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "        // longer than that must be processed iteratively.  The KV cache"
     )?;
+    writeln!(code, "        // carries state across chunks via self.pos.")?;
     writeln!(
         code,
-        "        // carries state across chunks via self.pos."
+        "        for chunk in tokens.chunks(MAX_BATCH_SIZE) {{"
     )?;
-    writeln!(code, "        for chunk in tokens.chunks(MAX_BATCH_SIZE) {{")?;
     writeln!(code, "        let m = chunk.len();")?;
     writeln!(code, "        if m == 0 {{ continue; }}")?;
     writeln!(code, "        let start_pos = self.pos;")?;
@@ -5268,17 +5259,20 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            let use_h4 = cols >= 2048;")?;
     writeln!(code, "            let pipe = if use_h4 {{")?;
     writeln!(code, "                if num_tokens >= 256 {{")?;
-    writeln!(code, "                    &self.matmul_q8_mma32_hh4_pipeline")?;
+    writeln!(
+        code,
+        "                    &self.matmul_q8_mma32_hh4_pipeline"
+    )?;
     writeln!(code, "                }} else {{")?;
-    writeln!(code, "                    &self.matmul_q8_mma32_h4_pipeline")?;
+    writeln!(
+        code,
+        "                    &self.matmul_q8_mma32_h4_pipeline"
+    )?;
     writeln!(code, "                }}")?;
     writeln!(code, "            }} else {{")?;
     writeln!(code, "                &self.matmul_q8_mma32_pipeline")?;
     writeln!(code, "            }};")?;
-    writeln!(
-        code,
-        "            enc.set_compute_pipeline_state(pipe);"
-    )?;
+    writeln!(code, "            enc.set_compute_pipeline_state(pipe);")?;
     writeln!(code, "            enc.set_buffer(0, Some(weight), 0);")?;
     writeln!(code, "            enc.set_buffer(1, Some(input), 0);")?;
     writeln!(code, "            enc.set_buffer(2, Some(output), 0);")?;
@@ -5294,10 +5288,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "            enc.set_bytes(5, mem::size_of::<u32>() as u64, &c as *const u32 as *const _);"
     )?;
-    writeln!(
-        code,
-        "            let row_tgs = rows / MMA32_ROW_TILE;"
-    )?;
+    writeln!(code, "            let row_tgs = rows / MMA32_ROW_TILE;")?;
     writeln!(
         code,
         "            let tok_tgs = (num_tokens + MMA32_TOK_TILE - 1) / MMA32_TOK_TILE;"
@@ -5337,10 +5328,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "            enc.set_bytes(5, mem::size_of::<u32>() as u64, &c as *const u32 as *const _);"
     )?;
-    writeln!(
-        code,
-        "            let row_tgs = rows / MMA_ROW_TILE;"
-    )?;
+    writeln!(code, "            let row_tgs = rows / MMA_ROW_TILE;")?;
     writeln!(
         code,
         "            let tok_tgs = (num_tokens + MMA_TOK_TILE - 1) / MMA_TOK_TILE;"
@@ -5870,10 +5858,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     // (tiled online softmax, O(head_dim) threadgroup memory, no seq_len
     // cap) above that boundary.  Below it the legacy kernel is ~15% faster
     // due to the flash kernel's per-tile barrier overhead at low seq_len.
-    writeln!(
-        code,
-        "        let max_seq = base_pos + num_tokens;"
-    )?;
+    writeln!(code, "        let max_seq = base_pos + num_tokens;")?;
     // Re-testing after the chunking + scores[4096] fixes showed the flash
     // kernel is numerically correct — the earlier "garbled output" was from
     // the scores[2048] overflow, not from flash itself.  Benchmarks show
@@ -5881,18 +5866,9 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     // more per-tile barriers and no MMA acceleration (yet).  Default to the
     // legacy kernel; keep flash wired up for future use (larger max_seq_len
     // caps, or as the base for an MMA-accelerated flash variant).
-    writeln!(
-        code,
-        "        let _ = max_seq;"
-    )?;
-    writeln!(
-        code,
-        "        let pipe = &self.attention_batch_pipeline;"
-    )?;
-    writeln!(
-        code,
-        "        enc.set_compute_pipeline_state(pipe);"
-    )?;
+    writeln!(code, "        let _ = max_seq;")?;
+    writeln!(code, "        let pipe = &self.attention_batch_pipeline;")?;
+    writeln!(code, "        enc.set_compute_pipeline_state(pipe);")?;
     writeln!(code, "        enc.set_buffer(0, Some(q_buf), 0);")?;
     writeln!(code, "        enc.set_buffer(1, Some(k_cache), 0);")?;
     writeln!(code, "        enc.set_buffer(2, Some(v_cache), 0);")?;

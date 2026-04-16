@@ -2079,18 +2079,9 @@ fn cmd_export_weights_impl(
             )?;
             if config.qkv_bias {
                 // Qwen2 QKV bias triplet (F32), each one `*_size * head_dim` floats.
-                write_mixed(
-                    &mut output_data,
-                    &format!("{prefix}.self_attn.q_proj.bias"),
-                )?;
-                write_mixed(
-                    &mut output_data,
-                    &format!("{prefix}.self_attn.k_proj.bias"),
-                )?;
-                write_mixed(
-                    &mut output_data,
-                    &format!("{prefix}.self_attn.v_proj.bias"),
-                )?;
+                write_mixed(&mut output_data, &format!("{prefix}.self_attn.q_proj.bias"))?;
+                write_mixed(&mut output_data, &format!("{prefix}.self_attn.k_proj.bias"))?;
+                write_mixed(&mut output_data, &format!("{prefix}.self_attn.v_proj.bias"))?;
             }
             write_mixed(
                 &mut output_data,
