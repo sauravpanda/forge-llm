@@ -2,7 +2,7 @@
 
 All notable changes to ForgeLLM are documented here.
 
-## [Unreleased]
+## [0.6.2] — 2026-04-15 — Qwen2 AOT Fix
 
 ### Fixed
 - **Qwen2 QKV bias on AOT backends** (`fix`, closes [#210](https://github.com/sauravpanda/forge-llm/issues/210)): Qwen2 models have bias terms on the Q/K/V projection matrices that Llama does not. Before this release, `cmd_export_weights_impl` never wrote those biases, the Metal codegen had zero handling for them, and the CPU codegen emitted bias fields without populating them — so a Qwen2 AOT binary either failed to compile (CPU) or produced garbled output (Metal).
