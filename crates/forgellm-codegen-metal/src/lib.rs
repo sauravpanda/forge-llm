@@ -5874,8 +5874,13 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "        let max_seq = base_pos + num_tokens;"
     )?;
-    // Temporarily: always use legacy — flash kernel has a bug discovered
-    // after the chunking fix exposed multi-chunk paths at seq_len > 2000.
+    // Re-testing after the chunking + scores[4096] fixes showed the flash
+    // kernel is numerically correct — the earlier "garbled output" was from
+    // the scores[2048] overflow, not from flash itself.  Benchmarks show
+    // flash is 7–14% slower than legacy because its online-softmax path has
+    // more per-tile barriers and no MMA acceleration (yet).  Default to the
+    // legacy kernel; keep flash wired up for future use (larger max_seq_len
+    // caps, or as the base for an MMA-accelerated flash variant).
     writeln!(
         code,
         "        let _ = max_seq;"
