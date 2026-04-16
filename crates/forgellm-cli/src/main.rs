@@ -2062,6 +2062,9 @@ fn cmd_export_weights_impl(
                 &mut output_data,
                 &format!("{prefix}.input_layernorm.weight"),
             )?;
+            // Q, K, V projection weights are written contiguously so the Metal
+            // codegen's fused-QKV reader (`next_q8_fused_buffer`) can load them
+            // in one slice.  Qwen2 biases follow as a contiguous triplet.
             write_mixed(
                 &mut output_data,
                 &format!("{prefix}.self_attn.q_proj.weight"),
@@ -2074,6 +2077,21 @@ fn cmd_export_weights_impl(
                 &mut output_data,
                 &format!("{prefix}.self_attn.v_proj.weight"),
             )?;
+            if config.qkv_bias {
+                // Qwen2 QKV bias triplet (F32), each one `*_size * head_dim` floats.
+                write_mixed(
+                    &mut output_data,
+                    &format!("{prefix}.self_attn.q_proj.bias"),
+                )?;
+                write_mixed(
+                    &mut output_data,
+                    &format!("{prefix}.self_attn.k_proj.bias"),
+                )?;
+                write_mixed(
+                    &mut output_data,
+                    &format!("{prefix}.self_attn.v_proj.bias"),
+                )?;
+            }
             write_mixed(
                 &mut output_data,
                 &format!("{prefix}.self_attn.o_proj.weight"),
@@ -2162,6 +2180,7 @@ fn cmd_export_weights_impl(
                 &format!("{prefix}.input_layernorm.weight"),
                 &weights,
             )?;
+            // Q, K, V projection weights as a contiguous triplet.
             write_tensor(
                 &mut output_data,
                 &format!("{prefix}.self_attn.q_proj.weight"),
@@ -2177,6 +2196,24 @@ fn cmd_export_weights_impl(
                 &format!("{prefix}.self_attn.v_proj.weight"),
                 &weights,
             )?;
+            if config.qkv_bias {
+                // Qwen2 bias triplet.
+                write_tensor(
+                    &mut output_data,
+                    &format!("{prefix}.self_attn.q_proj.bias"),
+                    &weights,
+                )?;
+                write_tensor(
+                    &mut output_data,
+                    &format!("{prefix}.self_attn.k_proj.bias"),
+                    &weights,
+                )?;
+                write_tensor(
+                    &mut output_data,
+                    &format!("{prefix}.self_attn.v_proj.bias"),
+                    &weights,
+                )?;
+            }
             write_tensor(
                 &mut output_data,
                 &format!("{prefix}.self_attn.o_proj.weight"),

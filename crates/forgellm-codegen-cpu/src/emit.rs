@@ -3116,6 +3116,23 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
             kv_size = kv_size
         )?;
     }
+    // Optional QKV bias adds (Qwen2) — mirrors forward(), applied before RoPE.
+    if config.qkv_bias {
+        writeln!(code)?;
+        writeln!(code, "            // QKV bias additions (Qwen2)")?;
+        writeln!(
+            code,
+            "            for i in 0..{qk_size} {{ q[i] += lw.q_bias[i]; }}"
+        )?;
+        writeln!(
+            code,
+            "            for i in 0..{kv_size} {{ k[i] += lw.k_bias[i]; }}"
+        )?;
+        writeln!(
+            code,
+            "            for i in 0..{kv_size} {{ v[i] += lw.v_bias[i]; }}"
+        )?;
+    }
     writeln!(code)?;
     writeln!(code, "            // RoPE")?;
     writeln!(
@@ -4061,15 +4078,32 @@ mod tests {
             code.contains("pub v_bias: Vec<f32>"),
             "Qwen2 LayerWeights should have v_bias field"
         );
-        // Forward should apply the biases
+        // Forward should apply the biases — BOTH in forward() and forward_prefill().
         assert!(
             code.contains("q[i] += lw.q_bias[i]"),
-            "Qwen2 forward should add q_bias"
+            "Qwen2 forward() should add q_bias"
         );
         assert!(
             code.contains("k[i] += lw.k_bias[i]"),
-            "Qwen2 forward should add k_bias"
+            "Qwen2 forward() should add k_bias"
         );
+        // forward_prefill must also apply the bias (issue #210: previously missing).
+        let fwd_idx = code
+            .find("pub fn forward(")
+            .expect("forward() must exist");
+        let prefill_idx = code
+            .find("pub fn forward_prefill(")
+            .expect("forward_prefill() must exist");
+        let prefill_body = &code[prefill_idx..];
+        assert!(
+            prefill_body.contains("q[i] += lw.q_bias[i]"),
+            "Qwen2 forward_prefill() should also add q_bias (issue #210)"
+        );
+        assert!(
+            prefill_body.contains("v[i] += lw.v_bias[i]"),
+            "Qwen2 forward_prefill() should also add v_bias (issue #210)"
+        );
+        let _ = fwd_idx;
         assert!(
             code.contains("v[i] += lw.v_bias[i]"),
             "Qwen2 forward should add v_bias"

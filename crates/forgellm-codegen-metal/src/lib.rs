@@ -2148,6 +2148,23 @@ kernel void matmul_q8_mma32_hh4(
     }
 }
 
+// ── add_bias_batch ─────────────────────────────────────────────────────
+// Broadcast-add a per-row bias vector to every row of an [M, rows] output.
+// Used for Qwen2 QKV bias after the fused qkv matmul.
+//     out[token, i] += bias[i]    for i in 0..rows, token in 0..num_tokens
+kernel void add_bias_batch(
+    device float* out            [[buffer(0)]],  // [num_tokens, rows]
+    device const float* bias     [[buffer(1)]],  // [rows]
+    constant uint& num_tokens    [[buffer(2)]],
+    constant uint& rows          [[buffer(3)]],
+    uint id [[thread_position_in_grid]])
+{
+    uint total = num_tokens * rows;
+    if (id >= total) return;
+    uint i = id % rows;
+    out[id] += bias[i];
+}
+
 // ── matmul_vec_q4_batch ────────────────────────────────────────────────
 // Batched Q4_0 matrix-vector multiply for M input vectors.
 // Grid: ceil(rows/Q4_ROWS_PER_TG) * M threadgroups.
@@ -2494,7 +2511,7 @@ fn generate_model_rs(config: &ModelConfig) -> Result<String, MetalCodegenError> 
     let mut code = String::with_capacity(48 * 1024);
     emit_model_header(&mut code, config)?;
     emit_metal_model_struct(&mut code, config)?;
-    emit_layer_buffers_struct(&mut code)?;
+    emit_layer_buffers_struct(&mut code, config)?;
     emit_metal_model_impl(&mut code, config)?;
     emit_helper_functions(&mut code)?;
     Ok(code)
@@ -2573,7 +2590,7 @@ fn emit_model_header(code: &mut String, config: &ModelConfig) -> Result<(), Meta
 
 fn emit_metal_model_struct(
     code: &mut String,
-    _config: &ModelConfig,
+    config: &ModelConfig,
 ) -> Result<(), MetalCodegenError> {
     writeln!(
         code,
@@ -2636,6 +2653,12 @@ fn emit_metal_model_struct(
         code,
         "    matmul_q8_mma32_hh4_pipeline: ComputePipelineState,"
     )?;
+    if config.qkv_bias {
+        writeln!(
+            code,
+            "    add_bias_batch_pipeline: ComputePipelineState,"
+        )?;
+    }
     writeln!(code, "    matmul_q4_batch_pipeline: ComputePipelineState,")?;
     writeln!(code, "    rms_norm_batch_pipeline: ComputePipelineState,")?;
     writeln!(code, "    rope_batch_pipeline: ComputePipelineState,")?;
@@ -2761,7 +2784,10 @@ fn emit_metal_model_struct(
     Ok(())
 }
 
-fn emit_layer_buffers_struct(code: &mut String) -> Result<(), MetalCodegenError> {
+fn emit_layer_buffers_struct(
+    code: &mut String,
+    config: &ModelConfig,
+) -> Result<(), MetalCodegenError> {
     writeln!(
         code,
         "/// Per-layer weight buffers for attention and FFN projections."
@@ -2773,6 +2799,13 @@ fn emit_layer_buffers_struct(code: &mut String) -> Result<(), MetalCodegenError>
         "    /// Fused Q+K+V weight [hidden+2*kv_dim, hidden] (concatenated rows)"
     )?;
     writeln!(code, "    qkv_weight: Buffer,")?;
+    if config.qkv_bias {
+        writeln!(
+            code,
+            "    /// Fused Q+K+V bias [hidden+2*kv_dim] (f32) — Qwen2 only."
+        )?;
+        writeln!(code, "    qkv_bias: Buffer,")?;
+    }
     writeln!(code, "    o_weight: Buffer,")?;
     writeln!(code, "    ffn_norm: Buffer,")?;
     writeln!(
@@ -2877,6 +2910,12 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         writeln!(
             code,
             "        let {var} = make_pipeline(&device, &library, \"{fn_name}\");"
+        )?;
+    }
+    if config.qkv_bias {
+        writeln!(
+            code,
+            "        let add_bias_batch_pipeline = make_pipeline(&device, &library, \"add_bias_batch\");"
         )?;
     }
     writeln!(code)?;
@@ -3101,26 +3140,46 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
             code,
             "            let qkv_weight = next_q8_fused_buffer(&device, {qkv_rows}, {hidden});"
         )?;
+        if config.qkv_bias {
+            writeln!(
+                code,
+                "            // Qwen2 QKV bias triplet (F32): {qkv_rows} floats, loaded immediately after the fused weight."
+            )?;
+            writeln!(
+                code,
+                "            let qkv_bias = next_f32_buffer(&device, {qkv_rows});"
+            )?;
+        }
         writeln!(
             code,
             "            let o_weight = next_q8_buffer(&device, {hidden}, {hidden});"
         )?;
     } else if is_q4 {
-        // Fused Q+K+V weight: read all three consecutive Q4_0 matrices as one buffer
         writeln!(
             code,
             "            let qkv_weight = next_q4_fused_buffer(&device, {qkv_rows}, {hidden});"
         )?;
+        if config.qkv_bias {
+            writeln!(
+                code,
+                "            let qkv_bias = next_f32_buffer(&device, {qkv_rows});"
+            )?;
+        }
         writeln!(
             code,
             "            let o_weight = next_q4_buffer(&device, {hidden}, {hidden});"
         )?;
     } else {
-        // Fused Q+K+V weight: read all three as a single contiguous f32 buffer
         writeln!(
             code,
             "            let qkv_weight = next_f32_buffer(&device, {qkv_rows} * {hidden});"
         )?;
+        if config.qkv_bias {
+            writeln!(
+                code,
+                "            let qkv_bias = next_f32_buffer(&device, {qkv_rows});"
+            )?;
+        }
         writeln!(
             code,
             "            let o_weight = next_f32_buffer(&device, {hidden} * {hidden});"
@@ -3169,6 +3228,9 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            layers.push(LayerBuffers {{")?;
     writeln!(code, "                attn_norm,")?;
     writeln!(code, "                qkv_weight,")?;
+    if config.qkv_bias {
+        writeln!(code, "                qkv_bias,")?;
+    }
     writeln!(code, "                o_weight,")?;
     writeln!(code, "                ffn_norm,")?;
     writeln!(code, "                gate_up_weight,")?;
@@ -3371,6 +3433,9 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            matmul_q8_mma32_h_pipeline,")?;
     writeln!(code, "            matmul_q8_mma32_h4_pipeline,")?;
     writeln!(code, "            matmul_q8_mma32_hh4_pipeline,")?;
+    if config.qkv_bias {
+        writeln!(code, "            add_bias_batch_pipeline,")?;
+    }
     writeln!(code, "            matmul_q4_batch_pipeline,")?;
     writeln!(code, "            rms_norm_batch_pipeline,")?;
     writeln!(code, "            rope_batch_pipeline,")?;
@@ -3540,6 +3605,16 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "                self.{matmul_fn}(&enc, &self.hidden_buf, &self.layers[layer].qkv_weight, &self.qkv_buf, {qkv_rows}, {hidden});"
     )?;
+    if config.qkv_bias {
+        writeln!(
+            code,
+            "                // Qwen2: broadcast-add per-row QKV bias after the fused matmul."
+        )?;
+        writeln!(
+            code,
+            "                self.dispatch_add_bias_batch(&enc, &self.qkv_buf, &self.layers[layer].qkv_bias, 1, {qkv_rows});"
+        )?;
+    }
     writeln!(
         code,
         "                // RoPE on Q portion (qkv_buf offset 0) and K portion (qkv_buf offset {k_byte_offset})"
@@ -3742,6 +3817,12 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "                self.{matmul_fn}(&enc, &self.hidden_buf, &self.layers[layer].qkv_weight, &self.qkv_buf, {qkv_rows}, {hidden});"
     )?;
+    if config.qkv_bias {
+        writeln!(
+            code,
+            "                self.dispatch_add_bias_batch(&enc, &self.qkv_buf, &self.layers[layer].qkv_bias, 1, {qkv_rows});"
+        )?;
+    }
     writeln!(
         code,
         "                self.dispatch_rope_offset(&enc, &self.qkv_buf, {q_byte_offset}, {num_heads}, {head_dim}, pos);"
@@ -3989,6 +4070,16 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "                self.{batch_matmul_fn}(&enc, &self.batch_hidden_buf, &self.layers[layer].qkv_weight, &self.batch_qkv_buf, m, {qkv_rows}, {hidden});"
     )?;
+    if config.qkv_bias {
+        writeln!(
+            code,
+            "                // Qwen2: broadcast-add QKV bias across all M tokens."
+        )?;
+        writeln!(
+            code,
+            "                self.dispatch_add_bias_batch(&enc, &self.batch_qkv_buf, &self.layers[layer].qkv_bias, m, {qkv_rows});"
+        )?;
+    }
     writeln!(code)?;
 
     // Fused RoPE on Q+K portions in a single dispatch
@@ -5193,6 +5284,47 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
+
+    // dispatch_add_bias_batch — Qwen2 QKV bias broadcast-add after fused qkv matmul.
+    if config.qkv_bias {
+        writeln!(
+            code,
+            "    /// Broadcast-add a per-row bias vector to every row of an [M, rows] buffer."
+        )?;
+        writeln!(
+            code,
+            "    fn dispatch_add_bias_batch(&self, enc: &ComputeCommandEncoderRef, out: &Buffer, bias: &Buffer, num_tokens: usize, rows: usize) {{"
+        )?;
+        writeln!(code, "        let nt: u32 = num_tokens as u32;")?;
+        writeln!(code, "        let r: u32 = rows as u32;")?;
+        writeln!(
+            code,
+            "        enc.set_compute_pipeline_state(&self.add_bias_batch_pipeline);"
+        )?;
+        writeln!(code, "        enc.set_buffer(0, Some(out), 0);")?;
+        writeln!(code, "        enc.set_buffer(1, Some(bias), 0);")?;
+        writeln!(
+            code,
+            "        enc.set_bytes(2, mem::size_of::<u32>() as u64, &nt as *const u32 as *const _);"
+        )?;
+        writeln!(
+            code,
+            "        enc.set_bytes(3, mem::size_of::<u32>() as u64, &r as *const u32 as *const _);"
+        )?;
+        writeln!(code, "        let total = (num_tokens * rows) as u64;")?;
+        writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
+        writeln!(
+            code,
+            "        let grid_size = MTLSize::new((total + 255) / 256, 1, 1);"
+        )?;
+        writeln!(
+            code,
+            "        enc.dispatch_thread_groups(grid_size, tg_size);"
+        )?;
+        writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
+        writeln!(code, "    }}")?;
+        writeln!(code)?;
+    }
 
     // dispatch_rope_batch
     writeln!(
@@ -7230,6 +7362,72 @@ mod tests {
         assert!(
             model_rs.contains("let down_weight = next_q4_buffer"),
             "Q4_0 model should use next_q4_buffer for down weight"
+        );
+    }
+
+    #[test]
+    fn qwen2_qkv_bias_wired_through_metal_codegen() {
+        // Issue #210: the pre-v0.6.2 Metal codegen had zero handling for
+        // qkv_bias.  Verify that a Qwen2-style config emits the bias buffer,
+        // loader, pipeline, and dispatch call in the expected places.
+        let config = ModelConfig {
+            architecture: Architecture::Qwen2,
+            qkv_bias: true,
+            ..minimal_config()
+        };
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        assert!(
+            model_rs.contains("qkv_bias: Buffer"),
+            "Qwen2 LayerBuffers must declare qkv_bias field"
+        );
+        assert!(
+            model_rs.contains("let qkv_bias = next_f32_buffer"),
+            "Qwen2 layer init must load the bias from the weight blob"
+        );
+        assert!(
+            model_rs.contains("add_bias_batch_pipeline"),
+            "Qwen2 model struct must include the add_bias_batch_pipeline"
+        );
+        assert!(
+            model_rs.contains("fn dispatch_add_bias_batch"),
+            "Qwen2 codegen must emit dispatch_add_bias_batch helper"
+        );
+        assert!(
+            model_rs.contains("dispatch_add_bias_batch(&enc, &self.batch_qkv_buf"),
+            "forward_prefill_batch must call dispatch_add_bias_batch on batch_qkv_buf"
+        );
+        assert!(
+            model_rs.contains("dispatch_add_bias_batch(&enc, &self.qkv_buf"),
+            "forward must call dispatch_add_bias_batch on the single-token qkv_buf"
+        );
+
+        // The add_bias_batch MSL kernel must be in the shader source.
+        let shaders = generate_metal_shaders(&config);
+        assert!(
+            shaders.contains("kernel void add_bias_batch"),
+            "shaders.metal must contain the add_bias_batch kernel"
+        );
+    }
+
+    #[test]
+    fn llama_does_not_emit_qkv_bias_machinery() {
+        // Negative test: non-Qwen2 models must NOT carry the bias dispatch,
+        // buffer, or pipeline — keeps generated code lean for Llama/Phi/etc.
+        let config = minimal_config();
+        assert!(!config.qkv_bias);
+        let model_rs = generate_model_rs(&config).unwrap();
+        assert!(
+            !model_rs.contains("qkv_bias: Buffer"),
+            "Llama must not have qkv_bias field"
+        );
+        assert!(
+            !model_rs.contains("add_bias_batch_pipeline"),
+            "Llama must not pull in add_bias_batch_pipeline"
+        );
+        assert!(
+            !model_rs.contains("dispatch_add_bias_batch"),
+            "Llama must not call dispatch_add_bias_batch"
         );
     }
 

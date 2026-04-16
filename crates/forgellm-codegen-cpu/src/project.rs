@@ -237,6 +237,66 @@ fn generate_main(config: &ModelConfig) -> String {
     let weight_slice_code = if is_q8 || is_q4 {
         // Quantized: byte offsets for projection weights, f32 element offsets for norm/embed
         let quant_label = if is_q8 { "Q8_0" } else { "Q4_0" };
+
+        // Qwen2 QKV bias (F32) — read from weights.bin when enabled. Each bias
+        // tensor has `num_heads * head_dim` (Q) or `num_kv_heads * head_dim` (K/V)
+        // F32 elements, written by cmd_export_weights_impl immediately after the
+        // corresponding projection weight.
+        let (q_bias_read, k_bias_read, v_bias_read, layer_fields) = if config.qkv_bias {
+            let q_bias_bytes = qk_size * 4;
+            let kv_bias_bytes = kv_size * 4;
+            (
+                format!(
+                    r##"        // Qwen2 Q projection bias: f32, interpreted from raw bytes
+        let qb_bytes = {q_bias_bytes};
+        let qb: Vec<f32> = {{
+            let n = qb_bytes / 4;
+            let mut v = Vec::<f32>::with_capacity(n);
+            unsafe {{
+                std::ptr::copy_nonoverlapping(w[boff..boff+qb_bytes].as_ptr() as *const f32, v.as_mut_ptr(), n);
+                v.set_len(n);
+            }}
+            v
+        }};
+        boff += qb_bytes;
+"##
+                ),
+                format!(
+                    r##"        // Qwen2 K projection bias: f32
+        let kb_bytes = {kv_bias_bytes};
+        let kb: Vec<f32> = {{
+            let n = kb_bytes / 4;
+            let mut v = Vec::<f32>::with_capacity(n);
+            unsafe {{
+                std::ptr::copy_nonoverlapping(w[boff..boff+kb_bytes].as_ptr() as *const f32, v.as_mut_ptr(), n);
+                v.set_len(n);
+            }}
+            v
+        }};
+        boff += kb_bytes;
+"##
+                ),
+                format!(
+                    r##"        // Qwen2 V projection bias: f32
+        let vb_bytes = {kv_bias_bytes};
+        let vb: Vec<f32> = {{
+            let n = vb_bytes / 4;
+            let mut v = Vec::<f32>::with_capacity(n);
+            unsafe {{
+                std::ptr::copy_nonoverlapping(w[boff..boff+vb_bytes].as_ptr() as *const f32, v.as_mut_ptr(), n);
+                v.set_len(n);
+            }}
+            v
+        }};
+        boff += vb_bytes;
+"##
+                ),
+                ", q_bias: qb, k_bias: kb, v_bias: vb".to_string(),
+            )
+        } else {
+            (String::new(), String::new(), String::new(), String::new())
+        };
+
         format!(
             r##"    let w = load_weights_raw(weights_path);
     let mut boff = 0usize;  // byte offset into raw buffer
@@ -267,11 +327,11 @@ fn generate_main(config: &ModelConfig) -> String {
             v
         }};
         boff += an_bytes;
-        // Projection weights: {quant_label} raw bytes
+        // Projection weights: {quant_label} raw bytes (Q, K, V as a contiguous triplet)
         let qp = w[boff..boff+{qp_bytes}].to_vec(); boff += {qp_bytes};
         let kp = w[boff..boff+{kp_bytes}].to_vec(); boff += {kp_bytes};
         let vp = w[boff..boff+{vp_bytes}].to_vec(); boff += {vp_bytes};
-        let op = w[boff..boff+{op_bytes}].to_vec(); boff += {op_bytes};
+{q_bias_read}{k_bias_read}{v_bias_read}        let op = w[boff..boff+{op_bytes}].to_vec(); boff += {op_bytes};
         // ffn_norm: f32
         let fn_bytes = {hidden} * 4;
         let fn_: Vec<f32> = {{
@@ -287,7 +347,7 @@ fn generate_main(config: &ModelConfig) -> String {
         let gp = w[boff..boff+{gp_bytes}].to_vec(); boff += {gp_bytes};
         let up = w[boff..boff+{up_bytes}].to_vec(); boff += {up_bytes};
         let dp = w[boff..boff+{dp_bytes}].to_vec(); boff += {dp_bytes};
-        layers.push(model::LayerWeights {{ attn_norm: an, q_proj: qp, k_proj: kp, v_proj: vp, o_proj: op, ffn_norm: fn_, gate_proj: gp, up_proj: up, down_proj: dp }});
+        layers.push(model::LayerWeights {{ attn_norm: an, q_proj: qp, k_proj: kp, v_proj: vp, o_proj: op, ffn_norm: fn_, gate_proj: gp, up_proj: up, down_proj: dp{layer_fields} }});
     }}
     // final_norm: f32
     let fnorm_bytes = {hidden} * 4;
@@ -306,6 +366,17 @@ fn generate_main(config: &ModelConfig) -> String {
     let weights = model::Weights {{ embed_tokens: embed, layers, final_norm: fnorm, lm_head: lmh }};"##
         )
     } else {
+        // Qwen2 QKV bias (F32) — f32 path. Each bias is qk_size or kv_size floats.
+        let (q_bias_read, k_bias_read, v_bias_read, layer_fields) = if config.qkv_bias {
+            (
+                format!("        let qb = w[off..off+{qk_size}].to_vec(); off += {qk_size};\n"),
+                format!("        let kb = w[off..off+{kv_size}].to_vec(); off += {kv_size};\n"),
+                format!("        let vb = w[off..off+{kv_size}].to_vec(); off += {kv_size};\n"),
+                ", q_bias: qb, k_bias: kb, v_bias: vb".to_string(),
+            )
+        } else {
+            (String::new(), String::new(), String::new(), String::new())
+        };
         format!(
             r##"    let w = load_weights(weights_path);
     let mut off = 0usize;
@@ -317,12 +388,12 @@ fn generate_main(config: &ModelConfig) -> String {
         let qp = w[off..off+{qk_size}*{hidden}].to_vec(); off += {qk_size}*{hidden};
         let kp = w[off..off+{kv_size}*{hidden}].to_vec(); off += {kv_size}*{hidden};
         let vp = w[off..off+{kv_size}*{hidden}].to_vec(); off += {kv_size}*{hidden};
-        let op = w[off..off+{hidden}*{qk_size}].to_vec(); off += {hidden}*{qk_size};
+{q_bias_read}{k_bias_read}{v_bias_read}        let op = w[off..off+{hidden}*{qk_size}].to_vec(); off += {hidden}*{qk_size};
         let fn_ = w[off..off+{hidden}].to_vec(); off += {hidden};
         let gp = w[off..off+{inter}*{hidden}].to_vec(); off += {inter}*{hidden};
         let up = w[off..off+{inter}*{hidden}].to_vec(); off += {inter}*{hidden};
         let dp = w[off..off+{hidden}*{inter}].to_vec(); off += {hidden}*{inter};
-        layers.push(model::LayerWeights {{ attn_norm: an, q_proj: qp, k_proj: kp, v_proj: vp, o_proj: op, ffn_norm: fn_, gate_proj: gp, up_proj: up, down_proj: dp }});
+        layers.push(model::LayerWeights {{ attn_norm: an, q_proj: qp, k_proj: kp, v_proj: vp, o_proj: op, ffn_norm: fn_, gate_proj: gp, up_proj: up, down_proj: dp{layer_fields} }});
     }}
     let fnorm = w[off..off+{hidden}].to_vec(); off += {hidden};
     let lmh = w[off..off+{vocab}*{hidden}].to_vec();

@@ -2,6 +2,16 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [Unreleased]
+
+### Fixed
+- **Qwen2 QKV bias on AOT backends** (`fix`, closes [#210](https://github.com/sauravpanda/forge-llm/issues/210)): Qwen2 models have bias terms on the Q/K/V projection matrices that Llama does not. Before this release, `cmd_export_weights_impl` never wrote those biases, the Metal codegen had zero handling for them, and the CPU codegen emitted bias fields without populating them — so a Qwen2 AOT binary either failed to compile (CPU) or produced garbled output (Metal).
+  - `forgellm-cli` export now writes the Q/K/V bias triplet immediately after the fused Q/K/V weight triplet when `config.qkv_bias` is true.
+  - `forgellm-codegen-cpu` `project.rs` weight-loader now reads those biases and populates `LayerWeights`. `forward_prefill` also applies them (previously only `forward` did).
+  - `forgellm-codegen-metal` adds a `qkv_bias` buffer to `LayerBuffers`, a new `add_bias_batch` MSL kernel, a `dispatch_add_bias_batch` helper, and calls it after the fused QKV matmul in both `forward` and `forward_prefill_batch`.
+  - Verified end-to-end on Qwen2.5-0.5B Q8_0: CPU and Metal AOT both produce coherent output. Llama-3.2-1B Metal prefill is unchanged (6,300 tok/s at 1,501 tokens — no regression).
+  - New regression tests: `qwen2_qkv_bias_wired_through_metal_codegen` and `llama_does_not_emit_qkv_bias_machinery` in Metal codegen; the CPU-codegen test for Qwen2 now asserts the bias-add is present in `forward_prefill` as well as `forward`.
+
 ## [0.6.1] — 2026-04-15 — All-FP16 MMA for Long Contexts
 
 ### Performance

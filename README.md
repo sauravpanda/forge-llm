@@ -126,7 +126,7 @@ ForgeLLM compiles models into hardware-specific code:
 | Architecture | Models | Interpreter (`forge run`) | AOT Metal/CPU |
 |-------------|--------|---------------------------|---------------|
 | LlamaForCausalLM | SmolLM2 (135M, 360M, 1.7B), Llama 3.2 (1B, 3B), TinyLlama | ✅ Verified | ✅ Verified |
-| Qwen2ForCausalLM | Qwen2.5 (0.5B–7B) | ✅ Verified | ⚠️ AOT export path doesn't include QKV bias — output is garbled ([#210](https://github.com/sauravpanda/forge-llm/issues/210)) |
+| Qwen2ForCausalLM | Qwen2.5 (0.5B–7B) | ✅ Verified | ✅ Verified (0.5B Q8_0 on CPU + Metal; fixes [#210](https://github.com/sauravpanda/forge-llm/issues/210)) |
 | MistralForCausalLM | Mistral 7B (sliding-window attention) | ✅ Verified | ⚠️ Untested with v0.6.x MMA kernels |
 | Phi3ForCausalLM | Phi-3 Mini | ✅ Verified | ⚠️ Untested with v0.6.x MMA kernels |
 | GemmaForCausalLM | Gemma 2B, 7B | ✅ Verified | ⚠️ Untested with v0.6.x MMA kernels |
