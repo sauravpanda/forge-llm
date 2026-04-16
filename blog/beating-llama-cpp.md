@@ -1,6 +1,8 @@
 # How We Beat llama.cpp and MLX: Building an AOT Compiler for LLM Inference
 
-**TL;DR:** ForgeLLM is a Rust AOT compiler that compiles GGUF language models into optimized Metal GPU binaries. On Apple Silicon, it's faster than both llama.cpp and Apple's own MLX framework on generation across all tested model sizes, and — as of v0.6.1 — it sustains **~12.6 TFLOPS on Llama-3.2-1B prefill** (about 93% of the M5 Pro FP32 peak) using a tiered stack of four `simdgroup_matrix` MMA kernels.
+> **Honest update (v0.6.4):** a correctness bug in `forward_prefill_batch` was silently truncating prompts longer than 512 tokens to the first 512, which inflated all previously reported prefill numbers for long prompts. Previous versions of this post quoted ~12 TFLOPS sustained on 1B prefill at 1,501 tokens — that was wrong. The real number is closer to 1,580 tok/s (~3 TFLOPS) because long-context attention in the current kernel is O(M²) and not MMA-accelerated. Numbers for prompts ≤ 512 tokens were unaffected and still hold. Everything below has been corrected. The truncation fix is in v0.6.4.
+
+**TL;DR:** ForgeLLM is a Rust AOT compiler that compiles GGUF language models into optimized Metal GPU binaries. On Apple Silicon, it's **faster than llama.cpp and Apple's MLX on generation across every model size we've tested**, and competitive on prefill for short-to-medium prompts — leading 135M at any length and within 1.3× of MLX on 1B at their 321-token benchmark point. Longer prefill contexts are currently attention-bound; work on a flash-attention kernel is in progress.
 
 ### Generation Speed — 8-bit Quantization, Apple M5 Pro
 
@@ -11,16 +13,16 @@
 | Llama-3.2-1B | **178 tok/s** | 111 tok/s | 130 tok/s | **1.60x** | **1.37x** |
 | Llama-3.2-3B | **70.4 tok/s** | 42.2 tok/s | 67.8 tok/s | **1.67x** | **1.04x** |
 
-### Prefill Speed (v0.6.1) — Llama-3.2-1B Q8_0
+### Prefill Speed (v0.6.4, honest numbers) — Llama-3.2-1B Q8_0
 
-| Prompt | v0.5.2 | **v0.6.1** | Speedup |
-|-------:|-------:|-----------:|--------:|
-| 108 tok | 406 | **1,145** | 2.8x |
-| 321 tok | ~475 | **2,040** | 4.3x |
-| 801 tok | 721 | **3,390** | 4.7x |
-| 1,501 tok | 1,354 | **6,320** | 4.7x |
+| Prompt | v0.5.2 | **v0.6.4** | Real speedup |
+|-------:|-------:|-----------:|-------------:|
+| 108 tok | 406 | **~1,160** | 2.9× |
+| 321 tok | ~475 | **~2,080** | 4.4× |
+| 801 tok | ~721 | **~2,030** | ~2.8× |
+| 1,501 tok | ~1,354 | **~1,580** | ~1.2× |
 
-Yes, we beat Apple's own framework on Apple's own hardware on generation. On prefill, v0.6.x closed the long-context gap entirely (we now lead on 135M/360M at any length, and on 1B at long context; MLX's Accelerate BLAS still edges us at the 321-token sweet spot they benchmark).
+Short-prompt speedups from the simdgroup_matrix MMA stack (v0.6.0–v0.6.1) are real — at M=321 tokens on 1B we go from ~475 tok/s to ~2,080 tok/s, closing the gap vs MLX's 2,718 to 1.3×. Longer-prompt numbers grow more slowly because the attention kernel is still the old O(M·seq) dot-product kernel with a `threadgroup float scores[ATTN_SCORES_SIZE]` array; once attention is MMA-accelerated too (flash attention work in progress), the long-prefill numbers should recover.
 
 ## The key insight: compile, don't interpret
 
@@ -143,17 +145,19 @@ v0.6.0 and v0.6.1 ship **four generations** of MMA kernels with a tiered dispatc
 
 Each kernel is faster than the previous in its shape range and strictly worse outside it. Every tiered transition was validated by running the benchmark, checking correctness on 135M/1B/3B, and keeping only the configuration that won.
 
-### Shape-specific wins on Llama-3.2-1B Q8_0 (M5 Pro)
+### Shape-specific wins on Llama-3.2-1B Q8_0 (M5 Pro, honest numbers)
 
-| Prompt | v0.5.2 dot-product | v0.6.0 `mma32_h4` | v0.6.1 `mma32_hh4` | Speedup |
-|-------:|-------------------:|------------------:|-------------------:|--------:|
-| 101 | 406 | **1,145** | — (stays on h4) | 2.8x |
-| 201 | ~560 | **1,718** | — | 3.1x |
-| 321 | ~475 | 1,880 | **2,040** | 4.3x |
-| 801 | 721 | 3,150 | **3,390** | 4.7x |
-| 1,501 | 1,354 | 6,070 | **6,320** (~12.6 TFLOPS) | 4.7x |
+| Prompt | v0.5.2 dot-product | v0.6.4 MMA stack | Speedup |
+|-------:|-------------------:|-----------------:|--------:|
+| 101 | 406 | **~1,160** | 2.9× |
+| 201 | ~560 | **~1,600** | 2.9× |
+| 321 | ~475 | **~2,080** | 4.4× |
+| 801 | ~721 | ~2,030 | ~2.8× |
+| 1,501 | ~1,354 | ~1,580 | ~1.2× |
 
-At 1,501 tokens we sustain ~12.6 TFLOPS — about 93% of the M5 Pro FP32 peak.
+The short-prompt speedups (up to ~321 tokens) are the MMA kernel stack doing its job: at this matmul-bound regime we're in the 2–4× range vs dot-product. Past ~512 tokens, **throughput goes down with prompt length** instead of up — the matmul scales linearly, but the attention kernel is still the pre-MMA "compute all scores, then softmax" O(M·seq) implementation with a `threadgroup float scores[ATTN_SCORES_SIZE]` array. For M=1,501 the attention FLOPs are about 13% of total but they're running at a much lower fraction of peak than the MMA matmul, so they dominate the wall-clock time.
+
+An MMA-based flash-attention kernel is the obvious next step — when that lands, the long-prefill numbers should move up by a factor of several.
 
 ### Design notes from the kernel rewrite
 

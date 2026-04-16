@@ -2,7 +2,7 @@
 
 All notable changes to ForgeLLM are documented here.
 
-## [Unreleased]
+## [0.6.4] — 2026-04-15 — Long-Prompt Correctness + Honest Numbers
 
 ### Fixed
 - **Long-prompt truncation in `forward_prefill_batch`** (`fix`, major correctness bug): the batched prefill was silently truncating prompts longer than `MAX_BATCH_SIZE` (512) via `.min(MAX_BATCH_SIZE)` — it processed only the first 512 tokens, filled KV cache for those positions, and left everything past 512 as zero/garbage in the cache. The `forward()` call for the final prompt token then attended over a partially-filled cache, producing subtly-wrong logits without crashing.
