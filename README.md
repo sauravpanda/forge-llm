@@ -38,7 +38,7 @@ Apple M5 Pro, Q8_0. Measurements are honest — previous releases reported infla
 | Llama-3.2-1B (~1501 tok) | 1,580 | — | — |
 | Llama-3.2-1B (~3001 tok) | 1,010 | — | — |
 
-Prefill uses hardware matrix-multiply via `simdgroup_matrix<float, 8, 8>`. The 32×32 MMA kernels (`matmul_q8_mma32` / `matmul_q8_mma32_h4` / `matmul_q8_mma32_hh4`) are well-optimized for the matmul portion of the forward pass. Throughput drops with prompt length because attention is O(M²) and the current kernel computes a full scores matrix up to `effective_seq_len` — a flash-attention kernel for long contexts is shipped but not yet numerically verified, so the legacy kernel is the default and drives the long-context numbers above.
+Prefill uses hardware matrix-multiply via `simdgroup_matrix<float, 8, 8>`. The 32×32 MMA kernels (`matmul_q8_mma32` / `matmul_q8_mma32_h4` / `matmul_q8_mma32_hh4`) are well-optimized for the matmul portion of the forward pass. Throughput drops with prompt length because attention is O(M²) and the current kernel computes a full scores matrix up to `effective_seq_len`. A tiled flash-attention kernel is shipped and numerically verified, but currently ~7–14% slower than the legacy kernel (no MMA yet), so legacy is the default. MMA-accelerated flash attention is tracked in [#212](https://github.com/sauravpanda/forge-llm/issues/212).
 
 ### Deploy Size
 
@@ -142,7 +142,7 @@ Also supports SafeTensors and LoRA adapter merging at compile time.
 
 The Metal backend generates optimized Apple Silicon compute shaders:
 
-- **Hardware matrix-multiply prefill** — `simdgroup_matrix<float, 8, 8>` MMA tiles dequantize Q8_0 into threadgroup memory and run 8×8×8 `simdgroup_multiply_accumulate` per tile, hitting ~8.7 TFLOPS sustained on 1B
+- **Hardware matrix-multiply prefill** — `simdgroup_matrix<float, 8, 8>` MMA tiles dequantize Q8_0 into threadgroup memory and run 8×8×8 `simdgroup_multiply_accumulate` per tile
 - **Simdgroup cooperative matmul** — 32-lane SIMD reductions with shared memory vector caching (fast path for single-token decode)
 - **Native Q8_0/Q4_0 kernels** — Dequantize on-the-fly during matmul, halving memory bandwidth
 - **Fused projections** — QKV and gate+up concatenated into single matmul dispatches
