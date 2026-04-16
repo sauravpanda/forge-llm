@@ -25,18 +25,18 @@ Benchmarks on Apple M5 Pro, 8-bit quantization, 64-token generation.
 
 ### Prefill Speed (tok/s, long prompt)
 
+Apple M5 Pro, Q8_0. Measurements are honest — previous releases reported inflated numbers for prompts longer than 512 tokens because `forward_prefill_batch` silently truncated to 512 tokens. The chunking fix (v0.6.4) correctly processes the full prompt; numbers below reflect the real end-to-end prefill time.
+
 | Model | ForgeLLM Metal | MLX (8-bit) | llama.cpp (Q8_0) |
 |-------|---------------|-------------|-------------------|
-| SmolLM2-135M (~100 tok) | **4,900** | 1,507 | 2,812 |
-| SmolLM2-135M (~1250 tok) | **23,300** | — | — |
-| Llama-3.2-1B (~321 tok) | 2,040 | **2,718** | 556 |
-| Llama-3.2-1B (~801 tok) | **3,390** | — | — |
-| Llama-3.2-1B (~1501 tok) | **6,320** | — | — |
-| Llama-3.2-1B (~3001 tok) | **~12,000** | — | — |
-| Llama-3.2-3B (~401 tok) | **770** | — | — |
-| Llama-3.2-3B (~1501 tok) | **2,390** | — | — |
+| SmolLM2-135M (~100 tok) | **~3,100** | 1,507 | 2,812 |
+| SmolLM2-135M (~1250 tok) | **~6,000** | — | — |
+| Llama-3.2-1B (~321 tok) | 2,080 | **2,718** | 556 |
+| Llama-3.2-1B (~801 tok) | 2,030 | — | — |
+| Llama-3.2-1B (~1501 tok) | 1,580 | — | — |
+| Llama-3.2-1B (~3001 tok) | 1,010 | — | — |
 
-Prefill uses hardware matrix-multiply via `simdgroup_matrix<float, 8, 8>`. The large-tile MMA kernel (`matmul_q8_mma32`, 32×32 tile) hits **~12.1 TFLOPS sustained** on Llama-3.2-1B at 1,501 tokens — ~93% of the M5 Pro FP32 peak. For 1B/3B a FP16-tile 4-simdgroup variant (`matmul_q8_mma32_h4`, 128 threads per TG, each simdgroup owning a 2×2 grid of 8×8 accumulators) doubles FLOP-per-simdgroup-load via A/B tile reuse.
+Prefill uses hardware matrix-multiply via `simdgroup_matrix<float, 8, 8>`. The 32×32 MMA kernels (`matmul_q8_mma32` / `matmul_q8_mma32_h4` / `matmul_q8_mma32_hh4`) are well-optimized for the matmul portion of the forward pass. Throughput drops with prompt length because attention is O(M²) and the current kernel computes a full scores matrix up to `effective_seq_len` — a flash-attention kernel for long contexts is shipped but not yet numerically verified, so the legacy kernel is the default and drives the long-context numbers above.
 
 ### Deploy Size
 

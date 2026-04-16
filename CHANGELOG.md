@@ -2,6 +2,17 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [Unreleased]
+
+### Fixed
+- **Long-prompt truncation in `forward_prefill_batch`** (`fix`, major correctness bug): the batched prefill was silently truncating prompts longer than `MAX_BATCH_SIZE` (512) via `.min(MAX_BATCH_SIZE)` — it processed only the first 512 tokens, filled KV cache for those positions, and left everything past 512 as zero/garbage in the cache. The `forward()` call for the final prompt token then attended over a partially-filled cache, producing subtly-wrong logits without crashing.
+  - Real impact: any prompt > 512 tokens produced wrong output. In particular, "needle-in-haystack" queries (fact buried mid-prompt) fail to retrieve. For repetitive prompts the output often looks correct (continues the pattern) because the first 512 tokens are representative.
+  - Fix: `forward_prefill_batch` now loops over `tokens.chunks(MAX_BATCH_SIZE)`, running the full attention + matmul pipeline for each chunk and carrying KV-cache state across chunks via `self.pos`.
+  - **Previous prefill numbers for prompts > 512 tokens were inflated**: reporting `prompt_len / total_time` where only 512 tokens actually went through the forward pass. Honest numbers on Llama-3.2-1B Q8_0 (M5 Pro): 801-tok ~2,030 tok/s (not 3,390), 1,501-tok ~1,580 tok/s (not 6,320). README table updated. Numbers ≤ 321 tokens were unaffected.
+  - Regression test: `forward_prefill_batch_chunks_by_max_batch_size`.
+- **`scores[2048]` attention overflow** (`fix`): both the single-token `attention` kernel and the batched `attention_batch` kernel had a hardcoded `threadgroup float scores[2048]` array. For models with `effective_seq_len` up to 4096 (all supported models), a prompt or generation position past 2048 silently overflowed the shared array, corrupting attention output. The scores array is now sized to `ATTN_SCORES_SIZE = min(max_seq_len, 4096)` — templated into the shader source at codegen time.
+- **Flash attention kernel temporarily disabled** after the chunking fix exposed a numerical issue (the pre-chunking dispatch never actually exercised flash at long seq because long prompts were being truncated). The kernel source + pipeline are still shipped; the dispatch routes to the (now correctly sized) legacy kernel pending a fix.
+
 ## [0.6.3] — 2026-04-15 — Long-Context Attention Fix
 
 ### Added
