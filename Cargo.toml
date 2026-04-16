@@ -13,7 +13,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.6.2"
+version = "0.6.3"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/sauravpanda/forge-llm"
@@ -24,13 +24,13 @@ readme = "README.md"
 
 [workspace.dependencies]
 # Internal crates
-forgellm-frontend = { version = "0.6.2", path = "crates/forgellm-frontend" }
-forgellm-optimizer = { version = "0.6.2", path = "crates/forgellm-optimizer" }
-forgellm-codegen-cpu = { version = "0.6.2", path = "crates/forgellm-codegen-cpu" }
-forgellm-codegen-wasm = { version = "0.6.2", path = "crates/forgellm-codegen-wasm" }
-forgellm-codegen-gpu = { version = "0.6.2", path = "crates/forgellm-codegen-gpu" }
-forgellm-codegen-metal = { version = "0.6.2", path = "crates/forgellm-codegen-metal" }
-forgellm-runtime = { version = "0.6.2", path = "crates/forgellm-runtime" }
+forgellm-frontend = { version = "0.6.3", path = "crates/forgellm-frontend" }
+forgellm-optimizer = { version = "0.6.3", path = "crates/forgellm-optimizer" }
+forgellm-codegen-cpu = { version = "0.6.3", path = "crates/forgellm-codegen-cpu" }
+forgellm-codegen-wasm = { version = "0.6.3", path = "crates/forgellm-codegen-wasm" }
+forgellm-codegen-gpu = { version = "0.6.3", path = "crates/forgellm-codegen-gpu" }
+forgellm-codegen-metal = { version = "0.6.3", path = "crates/forgellm-codegen-metal" }
+forgellm-runtime = { version = "0.6.3", path = "crates/forgellm-runtime" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
