@@ -2,6 +2,11 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [Unreleased]
+
+### Added
+- **`attention_flash_batch` kernel** (`feat`, fixes a long-context correctness bug): a tiled attention kernel with online softmax that streams K/V in `FLASH_K_TILE`-sized chunks, eliminating the `scores[2048]` threadgroup array used by `attention_batch`. The legacy kernel **silently corrupts** attention output when `base_pos + num_tokens > 2048` because the scores array overflows — a real bug for any prompt longer than 2K tokens (the compile-time max_seq_len is 4K for all supported models). Dispatch is tiered: legacy kernel for `max_seq <= 2000` (faster at short seq due to fewer barriers), flash kernel above. Verified coherent output on Llama-3.2-1B at 3,001 prompt tokens (~12K tok/s prefill). Short/medium prefill numbers are roughly unchanged (within thermal variance). Regression test: `attention_flash_batch_kernel_wired`.
+
 ## [0.6.2] — 2026-04-15 — Qwen2 AOT Fix
 
 ### Fixed

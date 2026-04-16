@@ -32,6 +32,7 @@ Benchmarks on Apple M5 Pro, 8-bit quantization, 64-token generation.
 | Llama-3.2-1B (~321 tok) | 2,040 | **2,718** | 556 |
 | Llama-3.2-1B (~801 tok) | **3,390** | — | — |
 | Llama-3.2-1B (~1501 tok) | **6,320** | — | — |
+| Llama-3.2-1B (~3001 tok) | **~12,000** | — | — |
 | Llama-3.2-3B (~401 tok) | **770** | — | — |
 | Llama-3.2-3B (~1501 tok) | **2,390** | — | — |
 

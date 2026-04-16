@@ -2414,6 +2414,171 @@ kernel void attention_batch(
     }
 }
 
+// ── attention_flash_batch ─────────────────────────────────────────────
+// Streaming attention with online softmax.  Same grid as attention_batch
+// (M × num_heads threadgroups, one per (token, head) pair) but the scores
+// matrix is never materialized.  K/V positions are processed in a tile of
+// FLASH_K_TILE at a time, and the running (m, l, O) tuple is updated via
+// the standard flash-attention recurrence:
+//
+//     m_new   = max(m_old, tile_max)
+//     alpha   = exp(m_old - m_new)
+//     l_new   = alpha * l_old + sum(exp(S - m_new))
+//     O_new   = alpha * O_old + sum(exp(S - m_new) * V)
+//     O_final = O / l
+//
+// This removes the `scores[2048]` cap in attention_batch (which silently
+// overflows for prompts with seq_len > 2048) and keeps threadgroup memory
+// use to O(head_dim + FLASH_K_TILE) instead of O(seq_len).
+//
+// Assumptions: head_dim ≤ 256 (Llama/Qwen/Mistral/Phi-3 all satisfy this).
+constant constexpr uint FLASH_K_TILE = 32;
+constant constexpr uint FLASH_MAX_HEAD_DIM = 256;
+
+kernel void attention_flash_batch(
+    device const float* q_batch      [[buffer(0)]],  // batch QKV buf (strided)
+    device const float* k_cache      [[buffer(1)]],  // [max_seq, num_kv_heads * head_dim]
+    device const float* v_cache      [[buffer(2)]],  // [max_seq, num_kv_heads * head_dim]
+    device float* output_batch       [[buffer(3)]],  // [M, num_heads * head_dim]
+    constant uint& M                 [[buffer(4)]],
+    constant uint& base_pos          [[buffer(5)]],
+    constant uint& num_heads         [[buffer(6)]],
+    constant uint& num_kv_heads      [[buffer(7)]],
+    constant uint& head_dim          [[buffer(8)]],
+    constant uint& q_stride          [[buffer(9)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]])
+{
+    uint token_idx = tgid / num_heads;
+    uint head = tgid % num_heads;
+    if (token_idx >= M) return;
+
+    uint kv_head = head / (num_heads / num_kv_heads);
+    uint seq_len = base_pos + token_idx + 1;  // causal: attend to [0, base_pos + token_idx]
+    uint q_off = token_idx * q_stride + head * head_dim;
+    uint out_off = token_idx * num_heads * head_dim + head * head_dim;
+
+    // Threadgroup state:
+    //   q_sh:      Q vector for this (token, head), loaded once
+    //   o_sh:      running output vector, updated each K tile
+    //   scores_sh: scores for the current K tile only
+    //   stats:     [running max, running sum]  (see flash-attention recurrence)
+    threadgroup float q_sh[FLASH_MAX_HEAD_DIM];
+    threadgroup float o_sh[FLASH_MAX_HEAD_DIM];
+    threadgroup float scores_sh[FLASH_K_TILE];
+    threadgroup float stats[2];
+    threadgroup float sg_scratch[8];  // simdgroup-level reduction buffer
+
+    // --- Load Q (one row) and zero the running O ---
+    for (uint d = tid; d < head_dim; d += 256) {
+        q_sh[d] = q_batch[q_off + d];
+        o_sh[d] = 0.0f;
+    }
+    if (tid == 0) {
+        stats[0] = -INFINITY;
+        stats[1] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float scale = fast::rsqrt(float(head_dim));
+    uint v_stride = num_kv_heads * head_dim;
+    uint v_base = kv_head * head_dim;
+
+    // --- Stream K/V in FLASH_K_TILE chunks, updating (m, l, O) each iteration ---
+    for (uint kv_base = 0; kv_base < seq_len; kv_base += FLASH_K_TILE) {
+        uint tile_n = min((uint)FLASH_K_TILE, seq_len - kv_base);
+
+        // [1] Compute scores for this tile: scores[ti] = dot(q, k[kv_base+ti]) * scale.
+        // 8 simdgroups cover up to FLASH_K_TILE/8 positions each, 32 lanes reduce head_dim.
+        for (uint ti = simd_id; ti < tile_n; ti += 8) {
+            uint k_off = (kv_base + ti) * v_stride + v_base;  // same layout as V stride
+            float dot = 0.0f;
+            for (uint d = simd_lane; d < head_dim; d += 32) {
+                dot += q_sh[d] * k_cache[k_off + d];
+            }
+            dot = simd_sum(dot);
+            if (simd_lane == 0) {
+                scores_sh[ti] = dot * scale;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // [2] Tile max via cooperative reduction.
+        float local_max = -INFINITY;
+        for (uint s = tid; s < tile_n; s += 256) {
+            local_max = max(local_max, scores_sh[s]);
+        }
+        local_max = simd_max(local_max);
+        if (simd_lane == 0) {
+            sg_scratch[simd_id] = local_max;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // [3] Merge with running max, compute alpha, rescale running l.
+        float m_new;
+        float alpha;
+        if (tid == 0) {
+            float tile_max = sg_scratch[0];
+            for (uint i = 1; i < 8; i++) tile_max = max(tile_max, sg_scratch[i]);
+            float m_old = stats[0];
+            m_new = max(m_old, tile_max);
+            // First iteration: m_old = -inf → alpha = 0 (reset O).
+            alpha = (m_old == -INFINITY) ? 0.0f : fast::exp(m_old - m_new);
+            stats[0] = m_new;
+            stats[1] *= alpha;
+            // Broadcast via sg_scratch.
+            sg_scratch[0] = alpha;
+            sg_scratch[1] = m_new;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        alpha = sg_scratch[0];
+        m_new = sg_scratch[1];
+
+        // [4] Rescale running output by alpha, then compute exp(scores - m_new).
+        for (uint d = tid; d < head_dim; d += 256) {
+            o_sh[d] *= alpha;
+        }
+        for (uint s = tid; s < tile_n; s += 256) {
+            scores_sh[s] = fast::exp(scores_sh[s] - m_new);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // [5] Tile sum → update running l.
+        float local_sum = 0.0f;
+        for (uint s = tid; s < tile_n; s += 256) {
+            local_sum += scores_sh[s];
+        }
+        local_sum = simd_sum(local_sum);
+        if (simd_lane == 0) {
+            sg_scratch[simd_id] = local_sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            float tile_sum = 0.0f;
+            for (uint i = 0; i < 8; i++) tile_sum += sg_scratch[i];
+            stats[1] += tile_sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // [6] Accumulate P @ V into o_sh: o_sh[d] += sum_s P[s] * V[kv_base+s, d]
+        for (uint d = tid; d < head_dim; d += 256) {
+            float acc = 0.0f;
+            for (uint s = 0; s < tile_n; s++) {
+                acc += scores_sh[s] * v_cache[(kv_base + s) * v_stride + v_base + d];
+            }
+            o_sh[d] += acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // --- Normalize and write output ---
+    float inv_l = (stats[1] > 0.0f) ? (1.0f / stats[1]) : 0.0f;
+    for (uint d = tid; d < head_dim; d += 256) {
+        output_batch[out_off + d] = o_sh[d] * inv_l;
+    }
+}
+
 // ── rope_qk_batch ─────────────────────────────────────────────────────
 // Fused RoPE for both Q and K in a single dispatch, saving one kernel
 // launch + memory barrier per layer. Both Q and K live in the same
@@ -2675,6 +2840,10 @@ fn emit_metal_model_struct(
         "    copy_embedding_batch_pipeline: ComputePipelineState,"
     )?;
     writeln!(code, "    attention_batch_pipeline: ComputePipelineState,")?;
+    writeln!(
+        code,
+        "    attention_flash_batch_pipeline: ComputePipelineState,"
+    )?;
     writeln!(code, "    copy_kv_batch_pipeline: ComputePipelineState,")?;
     writeln!(code, "    rope_qk_batch_pipeline: ComputePipelineState,")?;
     writeln!(
@@ -2903,6 +3072,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         ("add_inplace_batch_pipeline", "add_inplace_batch"),
         ("copy_embedding_batch_pipeline", "copy_embedding_batch"),
         ("attention_batch_pipeline", "attention_batch"),
+        ("attention_flash_batch_pipeline", "attention_flash_batch"),
         ("copy_kv_batch_pipeline", "copy_kv_batch"),
         ("rope_qk_batch_pipeline", "rope_qk_batch"),
         ("copy_kv_both_batch_pipeline", "copy_kv_both_batch"),
@@ -3443,6 +3613,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            add_inplace_batch_pipeline,")?;
     writeln!(code, "            copy_embedding_batch_pipeline,")?;
     writeln!(code, "            attention_batch_pipeline,")?;
+    writeln!(code, "            attention_flash_batch_pipeline,")?;
     writeln!(code, "            copy_kv_batch_pipeline,")?;
     writeln!(code, "            rope_qk_batch_pipeline,")?;
     writeln!(code, "            copy_kv_both_batch_pipeline,")?;
@@ -5667,9 +5838,33 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "        let nkv: u32 = NUM_KV_HEADS as u32;")?;
     writeln!(code, "        let hd: u32 = HEAD_DIM as u32;")?;
     writeln!(code, "        let qs: u32 = q_stride as u32;")?;
+    // The legacy attention_batch kernel materializes a scores[2048] array
+    // in threadgroup memory — fast at short seq_len but silently corrupts
+    // when `base_pos + num_tokens > 2048`.  Switch to the flash kernel
+    // (tiled online softmax, O(head_dim) threadgroup memory, no seq_len
+    // cap) above that boundary.  Below it the legacy kernel is ~15% faster
+    // due to the flash kernel's per-tile barrier overhead at low seq_len.
     writeln!(
         code,
-        "        enc.set_compute_pipeline_state(&self.attention_batch_pipeline);"
+        "        let max_seq = base_pos + num_tokens;"
+    )?;
+    writeln!(
+        code,
+        "        let pipe = if max_seq > 2000 {{"
+    )?;
+    writeln!(
+        code,
+        "            &self.attention_flash_batch_pipeline"
+    )?;
+    writeln!(code, "        }} else {{")?;
+    writeln!(
+        code,
+        "            &self.attention_batch_pipeline"
+    )?;
+    writeln!(code, "        }};")?;
+    writeln!(
+        code,
+        "        enc.set_compute_pipeline_state(pipe);"
     )?;
     writeln!(code, "        enc.set_buffer(0, Some(q_buf), 0);")?;
     writeln!(code, "        enc.set_buffer(1, Some(k_cache), 0);")?;
@@ -7362,6 +7557,38 @@ mod tests {
         assert!(
             model_rs.contains("let down_weight = next_q4_buffer"),
             "Q4_0 model should use next_q4_buffer for down weight"
+        );
+    }
+
+    #[test]
+    fn attention_flash_batch_kernel_wired() {
+        // The legacy attention_batch kernel has a hardcoded scores[2048] cap
+        // which silently overflows for base_pos+num_tokens > 2048.  Flash
+        // attention kernel + tiered dispatch were added in v0.6.x to fix this.
+        let config = minimal_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+        let shaders = generate_metal_shaders(&config);
+
+        assert!(
+            shaders.contains("kernel void attention_flash_batch"),
+            "shaders.metal must contain the attention_flash_batch kernel"
+        );
+        assert!(
+            shaders.contains("FLASH_K_TILE"),
+            "flash kernel must tile K/V with a FLASH_K_TILE constant"
+        );
+        assert!(
+            model_rs.contains("attention_flash_batch_pipeline"),
+            "MetalModel must register the flash attention pipeline"
+        );
+        // Tiered dispatch — legacy below 2000, flash above.
+        assert!(
+            model_rs.contains("max_seq > 2000"),
+            "dispatch_attention_batch must branch on max_seq > 2000"
+        );
+        assert!(
+            model_rs.contains("&self.attention_flash_batch_pipeline"),
+            "dispatch must reference the flash pipeline"
         );
     }
 
