@@ -31,6 +31,8 @@ Apple M5 Pro, Q8_0. Measurements are honest — previous releases reported infla
 |-------|---------------|-------------|-------------------|
 | SmolLM2-135M (~100 tok) | **~3,100** | 1,507 | 2,812 |
 | SmolLM2-135M (~1250 tok) | **~6,000** | — | — |
+| SmolLM2-360M (~321 tok) | **~3,900** | — | — |
+| SmolLM2-360M (~1500 tok) | **~2,350** | — | — |
 | Llama-3.2-1B (~321 tok) | 2,080 | **2,718** | 556 |
 | Llama-3.2-1B (~801 tok) | 2,030 | — | — |
 | Llama-3.2-1B (~1501 tok) | 1,580 | — | — |
