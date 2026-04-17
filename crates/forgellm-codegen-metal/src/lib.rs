@@ -2585,6 +2585,254 @@ kernel void attention_flash_batch(
     }
 }
 
+// ── attention_mma_flash_batch ─────────────────────────────────────────
+// MMA-accelerated flash attention using simdgroup_matrix<half, 8, 8> for
+// both Q·K^T and P·V.  Processes Q_BLOCK=8 tokens of one head per
+// threadgroup (vs 1 token per TG in attention_flash_batch), amortizing
+// K/V loads across 8 Q rows and using hardware matrix-multiply for the
+// arithmetic.
+//
+// Grid: [ceil(M / 8), num_heads, 1], 128 threads (4 simdgroups) per TG.
+// Requires head_dim ≤ FLASH_MMA_MAX_HEAD_DIM (128). Dispatch falls back
+// to attention_batch / attention_flash_batch otherwise.
+//
+// Online softmax recurrence is identical to attention_flash_batch but
+// per-Q-row: each K tile updates m[q], l[q], O[q] for q in 0..8.
+constant constexpr uint FLASH_MMA_Q_BLOCK = 8;
+constant constexpr uint FLASH_MMA_K_BLOCK = 32;
+constant constexpr uint FLASH_MMA_MAX_HEAD_DIM = 128;
+
+kernel void attention_mma_flash_batch(
+    device const float* q_batch      [[buffer(0)]],
+    device const float* k_cache      [[buffer(1)]],
+    device const float* v_cache      [[buffer(2)]],
+    device float* output_batch       [[buffer(3)]],
+    constant uint& M                 [[buffer(4)]],
+    constant uint& base_pos          [[buffer(5)]],
+    constant uint& num_heads         [[buffer(6)]],
+    constant uint& num_kv_heads      [[buffer(7)]],
+    constant uint& head_dim          [[buffer(8)]],
+    constant uint& q_stride          [[buffer(9)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]])
+{
+    uint q_block_start = tgid.x * FLASH_MMA_Q_BLOCK;
+    uint head = tgid.y;
+    if (q_block_start >= M) return;
+    uint q_valid = min((uint)FLASH_MMA_Q_BLOCK, M - q_block_start);
+
+    uint kv_head = head / (num_heads / num_kv_heads);
+    // Causal: Q row q (0..q_valid-1) attends to kv_pos in [0, base_pos + q_block_start + q].
+    // Max attended pos across the block = base_pos + q_block_start + q_valid - 1.
+    uint seq_len = base_pos + q_block_start + q_valid;
+    float scale = fast::rsqrt(float(head_dim));
+
+    uint kv_stride = num_kv_heads * head_dim;
+    uint kv_base_off = kv_head * head_dim;
+
+    // ── Threadgroup memory ──
+    // q_sh:  [Q_BLOCK, head_dim] half  — Q tile, loaded once
+    // k_sh:  [K_BLOCK, head_dim] half  — K tile, refreshed per kv_base iter
+    // v_sh:  [K_BLOCK, head_dim] half  — V tile, refreshed per kv_base iter
+    // s_sh:  [Q_BLOCK, K_BLOCK] float  — raw Q·K^T scores, then scaled+masked
+    // p_sh:  [Q_BLOCK, K_BLOCK] half   — softmax probabilities (for P·V MMA)
+    // o_sh:  [Q_BLOCK, head_dim] float — running output accumulator
+    // m_sh:  [Q_BLOCK] float           — running max per Q row
+    // l_sh:  [Q_BLOCK] float           — running softmax denominator per Q row
+    // scratch: 4*Q_BLOCK floats        — per-row reduction scratch
+    threadgroup half  q_sh[FLASH_MMA_Q_BLOCK * FLASH_MMA_MAX_HEAD_DIM];
+    threadgroup half  k_sh[FLASH_MMA_K_BLOCK * FLASH_MMA_MAX_HEAD_DIM];
+    threadgroup half  v_sh[FLASH_MMA_K_BLOCK * FLASH_MMA_MAX_HEAD_DIM];
+    threadgroup float s_sh[FLASH_MMA_Q_BLOCK * FLASH_MMA_K_BLOCK];
+    threadgroup half  p_sh[FLASH_MMA_Q_BLOCK * FLASH_MMA_K_BLOCK];
+    threadgroup float o_sh[FLASH_MMA_Q_BLOCK * FLASH_MMA_MAX_HEAD_DIM];
+    threadgroup float m_sh[FLASH_MMA_Q_BLOCK];
+    threadgroup float l_sh[FLASH_MMA_Q_BLOCK];
+    threadgroup float scratch[4 * FLASH_MMA_Q_BLOCK];
+
+    // ── Load Q tile (Q_BLOCK rows, head_dim cols), init o_sh=0, m_sh=-INF, l_sh=0 ──
+    uint qblock_elems = FLASH_MMA_Q_BLOCK * head_dim;
+    for (uint i = tid; i < qblock_elems; i += 128) {
+        uint q = i / head_dim;
+        uint d = i % head_dim;
+        if (q < q_valid) {
+            uint q_off = (q_block_start + q) * q_stride + head * head_dim + d;
+            q_sh[q * head_dim + d] = half(q_batch[q_off]);
+        } else {
+            q_sh[q * head_dim + d] = half(0);
+        }
+        o_sh[q * head_dim + d] = 0.0f;
+    }
+    if (tid < FLASH_MMA_Q_BLOCK) {
+        m_sh[tid] = -INFINITY;
+        l_sh[tid] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ── Stream K/V in K_BLOCK chunks ──
+    for (uint kv_base = 0; kv_base < seq_len; kv_base += FLASH_MMA_K_BLOCK) {
+        uint tile_n = min((uint)FLASH_MMA_K_BLOCK, seq_len - kv_base);
+
+        // Load K and V tile into TG memory (as half).
+        uint kv_tile_elems = FLASH_MMA_K_BLOCK * head_dim;
+        for (uint i = tid; i < kv_tile_elems; i += 128) {
+            uint k_pos = i / head_dim;
+            uint d = i % head_dim;
+            if (k_pos < tile_n) {
+                uint off = (kv_base + k_pos) * kv_stride + kv_base_off + d;
+                k_sh[k_pos * head_dim + d] = half(k_cache[off]);
+                v_sh[k_pos * head_dim + d] = half(v_cache[off]);
+            } else {
+                k_sh[k_pos * head_dim + d] = half(0);
+                v_sh[k_pos * head_dim + d] = half(0);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ── Phase 1: S = Q @ K^T via MMA ──
+        // 4 simdgroups × 1 tile each → 4 tiles of [8,8] covering [Q_BLOCK=8, K_BLOCK=32].
+        // Each simdgroup owns S columns [simd_id*8, simd_id*8+8).
+        // Q is [Q_BLOCK, head_dim]; K is [K_BLOCK, head_dim]; we want K^T via transposed load.
+        {
+            simdgroup_matrix<float, 8, 8> C = simdgroup_matrix<float, 8, 8>(0.0f);
+            uint dim_chunks = head_dim / 8;
+            for (uint dc = 0; dc < dim_chunks; dc++) {
+                simdgroup_matrix<half, 8, 8> A, B;
+                // A = Q[0:8, dc*8 : dc*8+8]  (rows of Q, no transpose)
+                simdgroup_load(A, q_sh + dc * 8, head_dim, ulong2(0, 0), false);
+                // B = K^T[dc*8 : dc*8+8, simd_id*8 : simd_id*8+8]
+                // K in TG mem is laid out [K_BLOCK, head_dim]. We load the tile
+                // K[simd_id*8 : simd_id*8+8, dc*8 : dc*8+8] (stride=head_dim) with
+                // transpose=true, which places it in the register as K^T of that sub-block.
+                simdgroup_load(B,
+                    k_sh + (simd_id * 8) * head_dim + dc * 8,
+                    head_dim, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(C, A, B, C);
+            }
+            // Store S tile into s_sh[0..8, simd_id*8..simd_id*8+8], stride=K_BLOCK.
+            simdgroup_store(C, s_sh + simd_id * 8, FLASH_MMA_K_BLOCK);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ── Phase 2a: Apply scale + causal mask in place on s_sh ──
+        // s_sh is [Q_BLOCK=8, K_BLOCK=32] = 256 elements; 128 threads → 2 each.
+        uint s_elems = FLASH_MMA_Q_BLOCK * FLASH_MMA_K_BLOCK;
+        for (uint i = tid; i < s_elems; i += 128) {
+            uint q = i / FLASH_MMA_K_BLOCK;
+            uint k = i % FLASH_MMA_K_BLOCK;
+            uint global_q = q_block_start + q;
+            uint global_kv = kv_base + k;
+            bool valid = (q < q_valid) && (k < tile_n) && (global_kv <= base_pos + global_q);
+            s_sh[i] = valid ? (s_sh[i] * scale) : -INFINITY;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ── Phase 2b: per-row max via simdgroup reduction ──
+        // 4 simdgroups × 2 rows each = 8 rows (= Q_BLOCK).
+        // simd_lane (0..31) covers all K_BLOCK=32 positions in one pass.
+        {
+            uint row_base = simd_id * 2;
+            for (uint qr = 0; qr < 2; qr++) {
+                uint q = row_base + qr;
+                float my = s_sh[q * FLASH_MMA_K_BLOCK + simd_lane];
+                float row_max = simd_max(my);
+                if (simd_lane == 0) {
+                    scratch[q] = row_max;  // tile_max[q]
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ── Phase 2c: update m, alpha, rescale l; publish m_new and alpha ──
+        if (tid < FLASH_MMA_Q_BLOCK) {
+            uint q = tid;
+            float m_old = m_sh[q];
+            float tile_max = scratch[q];
+            float m_new = max(m_old, tile_max);
+            float alpha = (m_old == -INFINITY) ? 0.0f : fast::exp(m_old - m_new);
+            m_sh[q] = m_new;
+            l_sh[q] = l_sh[q] * alpha;
+            // scratch[q]               = m_new   (for phase 2d)
+            // scratch[Q_BLOCK + q]     = alpha   (for phase 3)
+            scratch[q] = m_new;
+            scratch[FLASH_MMA_Q_BLOCK + q] = alpha;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ── Phase 2d: P = exp(S - m_new), populate p_sh (half) and row-sum ──
+        {
+            uint row_base = simd_id * 2;
+            for (uint qr = 0; qr < 2; qr++) {
+                uint q = row_base + qr;
+                float m_new = scratch[q];
+                float p = fast::exp(s_sh[q * FLASH_MMA_K_BLOCK + simd_lane] - m_new);
+                p_sh[q * FLASH_MMA_K_BLOCK + simd_lane] = half(p);
+                float row_sum = simd_sum(p);
+                if (simd_lane == 0) {
+                    scratch[2 * FLASH_MMA_Q_BLOCK + q] = row_sum;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ── Phase 2e: l_sh += tile_sum ──
+        if (tid < FLASH_MMA_Q_BLOCK) {
+            uint q = tid;
+            l_sh[q] += scratch[2 * FLASH_MMA_Q_BLOCK + q];
+        }
+
+        // ── Phase 3: Rescale o_sh[q,:] *= alpha[q] ──
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < qblock_elems; i += 128) {
+            uint q = i / head_dim;
+            float alpha = scratch[FLASH_MMA_Q_BLOCK + q];
+            o_sh[i] *= alpha;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ── Phase 4: O += P @ V via MMA ──
+        // P is [Q_BLOCK=8, K_BLOCK=32] half; V is [K_BLOCK=32, head_dim] half.
+        // Output tile span for this simdgroup: head_dim / 4 dims, divided into 8-wide tiles.
+        // For head_dim=64: 16 dims/sg = 2 tiles.  head_dim=128: 32 dims/sg = 4 tiles.
+        {
+            uint dims_per_sg = head_dim / 4;       // 16 or 32
+            uint tiles_per_sg = dims_per_sg / 8;   // 2 or 4
+            uint sg_d_base = simd_id * dims_per_sg;
+            for (uint t = 0; t < tiles_per_sg; t++) {
+                uint d_base = sg_d_base + t * 8;
+                simdgroup_matrix<float, 8, 8> O_acc;
+                simdgroup_load(O_acc, o_sh + d_base, head_dim, ulong2(0, 0), false);
+                uint k_chunks = FLASH_MMA_K_BLOCK / 8;  // 4
+                for (uint kc = 0; kc < k_chunks; kc++) {
+                    simdgroup_matrix<half, 8, 8> A, B;
+                    simdgroup_load(A, p_sh + kc * 8, FLASH_MMA_K_BLOCK,
+                                   ulong2(0, 0), false);
+                    simdgroup_load(B, v_sh + (kc * 8) * head_dim + d_base, head_dim,
+                                   ulong2(0, 0), false);
+                    simdgroup_multiply_accumulate(O_acc, A, B, O_acc);
+                }
+                simdgroup_store(O_acc, o_sh + d_base, head_dim);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ── Finalize: O /= l, write to output ──
+    for (uint i = tid; i < qblock_elems; i += 128) {
+        uint q = i / head_dim;
+        uint d = i % head_dim;
+        if (q < q_valid) {
+            float l = l_sh[q];
+            float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+            uint token_idx = q_block_start + q;
+            uint out_off = token_idx * num_heads * head_dim + head * head_dim + d;
+            output_batch[out_off] = o_sh[i] * inv_l;
+        }
+    }
+}
+
 // ── rope_qk_batch ─────────────────────────────────────────────────────
 // Fused RoPE for both Q and K in a single dispatch, saving one kernel
 // launch + memory barrier per layer. Both Q and K live in the same
@@ -2842,6 +3090,10 @@ fn emit_metal_model_struct(
         code,
         "    attention_flash_batch_pipeline: ComputePipelineState,"
     )?;
+    writeln!(
+        code,
+        "    attention_mma_flash_batch_pipeline: ComputePipelineState,"
+    )?;
     writeln!(code, "    copy_kv_batch_pipeline: ComputePipelineState,")?;
     writeln!(code, "    rope_qk_batch_pipeline: ComputePipelineState,")?;
     writeln!(
@@ -3071,6 +3323,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         ("copy_embedding_batch_pipeline", "copy_embedding_batch"),
         ("attention_batch_pipeline", "attention_batch"),
         ("attention_flash_batch_pipeline", "attention_flash_batch"),
+        ("attention_mma_flash_batch_pipeline", "attention_mma_flash_batch"),
         ("copy_kv_batch_pipeline", "copy_kv_batch"),
         ("rope_qk_batch_pipeline", "rope_qk_batch"),
         ("copy_kv_both_batch_pipeline", "copy_kv_both_batch"),
@@ -3612,6 +3865,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            copy_embedding_batch_pipeline,")?;
     writeln!(code, "            attention_batch_pipeline,")?;
     writeln!(code, "            attention_flash_batch_pipeline,")?;
+    writeln!(code, "            attention_mma_flash_batch_pipeline,")?;
     writeln!(code, "            copy_kv_batch_pipeline,")?;
     writeln!(code, "            rope_qk_batch_pipeline,")?;
     writeln!(code, "            copy_kv_both_batch_pipeline,")?;
@@ -5852,21 +6106,79 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "        let nkv: u32 = NUM_KV_HEADS as u32;")?;
     writeln!(code, "        let hd: u32 = HEAD_DIM as u32;")?;
     writeln!(code, "        let qs: u32 = q_stride as u32;")?;
-    // The legacy attention_batch kernel materializes a scores[2048] array
-    // in threadgroup memory — fast at short seq_len but silently corrupts
-    // when `base_pos + num_tokens > 2048`.  Switch to the flash kernel
-    // (tiled online softmax, O(head_dim) threadgroup memory, no seq_len
-    // cap) above that boundary.  Below it the legacy kernel is ~15% faster
-    // due to the flash kernel's per-tile barrier overhead at low seq_len.
+    // Attention kernel selection:
+    //   * Legacy `attention_batch` materializes scores[4096] in threadgroup memory
+    //     and uses scalar simdgroup reductions.  Fast at short seq_len, no MMA.
+    //   * `attention_flash_batch` streams K/V with online softmax; no seq cap,
+    //     scalar math, ~7-14 % slower than legacy at long contexts (no MMA).
+    //   * `attention_mma_flash_batch` adds hardware simdgroup_matrix<half, 8, 8>
+    //     MMA for both Q·K^T and P·V, processing Q_BLOCK=8 tokens per TG.
+    //     Gated behind FORGE_MMA_ATTN=1 until verified on all supported models.
+    //     Requires HEAD_DIM ≤ 128 and num_tokens ≥ 8.
     writeln!(code, "        let max_seq = base_pos + num_tokens;")?;
-    // Re-testing after the chunking + scores[4096] fixes showed the flash
-    // kernel is numerically correct — the earlier "garbled output" was from
-    // the scores[2048] overflow, not from flash itself.  Benchmarks show
-    // flash is 7–14% slower than legacy because its online-softmax path has
-    // more per-tile barriers and no MMA acceleration (yet).  Default to the
-    // legacy kernel; keep flash wired up for future use (larger max_seq_len
-    // caps, or as the base for an MMA-accelerated flash variant).
     writeln!(code, "        let _ = max_seq;")?;
+    writeln!(
+        code,
+        "        let use_mma_flash = std::env::var(\"FORGE_MMA_ATTN\")"
+    )?;
+    writeln!(
+        code,
+        "            .map(|v| v == \"1\").unwrap_or(false) && HEAD_DIM <= 128 && num_tokens >= 8;"
+    )?;
+    writeln!(code, "        if use_mma_flash {{")?;
+    writeln!(
+        code,
+        "            let pipe = &self.attention_mma_flash_batch_pipeline;"
+    )?;
+    writeln!(code, "            enc.set_compute_pipeline_state(pipe);")?;
+    writeln!(code, "            enc.set_buffer(0, Some(q_buf), 0);")?;
+    writeln!(code, "            enc.set_buffer(1, Some(k_cache), 0);")?;
+    writeln!(code, "            enc.set_buffer(2, Some(v_cache), 0);")?;
+    writeln!(code, "            enc.set_buffer(3, Some(output), 0);")?;
+    writeln!(
+        code,
+        "            enc.set_bytes(4, mem::size_of::<u32>() as u64, &m_val as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "            enc.set_bytes(5, mem::size_of::<u32>() as u64, &bp as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "            enc.set_bytes(6, mem::size_of::<u32>() as u64, &nh as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "            enc.set_bytes(7, mem::size_of::<u32>() as u64, &nkv as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "            enc.set_bytes(8, mem::size_of::<u32>() as u64, &hd as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "            enc.set_bytes(9, mem::size_of::<u32>() as u64, &qs as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "            // Grid: [ceil(M/8), NUM_HEADS, 1], 128 threads (4 simdgroups) per TG"
+    )?;
+    writeln!(code, "            let tg_size = MTLSize::new(128, 1, 1);")?;
+    writeln!(
+        code,
+        "            let q_blocks = ((num_tokens + 7) / 8) as u64;"
+    )?;
+    writeln!(
+        code,
+        "            let grid_size = MTLSize::new(q_blocks, NUM_HEADS as u64, 1);"
+    )?;
+    writeln!(
+        code,
+        "            enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(code, "            unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
+    writeln!(code, "            return;")?;
+    writeln!(code, "        }}")?;
     writeln!(code, "        let pipe = &self.attention_batch_pipeline;")?;
     writeln!(code, "        enc.set_compute_pipeline_state(pipe);")?;
     writeln!(code, "        enc.set_buffer(0, Some(q_buf), 0);")?;
@@ -7583,6 +7895,36 @@ mod tests {
         assert!(
             model_rs.contains("attention_flash_batch_pipeline"),
             "MetalModel must register the flash attention pipeline"
+        );
+    }
+
+    #[test]
+    fn attention_mma_flash_batch_kernel_wired() {
+        // MMA-accelerated flash attention (issue #212).  Opt-in via
+        // FORGE_MMA_ATTN=1 until default-enabled after broader testing.
+        let config = minimal_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+        let shaders = generate_metal_shaders(&config);
+
+        assert!(
+            shaders.contains("kernel void attention_mma_flash_batch"),
+            "shaders.metal must contain the MMA flash kernel"
+        );
+        assert!(
+            shaders.contains("FLASH_MMA_Q_BLOCK"),
+            "MMA flash kernel must define Q_BLOCK tiling constant"
+        );
+        assert!(
+            shaders.contains("simdgroup_multiply_accumulate"),
+            "MMA flash kernel must use hardware MMA"
+        );
+        assert!(
+            model_rs.contains("attention_mma_flash_batch_pipeline"),
+            "MetalModel must register the MMA flash pipeline"
+        );
+        assert!(
+            model_rs.contains("FORGE_MMA_ATTN"),
+            "dispatch_attention_batch must gate MMA flash on env var"
         );
     }
 
