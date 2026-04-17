@@ -2,6 +2,48 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.6.6] — 2026-04-16 — MMA-Accelerated Flash Attention (opt-in)
+
+New Metal attention kernel using hardware `simdgroup_matrix<half, 8, 8>` MMA for both Q·K^T and P·V, with online softmax and causal masking. Gated behind `FORGE_MMA_ATTN=1` for this release while broader model coverage is verified; default dispatch is unchanged.
+
+### Added
+- **`attention_mma_flash_batch` MSL kernel** (`feat`, opt-in, closes [#212](https://github.com/sauravpanda/forge-llm/issues/212)):
+  - Grid `[ceil(M/8), num_heads, 1]`, 128 threads (4 simdgroups) per TG.
+  - Each simdgroup owns one 8×8 S tile and `head_dim/4` columns of O accumulators.
+  - Threadgroup memory ~13 KB (`head_dim=64`) / ~24 KB (`head_dim=128`).
+  - K loaded with `transpose=true` to get `K^T` view — feeds MMA natively with no pre-transpose pass.
+  - Online softmax recurrence runs **per-Q-row** across `K_BLOCK=32` chunks (`m`, `l`, `O` updated per Q row, not globally).
+  - Requires `HEAD_DIM ≤ 128` and `num_tokens ≥ 8`; falls back to legacy `attention_batch` otherwise.
+- **`FORGE_MMA_ATTN=1` env gate**: set this to route long-prompt attention through the MMA kernel. Unset (default), behavior is identical to v0.6.5.
+
+### Performance (opt-in only)
+
+**Llama-3.2-1B Q8_0 prefill, Apple M5 Pro:**
+
+| Prompt | v0.6.5 | v0.6.6 MMA flash | Δ |
+|-------:|-------:|----------------:|--:|
+| 406 tok | 1,949 | **2,102 tok/s** | +8% |
+| 806 tok | 1,950 | **2,282 tok/s** | +17% |
+| 1,510 tok | 1,531 | **2,081 tok/s** | **+36%** |
+| 3,006 tok | 995 | **1,699 tok/s** | **+71%** |
+
+Gains grow with prompt length because attention cost is `O(M²)` and the MMA path replaces the scalar per-token reduction in the legacy kernel. Short-prompt numbers are within noise because matmul dominates there and the MMA flash kernel shares the same `matmul_q8_mma32*` path for Q/K/V/O projections.
+
+### Correctness
+
+Output is **byte-identical** vs the legacy `attention_batch` kernel on:
+
+- SmolLM2-135M Q8_0 @ 203-token prompt.
+- Llama-3.2-1B Q8_0 @ 406 / 806 / 1,510 / 3,006 token prompts.
+
+### Deferred to v0.7.0
+
+- Verification on Qwen2.5 (QKV-bias path), Phi-3 Mini (`head_dim=96`), and Gemma / StableLM.
+- Default-flip from legacy → MMA flash.
+- README + blog updates with the new numbers (benchmarks recorded but not yet published in the README).
+
+Regression test: `attention_mma_flash_batch_kernel_wired`.
+
 ## [0.6.5] — 2026-04-16 — Docs Polish: Flash Verified, Honest TFLOPS
 
 Docs-only release correcting README claims that were stale after v0.6.4. No code changes to the kernels or dispatch; crates.io package metadata and README are updated.
