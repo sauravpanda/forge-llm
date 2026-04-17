@@ -2,6 +2,18 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.6.5] — 2026-04-16 — Docs Polish: Flash Verified, Honest TFLOPS
+
+Docs-only release correcting README claims that were stale after v0.6.4. No code changes to the kernels or dispatch; crates.io package metadata and README are updated.
+
+### Fixed
+- **Flash attention status**: v0.6.4's README said the `attention_flash_batch` kernel was "shipped but not yet numerically verified." Post-v0.6.4 verification confirmed the kernel is correct (the earlier garbled output was the `scores[2048]` overflow in the *legacy* kernel, not flash). README now states flash is verified and is ~7–14% slower than legacy until MMA support lands; the legacy kernel remains the dispatch default. See [#212](https://github.com/sauravpanda/forge-llm/issues/212) for MMA-accelerated flash.
+- **Inflated TFLOPS claim**: removed "~8.7 TFLOPS sustained on 1B" from the Metal GPU features list. That number originated from the pre-chunking-fix era; the honest v0.6.4 number is ~3.9 TFLOPS at 1,501 tokens (1,580 tok/s × 2·1.24B params).
+- **SmolLM2-360M prefill numbers** added to the README prefill table: ~3,900 tok/s at 321 tokens and ~2,350 tok/s at 1,500 tokens.
+
+### Chore
+- `cargo fmt --all` applied across `forgellm-cli`, `forgellm-codegen-cpu`, and `forgellm-codegen-metal`. No functional change; `cargo fmt --all -- --check` is now clean.
+
 ## [0.6.4] — 2026-04-15 — Long-Prompt Correctness + Honest Numbers
 
 ### Fixed
