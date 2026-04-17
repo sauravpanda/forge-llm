@@ -2,6 +2,41 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.6.7] — 2026-04-17 — Phi-3 Weight Splitting + Qwen2.5 MMA Flash Verified
+
+Weight-loader support for Phi-3 GGUFs (fused `attn_qkv` / `ffn_up` tensors) so the IR graph, interpreter, and AOT export paths that all expect split Llama-style names can consume them unchanged. Also empirically verified the v0.6.6 MMA flash kernel on Qwen2.5-0.5B.
+
+### Added
+- **`split_fused_tensors` / `split_fused_tensors_f32` helpers** in `forgellm-frontend::weight_loader`:
+  - Split a fused `model.layers.N.self_attn.qkv_proj.weight` (Q|K|V concatenated along the output dim) into the three HF-named tensors.
+  - When `mlp.gate_proj.weight` is absent and `mlp.up_proj.weight` has twice the expected size, split it into `gate_proj` and `up_proj` halves.
+  - Q8_0 / Q4_0 splits operate on raw bytes on block boundaries (row counts are always multiples of 32 for current model shapes).
+- **Auto-detect hook** in `load_from_file`, `load_from_file_mixed`, and `load_all`: reads GGUF metadata keys (`{arch}.block_count`, `{arch}.attention.head_count{,_kv}`, `{arch}.feed_forward_length`, `{arch}.embedding_length`) and applies the split when a fused tensor is present. No-op for Llama / Qwen2 / Gemma layouts.
+- **GGUF→HF name remap** for `attn_qkv.weight` → `self_attn.qkv_proj.weight` (placeholder that the split helper replaces with `q_proj` / `k_proj` / `v_proj`).
+- Three new unit tests covering F32 splits, Q8_0 byte-boundary splits, and the no-op path on Llama layouts.
+
+### Fixed
+- **Phi-3 interpreter (`forge run`)** now loads coherently. Previously panicked with `weight not found: model.layers.0.self_attn.q_proj.weight` because `blk.N.attn_qkv.weight` fell through the name remap unchanged.
+
+### Verified (Qwen2.5-0.5B, Apple M5 Pro, Q8_0, MMA flash via `FORGE_MMA_ATTN=1`)
+
+| Prompt | Legacy | MMA flash | Δ |
+|-------:|-------:|----------:|--:|
+| 666 tok | 1,990 | **2,377 tok/s** | +19% |
+| 666 tok (long `FOX`) | 3,730 | **4,515 tok/s** | +21% |
+| 2,501 tok | 2,408 | **3,540 tok/s** | **+47%** |
+
+Output is coherent on both paths (the `#210` QKV-bias export path works correctly under MMA flash). Not byte-identical to legacy — f16 ULP-level differences in the online-softmax recurrence cause divergence ~90 tokens into decode, as expected.
+
+### Known issues
+- **Phi-3 Metal AOT forward pass still produces bad logits** after the weight split — logits collapse to the newline token regardless of prompt. The weight split itself is correct (interpreter output is sane); something else in the Metal codegen path is Phi-3-specific and needs dedicated debugging. Tracked as follow-up work. Phi-3 on the interpreter path works in this release.
+
+### Deferred to v0.7.0
+- Phi-3 Metal forward-pass debugging, then empirical MMA flash verification on Phi-3 (head_dim=96).
+- Gemma / StableLM coverage.
+- Flipping the default from legacy attention → MMA flash.
+- README prefill table + blog refresh.
+
 ## [0.6.6] — 2026-04-16 — MMA-Accelerated Flash Attention (opt-in)
 
 New Metal attention kernel using hardware `simdgroup_matrix<half, 8, 8>` MMA for both Q·K^T and P·V, with online softmax and causal masking. Gated behind `FORGE_MMA_ATTN=1` for this release while broader model coverage is verified; default dispatch is unchanged.

@@ -123,7 +123,9 @@ pub fn load_from_file_mixed(
         tensors.insert(hf_name, weight_data);
     }
 
-    Ok((gguf, ModelWeightsRaw { tensors }))
+    let mut weights = ModelWeightsRaw { tensors };
+    auto_split_fused_tensors_raw(&mut weights, &gguf);
+    Ok((gguf, weights))
 }
 
 /// Loaded model weights — all tensors dequantized to f32.
@@ -194,7 +196,9 @@ pub fn load_all<R: Read + Seek>(
         tensors.insert(hf_name, data);
     }
 
-    Ok(ModelWeights { tensors })
+    let mut weights = ModelWeights { tensors };
+    auto_split_fused_tensors_f32(&mut weights, gguf);
+    Ok(weights)
 }
 
 /// Load all tensors from a GGUF file using memory mapping.
@@ -229,7 +233,9 @@ pub fn load_from_file(path: impl AsRef<Path>) -> Result<(GGUFFile, ModelWeights)
         tensors.insert(hf_name, data);
     }
 
-    Ok((gguf, ModelWeights { tensors }))
+    let mut weights = ModelWeights { tensors };
+    auto_split_fused_tensors_f32(&mut weights, &gguf);
+    Ok((gguf, weights))
 }
 
 /// Remap GGUF tensor names to HuggingFace convention.
@@ -261,6 +267,9 @@ fn gguf_name_to_hf(name: &str) -> String {
                 "attn_k.bias" => "self_attn.k_proj.bias",
                 "attn_v.bias" => "self_attn.v_proj.bias",
                 "attn_output.weight" => "self_attn.o_proj.weight",
+                // Phi-3: Q/K/V concatenated along the output dim in one tensor.
+                // Split post-load via `split_fused_tensors`.
+                "attn_qkv.weight" => "self_attn.qkv_proj.weight",
                 "ffn_norm.weight" => "post_attention_layernorm.weight",
                 "ffn_gate.weight" => "mlp.gate_proj.weight",
                 "ffn_up.weight" => "mlp.up_proj.weight",
@@ -274,6 +283,272 @@ fn gguf_name_to_hf(name: &str) -> String {
 
     // Fallback: return original name
     name.to_string()
+}
+
+/// Auto-detect a fused Phi-3-style layout from the loaded weight map and
+/// the GGUF metadata, then split in place. No-op when neither fused
+/// entry is present (standard Llama/Qwen2/Gemma layouts).
+fn auto_split_fused_tensors_raw(weights: &mut ModelWeightsRaw, gguf: &GGUFFile) {
+    let has_fused_qkv = weights
+        .tensors
+        .contains_key("model.layers.0.self_attn.qkv_proj.weight");
+    let has_fused_ffn = {
+        let gate = "model.layers.0.mlp.gate_proj.weight";
+        let up = "model.layers.0.mlp.up_proj.weight";
+        !weights.tensors.contains_key(gate) && weights.tensors.contains_key(up)
+    };
+    if !has_fused_qkv && !has_fused_ffn {
+        return;
+    }
+    if let Some(params) = fused_params_from_gguf(gguf) {
+        split_fused_tensors(
+            weights,
+            params.num_layers,
+            params.hidden_size,
+            params.num_heads,
+            params.num_kv_heads,
+            params.head_dim,
+            params.intermediate_size,
+        );
+    }
+}
+
+fn auto_split_fused_tensors_f32(weights: &mut ModelWeights, gguf: &GGUFFile) {
+    let has_fused_qkv = weights
+        .tensors
+        .contains_key("model.layers.0.self_attn.qkv_proj.weight");
+    let has_fused_ffn = {
+        let gate = "model.layers.0.mlp.gate_proj.weight";
+        let up = "model.layers.0.mlp.up_proj.weight";
+        !weights.tensors.contains_key(gate) && weights.tensors.contains_key(up)
+    };
+    if !has_fused_qkv && !has_fused_ffn {
+        return;
+    }
+    if let Some(params) = fused_params_from_gguf(gguf) {
+        split_fused_tensors_f32(
+            weights,
+            params.num_layers,
+            params.hidden_size,
+            params.num_heads,
+            params.num_kv_heads,
+            params.head_dim,
+            params.intermediate_size,
+        );
+    }
+}
+
+struct FusedParams {
+    num_layers: usize,
+    hidden_size: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    intermediate_size: usize,
+}
+
+fn fused_params_from_gguf(gguf: &GGUFFile) -> Option<FusedParams> {
+    let arch = gguf.get_str("general.architecture")?.to_string();
+    let num_layers = gguf.get_u32(&format!("{arch}.block_count"))? as usize;
+    let hidden_size = gguf.get_u32(&format!("{arch}.embedding_length"))? as usize;
+    let num_heads = gguf.get_u32(&format!("{arch}.attention.head_count"))? as usize;
+    let num_kv_heads = gguf
+        .get_u32(&format!("{arch}.attention.head_count_kv"))
+        .map(|v| v as usize)
+        .unwrap_or(num_heads);
+    let intermediate_size = gguf
+        .get_u32(&format!("{arch}.feed_forward_length"))
+        .map(|v| v as usize)
+        .unwrap_or(hidden_size * 4);
+    let head_dim = hidden_size / num_heads;
+    Some(FusedParams {
+        num_layers,
+        hidden_size,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        intermediate_size,
+    })
+}
+
+/// Split fused Phi-3-style tensors in place.
+///
+/// Phi-3 GGUFs store attention as one fused `attn_qkv.weight` (Q|K|V
+/// concatenated along the output dim) and MLP as one fused `ffn_up.weight`
+/// (gate|up concatenated). The rest of the pipeline expects HF-split
+/// `q_proj`/`k_proj`/`v_proj` and `gate_proj`/`up_proj`; this helper
+/// rewrites the weight map to that shape. No-op when the fused entries
+/// are not present, so it's safe to call for any architecture.
+///
+/// GGUF byte layout for a tensor with dims=(in_features, out_features)
+/// places the out dim as the outer (slow) index, so concatenated Q|K|V
+/// are contiguous byte ranges. For Q8_0 each section must be block-aligned
+/// (multiple of 32 elements), which holds for all current Phi-3 shapes
+/// (hidden × Q/K/V rows, where rows is a multiple of 32).
+pub fn split_fused_tensors(
+    weights: &mut ModelWeightsRaw,
+    num_layers: usize,
+    hidden_size: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    intermediate_size: usize,
+) {
+    for layer in 0..num_layers {
+        let qkv_name = format!("model.layers.{layer}.self_attn.qkv_proj.weight");
+        if let Some(fused) = weights.tensors.remove(&qkv_name) {
+            let q_elems = hidden_size * num_heads * head_dim;
+            let kv_elems = hidden_size * num_kv_heads * head_dim;
+            let (q, k, v) = split_weight_three(&fused, q_elems, kv_elems, kv_elems);
+            weights
+                .tensors
+                .insert(format!("model.layers.{layer}.self_attn.q_proj.weight"), q);
+            weights
+                .tensors
+                .insert(format!("model.layers.{layer}.self_attn.k_proj.weight"), k);
+            weights
+                .tensors
+                .insert(format!("model.layers.{layer}.self_attn.v_proj.weight"), v);
+        }
+
+        let gate_name = format!("model.layers.{layer}.mlp.gate_proj.weight");
+        let up_name = format!("model.layers.{layer}.mlp.up_proj.weight");
+        if !weights.tensors.contains_key(&gate_name) {
+            let fused_size = weights.tensors.get(&up_name).map(weight_elem_count);
+            let expected_single = hidden_size * intermediate_size;
+            if fused_size == Some(2 * expected_single) {
+                let fused = weights.tensors.remove(&up_name).unwrap();
+                let (gate, up) = split_weight_two(&fused, expected_single, expected_single);
+                weights.tensors.insert(gate_name, gate);
+                weights.tensors.insert(up_name, up);
+            }
+        }
+    }
+}
+
+/// Same as [`split_fused_tensors`] but operates on fully-dequantized
+/// [`ModelWeights`]. Used by the interpreter path where everything is f32.
+pub fn split_fused_tensors_f32(
+    weights: &mut ModelWeights,
+    num_layers: usize,
+    hidden_size: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    intermediate_size: usize,
+) {
+    for layer in 0..num_layers {
+        let qkv_name = format!("model.layers.{layer}.self_attn.qkv_proj.weight");
+        if let Some(fused) = weights.tensors.remove(&qkv_name) {
+            let q_elems = hidden_size * num_heads * head_dim;
+            let kv_elems = hidden_size * num_kv_heads * head_dim;
+            assert_eq!(fused.len(), q_elems + 2 * kv_elems);
+            let q = fused[0..q_elems].to_vec();
+            let k = fused[q_elems..q_elems + kv_elems].to_vec();
+            let v = fused[q_elems + kv_elems..].to_vec();
+            weights
+                .tensors
+                .insert(format!("model.layers.{layer}.self_attn.q_proj.weight"), q);
+            weights
+                .tensors
+                .insert(format!("model.layers.{layer}.self_attn.k_proj.weight"), k);
+            weights
+                .tensors
+                .insert(format!("model.layers.{layer}.self_attn.v_proj.weight"), v);
+        }
+
+        let gate_name = format!("model.layers.{layer}.mlp.gate_proj.weight");
+        let up_name = format!("model.layers.{layer}.mlp.up_proj.weight");
+        if !weights.tensors.contains_key(&gate_name) {
+            let fused_size = weights.tensors.get(&up_name).map(|v| v.len());
+            let expected_single = hidden_size * intermediate_size;
+            if fused_size == Some(2 * expected_single) {
+                let fused = weights.tensors.remove(&up_name).unwrap();
+                let gate = fused[0..expected_single].to_vec();
+                let up = fused[expected_single..].to_vec();
+                weights.tensors.insert(gate_name, gate);
+                weights.tensors.insert(up_name, up);
+            }
+        }
+    }
+}
+
+fn weight_elem_count(w: &WeightData) -> usize {
+    match w {
+        WeightData::F32(v) => v.len(),
+        WeightData::Q8_0Raw(b) => b.len() / 34 * 32,
+        WeightData::Q4_0Raw(b) => b.len() / 18 * 32,
+    }
+}
+
+fn split_weight_three(
+    w: &WeightData,
+    n1: usize,
+    n2: usize,
+    n3: usize,
+) -> (WeightData, WeightData, WeightData) {
+    match w {
+        WeightData::F32(v) => {
+            assert_eq!(v.len(), n1 + n2 + n3);
+            (
+                WeightData::F32(v[0..n1].to_vec()),
+                WeightData::F32(v[n1..n1 + n2].to_vec()),
+                WeightData::F32(v[n1 + n2..].to_vec()),
+            )
+        }
+        WeightData::Q8_0Raw(b) => {
+            let b1 = n1 / 32 * 34;
+            let b2 = n2 / 32 * 34;
+            let b3 = n3 / 32 * 34;
+            assert_eq!(b.len(), b1 + b2 + b3);
+            (
+                WeightData::Q8_0Raw(b[0..b1].to_vec()),
+                WeightData::Q8_0Raw(b[b1..b1 + b2].to_vec()),
+                WeightData::Q8_0Raw(b[b1 + b2..].to_vec()),
+            )
+        }
+        WeightData::Q4_0Raw(b) => {
+            let b1 = n1 / 32 * 18;
+            let b2 = n2 / 32 * 18;
+            let b3 = n3 / 32 * 18;
+            assert_eq!(b.len(), b1 + b2 + b3);
+            (
+                WeightData::Q4_0Raw(b[0..b1].to_vec()),
+                WeightData::Q4_0Raw(b[b1..b1 + b2].to_vec()),
+                WeightData::Q4_0Raw(b[b1 + b2..].to_vec()),
+            )
+        }
+    }
+}
+
+fn split_weight_two(w: &WeightData, n1: usize, n2: usize) -> (WeightData, WeightData) {
+    match w {
+        WeightData::F32(v) => {
+            assert_eq!(v.len(), n1 + n2);
+            (
+                WeightData::F32(v[0..n1].to_vec()),
+                WeightData::F32(v[n1..].to_vec()),
+            )
+        }
+        WeightData::Q8_0Raw(b) => {
+            let b1 = n1 / 32 * 34;
+            let b2 = n2 / 32 * 34;
+            assert_eq!(b.len(), b1 + b2);
+            (
+                WeightData::Q8_0Raw(b[0..b1].to_vec()),
+                WeightData::Q8_0Raw(b[b1..].to_vec()),
+            )
+        }
+        WeightData::Q4_0Raw(b) => {
+            let b1 = n1 / 32 * 18;
+            let b2 = n2 / 32 * 18;
+            assert_eq!(b.len(), b1 + b2);
+            (
+                WeightData::Q4_0Raw(b[0..b1].to_vec()),
+                WeightData::Q4_0Raw(b[b1..].to_vec()),
+            )
+        }
+    }
 }
 
 /// Load a single tensor from a GGUF file, dequantizing to f32.
@@ -1017,6 +1292,110 @@ mod tests {
         let result = dequant_f16(&bytes, 2);
         assert!((result[0] - 1.0).abs() < 1e-6);
         assert!((result[1] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn split_fused_qkv_and_ffn_f32() {
+        // One layer, MHA (heads==kv_heads), hidden=4, heads=2, head_dim=2, intermediate=6.
+        // QKV total = hidden * (heads*head_dim + 2*kv_heads*head_dim) = 4*12 = 48.
+        //   Q = [1..=16], K = [17..=32], V = [33..=48]
+        // ffn total = hidden * 2 * intermediate = 4 * 2 * 6 = 48.
+        //   gate = [1..=24], up = [25..=48]
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "model.layers.0.self_attn.qkv_proj.weight".to_string(),
+            (1..=48).map(|x| x as f32).collect::<Vec<f32>>(),
+        );
+        let gate = (1..=24).map(|x| x as f32).collect::<Vec<f32>>();
+        let up = (25..=48).map(|x| x as f32).collect::<Vec<f32>>();
+        let fused_ffn = gate.iter().chain(up.iter()).copied().collect::<Vec<f32>>();
+        tensors.insert("model.layers.0.mlp.up_proj.weight".to_string(), fused_ffn);
+        let mut weights = ModelWeights { tensors };
+
+        split_fused_tensors_f32(&mut weights, 1, 4, 2, 2, 2, 6);
+
+        assert_eq!(weights.get("model.layers.0.self_attn.q_proj.weight").unwrap().len(), 16);
+        assert_eq!(weights.get("model.layers.0.self_attn.k_proj.weight").unwrap().len(), 16);
+        assert_eq!(weights.get("model.layers.0.self_attn.v_proj.weight").unwrap().len(), 16);
+        assert_eq!(
+            weights.get("model.layers.0.self_attn.q_proj.weight").unwrap(),
+            &(1..=16).map(|x| x as f32).collect::<Vec<f32>>()[..]
+        );
+        assert_eq!(
+            weights.get("model.layers.0.self_attn.v_proj.weight").unwrap(),
+            &(33..=48).map(|x| x as f32).collect::<Vec<f32>>()[..]
+        );
+        assert!(weights
+            .get("model.layers.0.self_attn.qkv_proj.weight")
+            .is_none());
+
+        assert_eq!(weights.get("model.layers.0.mlp.gate_proj.weight").unwrap(), &gate[..]);
+        assert_eq!(weights.get("model.layers.0.mlp.up_proj.weight").unwrap(), &up[..]);
+    }
+
+    #[test]
+    fn split_fused_noop_on_llama_layout() {
+        // Llama has separate q/k/v and gate/up already; split should be a no-op.
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "model.layers.0.self_attn.q_proj.weight".to_string(),
+            vec![1.0f32; 8],
+        );
+        tensors.insert(
+            "model.layers.0.mlp.gate_proj.weight".to_string(),
+            vec![2.0f32; 24],
+        );
+        tensors.insert(
+            "model.layers.0.mlp.up_proj.weight".to_string(),
+            vec![3.0f32; 24],
+        );
+        let mut weights = ModelWeights {
+            tensors: tensors.clone(),
+        };
+        split_fused_tensors_f32(&mut weights, 1, 4, 2, 2, 2, 6);
+        // Nothing added or removed.
+        assert_eq!(weights.tensors.len(), tensors.len());
+        assert_eq!(weights.get("model.layers.0.mlp.up_proj.weight").unwrap().len(), 24);
+    }
+
+    #[test]
+    fn split_fused_qkv_q8_block_boundaries() {
+        // 32 elements per Q8_0 block (34 bytes). Build a fused QKV tensor where
+        // Q, K, V are each one block — ensures our byte-level split lands on
+        // block boundaries.
+        let block_bytes: [u8; 34] = {
+            let mut b = [0u8; 34];
+            b[0] = 0x00; b[1] = 0x3C; // f16 scale = 1.0
+            for i in 0..32 { b[2 + i] = i as u8; }
+            b
+        };
+        let mut q_block = block_bytes;
+        let mut k_block = block_bytes;
+        let mut v_block = block_bytes;
+        q_block[2] = 1; k_block[2] = 2; v_block[2] = 3;
+        let mut fused = Vec::with_capacity(34 * 3);
+        fused.extend_from_slice(&q_block);
+        fused.extend_from_slice(&k_block);
+        fused.extend_from_slice(&v_block);
+
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "model.layers.0.self_attn.qkv_proj.weight".to_string(),
+            WeightData::Q8_0Raw(fused),
+        );
+        let mut weights = ModelWeightsRaw { tensors };
+        // hidden=1, heads=kv_heads=1, head_dim=32, intermediate=0 → Q=K=V= 32 elems each.
+        split_fused_tensors(&mut weights, 1, 1, 1, 1, 32, 0);
+
+        let q = weights.get_q8_raw("model.layers.0.self_attn.q_proj.weight").unwrap();
+        let k = weights.get_q8_raw("model.layers.0.self_attn.k_proj.weight").unwrap();
+        let v = weights.get_q8_raw("model.layers.0.self_attn.v_proj.weight").unwrap();
+        assert_eq!(q.len(), 34);
+        assert_eq!(k.len(), 34);
+        assert_eq!(v.len(), 34);
+        assert_eq!(q[2], 1);
+        assert_eq!(k[2], 2);
+        assert_eq!(v[2], 3);
     }
 
     #[test]
