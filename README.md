@@ -8,7 +8,7 @@ ForgeLLM is a Rust-native ahead-of-time (AOT) ML compiler for language models (1
 
 **Faster than llama.cpp** on Apple Silicon.
 
-[Documentation](https://sauravpanda.github.io/forge-llm/) | [Crates.io](https://crates.io/crates/forgellm-frontend) | [forgellm.dev](https://forgellm.dev) | [Blog: How we beat llama.cpp](blog/beating-llama-cpp.md)
+[Documentation](https://sauravpanda.github.io/forge-llm/) | [Crates.io](https://crates.io/crates/forgellm-frontend) | [forgellm.dev](https://forgellm.dev) | Blog: [How we beat llama.cpp](blog/beating-llama-cpp.md) · [MMA flash + fp16 KV + dispatch fusion](blog/mma-flash-and-decode.md)
 
 ## Performance
 
