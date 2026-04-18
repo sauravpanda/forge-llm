@@ -811,11 +811,24 @@ kernel void attention(
     // most generation steps have short effective context.
     threadgroup float scores[ATTN_SCORES_SIZE];  // max seq_len for generation phase (matches MAX_SEQ_LEN cap)
 
+    // Q·K^T with half4/float4 vectorized loads.
+    // Each simdgroup handles one s; 32 lanes cover head_dim in chunks of 4.
+    // For head_dim=128, every lane does exactly one half4 load (no loop).
+    // For head_dim=64, 16 lanes active; for head_dim=96, 24 lanes.
+    uint head_dim4 = head_dim / 4;
     for (uint s = simd_id; s < seq_len; s += 8) {
         uint k_off = s * num_kv_heads * head_dim + kv_head * head_dim;
         float dot = 0.0;
-        for (uint d = simd_lane; d < head_dim; d += 32) {
-            dot += q[q_off + d] * k_cache[k_off + d];
+        for (uint d4 = simd_lane; d4 < head_dim4; d4 += 32) {
+            uint d = d4 * 4;
+            float4 q4 = *(device const float4*)(q + q_off + d);
+            float4 k4 = float4(*(device const half4*)(k_cache + k_off + d));
+            dot += q4.x * k4.x + q4.y * k4.y + q4.z * k4.z + q4.w * k4.w;
+        }
+        // Scalar fallback for head_dim not divisible by 4 (unused for all
+        // current models: head_dim ∈ {64, 96, 128} are all multiples of 4).
+        for (uint d = head_dim4 * 4 + simd_lane; d < head_dim; d += 32) {
+            dot += q[q_off + d] * float(k_cache[k_off + d]);
         }
         dot = simd_sum(dot);
         if (simd_lane == 0) {
@@ -865,27 +878,36 @@ kernel void attention(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Step 3: Weighted sum of V: output = scores · V
-    // Each thread handles a range of head_dim dimensions.
-    // Process 4 sequence positions at a time for better ILP and reduced
-    // loop overhead (float4 score gather, 4 V loads per iteration).
+    // Step 3: Weighted sum of V: output = scores · V, half4 vectorized.
+    // Mirrors attention_batch prefill: each thread handles 4 d-dims via
+    // half4 loads, with scalar fallback for head_dim not divisible by 4.
     uint seq_len4 = seq_len & ~3u;  // largest multiple of 4 <= seq_len
     uint v_stride = num_kv_heads * head_dim;
-    for (uint d = tid; d < head_dim; d += 256) {
-        float acc = 0.0;
+    for (uint d4 = tid; d4 < head_dim4; d4 += 256) {
+        uint d = d4 * 4;
+        float4 acc = float4(0.0);
         uint v_base = kv_head * head_dim + d;
         for (uint s = 0; s < seq_len4; s += 4) {
             float sc0 = scores[s];
             float sc1 = scores[s + 1];
             float sc2 = scores[s + 2];
             float sc3 = scores[s + 3];
-            acc += sc0 * v_cache[s * v_stride + v_base]
-                 + sc1 * v_cache[(s+1) * v_stride + v_base]
-                 + sc2 * v_cache[(s+2) * v_stride + v_base]
-                 + sc3 * v_cache[(s+3) * v_stride + v_base];
+            acc += sc0 * float4(*(device const half4*)(v_cache + s * v_stride + v_base))
+                 + sc1 * float4(*(device const half4*)(v_cache + (s+1) * v_stride + v_base))
+                 + sc2 * float4(*(device const half4*)(v_cache + (s+2) * v_stride + v_base))
+                 + sc3 * float4(*(device const half4*)(v_cache + (s+3) * v_stride + v_base));
         }
         for (uint s = seq_len4; s < seq_len; s++) {
-            acc += scores[s] * v_cache[s * v_stride + v_base];
+            acc += scores[s] * float4(*(device const half4*)(v_cache + s * v_stride + v_base));
+        }
+        *(device float4*)(output + q_off + d) = acc;
+    }
+    // Scalar fallback for remaining dimensions (unused for current models)
+    for (uint d = head_dim4 * 4 + tid; d < head_dim; d += 256) {
+        float acc = 0.0;
+        uint v_base = kv_head * head_dim + d;
+        for (uint s = 0; s < seq_len; s++) {
+            acc += scores[s] * float(v_cache[s * v_stride + v_base]);
         }
         output[q_off + d] = acc;
     }
@@ -8028,6 +8050,41 @@ mod tests {
         assert!(
             model_rs.contains("dispatch_copy_from_offset_f16"),
             "single-token decode must dispatch the f32->f16 KV copy"
+        );
+    }
+
+    #[test]
+    fn decode_attention_uses_half4_vectorized_loads() {
+        // v0.7.3: the decode `kernel void attention` vectorizes both the
+        // Q·K^T dot product and the scores·V weighted sum via half4 loads
+        // (and float4 stores on output), mirroring the prefill path.
+        let config = minimal_config();
+        let shaders = generate_metal_shaders(&config);
+
+        let start = shaders
+            .find("kernel void attention(")
+            .expect("decode attention kernel missing");
+        // Slice just the decode kernel body — stop at the next kernel.
+        let end_rel = shaders[start + 1..]
+            .find("kernel void ")
+            .expect("next kernel missing");
+        let body = &shaders[start..start + 1 + end_rel];
+
+        assert!(
+            body.contains("device const half4*"),
+            "decode attention must half4-load K/V"
+        );
+        assert!(
+            body.contains("device const float4*"),
+            "decode attention must float4-load Q"
+        );
+        assert!(
+            body.contains("device float4*"),
+            "decode attention must float4-store output"
+        );
+        assert!(
+            body.contains("head_dim4"),
+            "decode attention must iterate head_dim in chunks of 4"
         );
     }
 

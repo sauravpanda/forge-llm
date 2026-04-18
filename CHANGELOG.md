@@ -2,6 +2,33 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.7.3] — 2026-04-18 — Vectorized Decode Attention (Metal)
+
+Patch release: the single-token decode attention kernel (`kernel void attention`) now issues `half4` loads against the f16 KV cache, mirroring the prefill path. Both the Q·K^T dot product and the scores·V weighted sum go through vectorized loads, with a scalar fallback for head_dim not divisible by 4 (unused on current supported architectures — all have head_dim ∈ {64, 96, 128}).
+
+### Changed
+
+- **`kernel void attention` Q·K^T** — scalar `half` loads → `float4`/`half4` loads. Each simdgroup lane now does one vector load instead of up to four scalar loads. At head_dim=128 all 32 lanes load in parallel with no inner loop.
+- **`kernel void attention` scores·V** — scalar `half` loads → `half4` + `float4` stores. Each thread now accumulates 4 d-dims per iteration. Loop structure over `s` (4-wide unroll) preserved.
+- Output writeback via `*(device float4*)` instead of per-element stores.
+
+### Performance (Apple M5 Pro, Q8_0, decode tok/s, median of 3)
+
+| Workload | v0.7.2 | **v0.7.3** | Δ |
+|----------|-------:|-----------:|--:|
+| SmolLM2-135M, ~10-tok decode | 352 | 356 | noise |
+| SmolLM2-135M, decode @ ~900-tok ctx | 174 | **202** | **+16%** |
+| SmolLM2-135M, decode @ ~2250-tok ctx | 84 | **99** | **+18%** |
+| Llama-3.2-1B, ~10-tok decode | 170 | 172 | noise |
+| Llama-3.2-1B, decode @ ~2250-tok ctx | 87 | **96** | **+10%** |
+
+Short-context decode is matmul-bound (projections dominate over attention), so the vectorization is invisible at small KV sizes — expected and correct. Gains scale with context length because decode attention is O(seq_len × head_dim × num_heads), which crosses into the bandwidth-bound regime once KV is large.
+
+### Correctness
+
+- Byte-identical continuation text on SmolLM-135M and Llama-3.2-1B vs v0.7.2 for the "meaning of life" prompt.
+- All 71 Metal codegen tests pass, including new regression `decode_attention_uses_half4_vectorized_loads`.
+
 ## [0.7.2] — 2026-04-17 — Fused Decode-Path Dispatches (Metal)
 
 Patch release: single-token decode now reuses the existing batched `rope_qk_batch` and `copy_kv_both_batch` helpers (with M=1) instead of issuing four separate dispatches per layer. Two fewer dispatches + barriers per layer per decode step.

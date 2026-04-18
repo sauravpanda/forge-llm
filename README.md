@@ -23,6 +23,16 @@ Benchmarks on Apple M5 Pro, 8-bit quantization, 64-token generation.
 | Llama-3.2-1B | **178 tok/s** | 111 tok/s | 130 tok/s | **1.60x** | **1.37x** |
 | Llama-3.2-3B | **70.4 tok/s** | 42.2 tok/s | 67.8 tok/s | **1.67x** | **1.04x** |
 
+### Long-Context Decode (tok/s)
+
+v0.7.3 vectorizes the decode-path attention kernel with `half4` loads (Q·K^T and scores·V), mirroring the prefill kernel. Short-context decode is matmul-bound and unchanged; long-context decode is attention-bound and speeds up meaningfully.
+
+| Model | Context | v0.7.2 | **v0.7.3** | Δ |
+|-------|--------:|-------:|-----------:|--:|
+| SmolLM2-135M | ~900 tok | 174 | **202** | **+16%** |
+| SmolLM2-135M | ~2250 tok | 84 | **99** | **+18%** |
+| Llama-3.2-1B | ~2250 tok | 87 | **96** | **+10%** |
+
 ### Prefill Speed (tok/s, long prompt)
 
 Apple M5 Pro, Q8_0. Numbers below use **v0.7.0 default attention**: MMA-accelerated flash attention (hardware `simdgroup_matrix<half, 8, 8>` for Q·K^T and P·V) activates automatically when `HEAD_DIM ≤ 128` and `num_tokens ≥ 8`. Set `FORGE_MMA_ATTN=0` to force the legacy kernel.
