@@ -2,6 +2,44 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.7.1] — 2026-04-17 — FP16 KV Cache (Metal)
+
+Patch release: KV cache storage changed from f32 (4 bytes/element) to f16 (2 bytes/element). Halves KV RAM footprint and KV read bandwidth during attention.
+
+### Changed
+
+- **KV cache storage: f32 → f16** across all four Metal attention kernels (`attention`, `attention_batch`, `attention_flash_batch`, `attention_mma_flash_batch`).  K/V are read as `device const half*` and upcast to `float` at the multiply-accumulate.  Batched prefill copy kernels (`copy_kv_batch`, `copy_kv_both_batch`) convert f32→f16 on write.
+- **New `copy_f32_to_f16_offset` MSL kernel** + `dispatch_copy_from_offset_f16` helper for the single-token decode path.  The old f32-only `dispatch_copy_from_offset` is no longer used for KV writes.
+- **KV buffer allocation halved**: `kv_cache_bytes = effective_seq_len * num_kv_heads * head_dim * 2` (was `* 4`).
+
+### Performance (Apple M5 Pro, Q8_0)
+
+| Workload | v0.7.0 (f32 KV) | v0.7.1 (f16 KV) | Δ |
+|----------|----------------:|----------------:|--:|
+| Llama-3.2-1B prefill @ 2502 tok | 1,739 | **1,840 tok/s** | +6% |
+| Llama-3.2-1B decode @ 2502-tok ctx | 84.1 | **85.8 tok/s** | +2% |
+| Phi-3 Mini prefill @ 3001 tok | 476 | **496 tok/s** | +4% |
+| Phi-3 Mini decode @ 3001-tok ctx | 29.5 | **30.8 tok/s** | +4% |
+
+Modest speedup at long context — the decode critical path is dominated by weight reads (~1.3 GB for 1B Q8_0 vs ~82 MB f16 KV at 2.5K tokens), so the KV bandwidth savings are ~5-10% of total memory traffic.  The headline win is **~50% KV RAM savings** enabling longer contexts and more concurrent requests.
+
+### Correctness
+
+- Llama-3.2-1B: output **byte-identical** to v0.7.0 on a 40-token decode test ("The theory of relativity was developed by..." → same continuation).
+- Phi-3 Mini: outputs diverge at ~15 tokens due to f16 softmax ULP noise ("Mongols" vs "nomadic tribes") — both coherent and semantically correct.
+
+### Migration
+
+No user action needed. Generated Metal binaries automatically use f16 KV after rebuilding:
+
+```bash
+cargo install --force forgellm-cli   # 0.7.1
+forge compile --model my-model.gguf --output ./my-model --target metal
+# weights.bin unchanged; only KV cache storage changed in the binary
+```
+
+KV cache is runtime state, not stored on disk — no weights.bin migration needed.
+
 ## [0.7.0] — 2026-04-17 — MMA Flash Attention Default-On
 
 Minor release: MMA-accelerated flash attention is now the default Metal attention kernel when `HEAD_DIM ≤ 128` and `num_tokens ≥ 8`. Empirically verified on Llama 3.2, Qwen2.5, and Phi-3 Mini. Set `FORGE_MMA_ATTN=0` as an opt-out escape hatch.

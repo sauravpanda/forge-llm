@@ -446,6 +446,20 @@ kernel void copy_offset(
     if (id < count) dst[id] = src[src_offset + id];
 }
 
+// ── copy_f32_to_f16_offset ──────────────────────────────────────────────
+// Copy f32 elements from src into a half-typed dst, converting to half on
+// write.  Used by the single-token decode path to append a new K/V vector
+// to the f16 KV cache.  Byte offsets into src/dst are supplied via the
+// Metal buffer binding offsets — no in-kernel offsets needed.
+kernel void copy_f32_to_f16_offset(
+    device const float* src     [[buffer(0)]],
+    device half* dst            [[buffer(1)]],
+    constant uint& count        [[buffer(2)]],
+    uint id [[thread_position_in_grid]])
+{
+    if (id < count) dst[id] = half(src[id]);
+}
+
 // ── add_inplace ─────────────────────────────────────────────────────────
 // In-place residual connection: a[i] += b[i]
 // Avoids a separate blit copy for residual add, reducing encoder overhead.
@@ -773,8 +787,8 @@ kernel void matmul_vec_q4(
 //   output:  [num_heads * head_dim]
 kernel void attention(
     device const float* q        [[buffer(0)]],
-    device const float* k_cache  [[buffer(1)]],
-    device const float* v_cache  [[buffer(2)]],
+    device const half*  k_cache  [[buffer(1)]],
+    device const half*  v_cache  [[buffer(2)]],
     device float* output         [[buffer(3)]],
     constant uint& seq_len       [[buffer(4)]],
     constant uint& num_heads     [[buffer(5)]],
@@ -2276,10 +2290,10 @@ kernel void matmul_vec_q4_batch(
 // src layout: [M, qkv_stride] with K/V at src_float_offset within each row.
 // dst layout: contiguous [max_seq, kv_dim] cache.
 kernel void copy_kv_batch(
-    device const float* src  [[buffer(0)]],  // batch QKV buffer
-    device float* dst        [[buffer(1)]],  // KV cache
+    device const float* src  [[buffer(0)]],  // batch QKV buffer (f32)
+    device half* dst         [[buffer(1)]],  // KV cache (f16)
     constant uint& M         [[buffer(2)]],  // num tokens in batch
-    constant uint& kv_dim    [[buffer(3)]],  // floats per KV vector
+    constant uint& kv_dim    [[buffer(3)]],  // elements per KV vector
     constant uint& base_pos  [[buffer(4)]],  // starting position in cache
     constant uint& src_stride [[buffer(5)]], // floats per row in src (qkv_rows)
     constant uint& src_offset [[buffer(6)]], // float offset within each src row
@@ -2291,7 +2305,7 @@ kernel void copy_kv_batch(
     uint d = id % kv_dim;
     uint dst_off = (base_pos + token) * kv_dim + d;
     uint src_off = token * src_stride + src_offset + d;
-    dst[dst_off] = src[src_off];
+    dst[dst_off] = half(src[src_off]);
 }
 
 // ── attention_batch ───────────────────────────────────────────────────
@@ -2301,8 +2315,8 @@ kernel void copy_kv_batch(
 // Causal masking: token i can only attend to positions 0..base_pos+i.
 kernel void attention_batch(
     device const float* q_batch      [[buffer(0)]],  // batch QKV buf (strided)
-    device const float* k_cache      [[buffer(1)]],  // [max_seq, num_kv_heads * head_dim]
-    device const float* v_cache      [[buffer(2)]],  // [max_seq, num_kv_heads * head_dim]
+    device const half*  k_cache      [[buffer(1)]],  // [max_seq, num_kv_heads * head_dim] f16
+    device const half*  v_cache      [[buffer(2)]],  // [max_seq, num_kv_heads * head_dim] f16
     device float* output_batch       [[buffer(3)]],  // [M, num_heads * head_dim]
     constant uint& M                 [[buffer(4)]],  // num tokens in batch
     constant uint& base_pos          [[buffer(5)]],  // starting position in KV cache
@@ -2399,13 +2413,13 @@ kernel void attention_batch(
             float sc1 = scores[s + 1];
             float sc2 = scores[s + 2];
             float sc3 = scores[s + 3];
-            acc += sc0 * *(device const float4*)(v_cache + s * v_stride + v_base)
-                 + sc1 * *(device const float4*)(v_cache + (s+1) * v_stride + v_base)
-                 + sc2 * *(device const float4*)(v_cache + (s+2) * v_stride + v_base)
-                 + sc3 * *(device const float4*)(v_cache + (s+3) * v_stride + v_base);
+            acc += sc0 * float4(*(device const half4*)(v_cache + s * v_stride + v_base))
+                 + sc1 * float4(*(device const half4*)(v_cache + (s+1) * v_stride + v_base))
+                 + sc2 * float4(*(device const half4*)(v_cache + (s+2) * v_stride + v_base))
+                 + sc3 * float4(*(device const half4*)(v_cache + (s+3) * v_stride + v_base));
         }
         for (uint s = seq_len4; s < seq_len; s++) {
-            acc += scores[s] * *(device const float4*)(v_cache + s * v_stride + v_base);
+            acc += scores[s] * float4(*(device const half4*)(v_cache + s * v_stride + v_base));
         }
         *(device float4*)(output_batch + out_off + d) = acc;
     }
@@ -2443,8 +2457,8 @@ constant constexpr uint FLASH_MAX_HEAD_DIM = 256;
 
 kernel void attention_flash_batch(
     device const float* q_batch      [[buffer(0)]],  // batch QKV buf (strided)
-    device const float* k_cache      [[buffer(1)]],  // [max_seq, num_kv_heads * head_dim]
-    device const float* v_cache      [[buffer(2)]],  // [max_seq, num_kv_heads * head_dim]
+    device const half*  k_cache      [[buffer(1)]],  // [max_seq, num_kv_heads * head_dim] f16
+    device const half*  v_cache      [[buffer(2)]],  // [max_seq, num_kv_heads * head_dim] f16
     device float* output_batch       [[buffer(3)]],  // [M, num_heads * head_dim]
     constant uint& M                 [[buffer(4)]],
     constant uint& base_pos          [[buffer(5)]],
@@ -2604,8 +2618,8 @@ constant constexpr uint FLASH_MMA_MAX_HEAD_DIM = 128;
 
 kernel void attention_mma_flash_batch(
     device const float* q_batch      [[buffer(0)]],
-    device const float* k_cache      [[buffer(1)]],
-    device const float* v_cache      [[buffer(2)]],
+    device const half*  k_cache      [[buffer(1)]],
+    device const half*  v_cache      [[buffer(2)]],
     device float* output_batch       [[buffer(3)]],
     constant uint& M                 [[buffer(4)]],
     constant uint& base_pos          [[buffer(5)]],
@@ -2889,11 +2903,11 @@ kernel void rope_qk_batch(
 // the strided batch QKV buffer to their respective KV cache buffers.
 // Saves one kernel launch + memory barrier per layer vs two copy_kv_batch calls.
 kernel void copy_kv_both_batch(
-    device const float* src    [[buffer(0)]],  // batch QKV buffer [M, qkv_stride]
-    device float* k_dst        [[buffer(1)]],  // K cache [max_seq, kv_dim]
-    device float* v_dst        [[buffer(2)]],  // V cache [max_seq, kv_dim]
+    device const float* src    [[buffer(0)]],  // batch QKV buffer [M, qkv_stride] f32
+    device half* k_dst         [[buffer(1)]],  // K cache [max_seq, kv_dim] f16
+    device half* v_dst         [[buffer(2)]],  // V cache [max_seq, kv_dim] f16
     constant uint& M           [[buffer(3)]],  // num tokens in batch
-    constant uint& kv_dim      [[buffer(4)]],  // floats per KV vector
+    constant uint& kv_dim      [[buffer(4)]],  // elements per KV vector
     constant uint& base_pos    [[buffer(5)]],  // starting position in cache
     constant uint& src_stride  [[buffer(6)]],  // floats per row in src (qkv_stride)
     constant uint& k_offset    [[buffer(7)]],  // float offset of K within each src row
@@ -2913,9 +2927,9 @@ kernel void copy_kv_both_batch(
     uint src_off = token * src_stride + (is_v ? v_offset : k_offset) + d;
 
     if (is_v) {
-        v_dst[dst_off] = src[src_off];
+        v_dst[dst_off] = half(src[src_off]);
     } else {
-        k_dst[dst_off] = src[src_off];
+        k_dst[dst_off] = half(src[src_off]);
     }
 }
 "#
@@ -3045,6 +3059,10 @@ fn emit_metal_model_struct(
     writeln!(code, "    add_inplace_pipeline: ComputePipelineState,")?;
     writeln!(code, "    copy_pipeline: ComputePipelineState,")?;
     writeln!(code, "    copy_offset_pipeline: ComputePipelineState,")?;
+    writeln!(
+        code,
+        "    copy_f32_to_f16_offset_pipeline: ComputePipelineState,"
+    )?;
     writeln!(code)?;
     writeln!(code, "    // ── Batched prefill pipelines ──")?;
     writeln!(code, "    matmul_batch_pipeline: ComputePipelineState,")?;
@@ -3307,6 +3325,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         ("add_inplace_pipeline", "add_inplace"),
         ("copy_pipeline", "copy_buffer"),
         ("copy_offset_pipeline", "copy_offset"),
+        ("copy_f32_to_f16_offset_pipeline", "copy_f32_to_f16_offset"),
         ("matmul_batch_pipeline", "matmul_vec_batch"),
         ("matmul_q8_batch_pipeline", "matmul_vec_q8_batch"),
         ("matmul_q8_gemm_batch_pipeline", "matmul_q8_gemm_batch"),
@@ -3694,7 +3713,9 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     let _kv_dim_bytes = kv_dim * 4;
     let intermediate_bytes = intermediate * 4;
     let vocab_bytes = vocab * 4;
-    let kv_cache_bytes = effective_seq_len * num_kv_heads * head_dim * 4;
+    // KV cache is stored as f16 (2 bytes/element) to halve attention memory
+    // bandwidth in long-context decode.
+    let kv_cache_bytes = effective_seq_len * num_kv_heads * head_dim * 2;
 
     writeln!(
         code,
@@ -3849,6 +3870,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            add_inplace_pipeline,")?;
     writeln!(code, "            copy_pipeline,")?;
     writeln!(code, "            copy_offset_pipeline,")?;
+    writeln!(code, "            copy_f32_to_f16_offset_pipeline,")?;
     writeln!(code, "            matmul_batch_pipeline,")?;
     writeln!(code, "            matmul_q8_batch_pipeline,")?;
     writeln!(code, "            matmul_q8_gemm_batch_pipeline,")?;
@@ -4061,11 +4083,11 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "                let kv_offset = pos * {kv_dim};")?;
     writeln!(
         code,
-        "                self.dispatch_copy_from_offset(&enc, &self.qkv_buf, {k_byte_offset}, &self.k_cache[layer], kv_offset, {kv_dim});"
+        "                self.dispatch_copy_from_offset_f16(&enc, &self.qkv_buf, {k_byte_offset}, &self.k_cache[layer], kv_offset, {kv_dim});"
     )?;
     writeln!(
         code,
-        "                self.dispatch_copy_from_offset(&enc, &self.qkv_buf, {v_byte_offset}, &self.v_cache[layer], kv_offset, {kv_dim});"
+        "                self.dispatch_copy_from_offset_f16(&enc, &self.qkv_buf, {v_byte_offset}, &self.v_cache[layer], kv_offset, {kv_dim});"
     )?;
     writeln!(code)?;
     writeln!(
@@ -4260,11 +4282,11 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "                let kv_offset = pos * {kv_dim};")?;
     writeln!(
         code,
-        "                self.dispatch_copy_from_offset(&enc, &self.qkv_buf, {k_byte_offset}, &self.k_cache[layer], kv_offset, {kv_dim});"
+        "                self.dispatch_copy_from_offset_f16(&enc, &self.qkv_buf, {k_byte_offset}, &self.k_cache[layer], kv_offset, {kv_dim});"
     )?;
     writeln!(
         code,
-        "                self.dispatch_copy_from_offset(&enc, &self.qkv_buf, {v_byte_offset}, &self.v_cache[layer], kv_offset, {kv_dim});"
+        "                self.dispatch_copy_from_offset_f16(&enc, &self.qkv_buf, {v_byte_offset}, &self.v_cache[layer], kv_offset, {kv_dim});"
     )?;
     writeln!(
         code,
@@ -5204,6 +5226,49 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(
         code,
         "        enc.set_buffer(1, Some(dst), (dst_float_offset * mem::size_of::<f32>()) as u64);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(2, mem::size_of::<u32>() as u64, &n as *const u32 as *const _);"
+    )?;
+    writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
+    writeln!(
+        code,
+        "        let grid_size = MTLSize::new(((count + 255) / 256) as u64, 1, 1);"
+    )?;
+    writeln!(
+        code,
+        "        enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
+
+    // dispatch_copy_from_offset_f16 (copy src[src_byte_offset..] -> f16 dst[dst_elem_offset..])
+    writeln!(
+        code,
+        "    /// Dispatch f32 -> f16 copy from src at byte offset to half-typed dst at element offset."
+    )?;
+    writeln!(
+        code,
+        "    /// Used for single-token decode KV cache updates (f32 QKV buf -> f16 KV cache)."
+    )?;
+    writeln!(
+        code,
+        "    fn dispatch_copy_from_offset_f16(&self, enc: &ComputeCommandEncoderRef, src: &Buffer, src_byte_offset: usize, dst: &Buffer, dst_elem_offset: usize, count: usize) {{"
+    )?;
+    writeln!(code, "        let n: u32 = count as u32;")?;
+    writeln!(
+        code,
+        "        enc.set_compute_pipeline_state(&self.copy_f32_to_f16_offset_pipeline);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_buffer(0, Some(src), src_byte_offset as u64);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_buffer(1, Some(dst), (dst_elem_offset * 2) as u64);"
     )?;
     writeln!(
         code,
@@ -7899,6 +7964,55 @@ mod tests {
         assert!(
             model_rs.contains("attention_flash_batch_pipeline"),
             "MetalModel must register the flash attention pipeline"
+        );
+    }
+
+    #[test]
+    fn kv_cache_stored_as_f16() {
+        // v0.7.1: KV cache is f16 (2 bytes/element) instead of f32 to halve
+        // attention memory bandwidth and KV RAM footprint.  All attention
+        // kernels must read K/V as `device const half*`; copy kernels must
+        // write half; the f32->f16 copy kernel must be wired for single-
+        // token decode KV writes.
+        let config = minimal_config();
+        let shaders = generate_metal_shaders(&config);
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        for kernel in [
+            "kernel void attention(",
+            "kernel void attention_batch(",
+            "kernel void attention_flash_batch(",
+            "kernel void attention_mma_flash_batch(",
+        ] {
+            let start = shaders
+                .find(kernel)
+                .unwrap_or_else(|| panic!("kernel {kernel} missing"));
+            // Slice through the signature block — scan for "){" which closes
+            // the parameter list at the top of every kernel's body.
+            let sig_end = shaders[start..]
+                .find("){")
+                .unwrap_or_else(|| shaders[start..].find(") {").unwrap());
+            let sig = &shaders[start..start + sig_end];
+            assert!(
+                sig.contains("device const half*")
+                    && sig.contains("k_cache")
+                    && sig.contains("v_cache"),
+                "{kernel} must read k_cache/v_cache as `device const half*`"
+            );
+            assert!(
+                !sig.contains("device const float* k_cache")
+                    && !sig.contains("device const float*  k_cache"),
+                "{kernel} still reads k_cache as float"
+            );
+        }
+
+        assert!(
+            shaders.contains("kernel void copy_f32_to_f16_offset"),
+            "f32->f16 copy kernel must be present for single-token decode KV writes"
+        );
+        assert!(
+            model_rs.contains("dispatch_copy_from_offset_f16"),
+            "single-token decode must dispatch the f32->f16 KV copy"
         );
     }
 
