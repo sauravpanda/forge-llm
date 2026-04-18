@@ -25,20 +25,22 @@ Benchmarks on Apple M5 Pro, 8-bit quantization, 64-token generation.
 
 ### Prefill Speed (tok/s, long prompt)
 
-Apple M5 Pro, Q8_0. Measurements are honest — previous releases reported inflated numbers for prompts longer than 512 tokens because `forward_prefill_batch` silently truncated to 512 tokens. The chunking fix (v0.6.4) correctly processes the full prompt; numbers below reflect the real end-to-end prefill time.
+Apple M5 Pro, Q8_0. Numbers below use **v0.7.0 default attention**: MMA-accelerated flash attention (hardware `simdgroup_matrix<half, 8, 8>` for Q·K^T and P·V) activates automatically when `HEAD_DIM ≤ 128` and `num_tokens ≥ 8`. Set `FORGE_MMA_ATTN=0` to force the legacy kernel.
 
-| Model | ForgeLLM Metal | MLX (8-bit) | llama.cpp (Q8_0) |
-|-------|---------------|-------------|-------------------|
-| SmolLM2-135M (~100 tok) | **~3,100** | 1,507 | 2,812 |
-| SmolLM2-135M (~1250 tok) | **~6,000** | — | — |
-| SmolLM2-360M (~321 tok) | **~3,900** | — | — |
-| SmolLM2-360M (~1500 tok) | **~2,350** | — | — |
-| Llama-3.2-1B (~321 tok) | 2,080 | **2,718** | 556 |
-| Llama-3.2-1B (~801 tok) | 2,030 | — | — |
-| Llama-3.2-1B (~1501 tok) | 1,580 | — | — |
-| Llama-3.2-1B (~3001 tok) | 1,010 | — | — |
+| Model | ForgeLLM Metal | Legacy (opt-out) | MLX (8-bit) | llama.cpp (Q8_0) |
+|-------|---------------|-----------------:|-------------|-------------------|
+| SmolLM2-135M (~100 tok) | **~3,100** | ~3,100 | 1,507 | 2,812 |
+| SmolLM2-135M (~1250 tok) | **~6,000** | ~6,000 | — | — |
+| Llama-3.2-1B (~801 tok) | **2,282** | 1,950 | — | — |
+| Llama-3.2-1B (~1501 tok) | **2,081** | 1,531 | — | — |
+| Llama-3.2-1B (~2501 tok) | **1,775** | 1,134 | — | — |
+| Llama-3.2-1B (~3001 tok) | **1,699** | 995 | — | — |
+| Qwen2.5-0.5B (~666 tok) | **4,515** | 3,730 | — | — |
+| Qwen2.5-0.5B (~2501 tok) | **3,540** | 2,408 | — | — |
+| Phi-3-mini (~1201 tok) | **607** | 465 | — | — |
+| Phi-3-mini (~3001 tok) | **480** | 278 | — | — |
 
-Prefill uses hardware matrix-multiply via `simdgroup_matrix<float, 8, 8>`. The 32×32 MMA kernels (`matmul_q8_mma32` / `matmul_q8_mma32_h4` / `matmul_q8_mma32_hh4`) are well-optimized for the matmul portion of the forward pass. Throughput drops with prompt length because attention is O(M²) and the current kernel computes a full scores matrix up to `effective_seq_len`. A tiled flash-attention kernel is shipped and numerically verified, but currently ~7–14% slower than the legacy kernel (no MMA yet), so legacy is the default. MMA-accelerated flash attention is tracked in [#212](https://github.com/sauravpanda/forge-llm/issues/212).
+Gains grow with prompt length because attention is O(M²) and the MMA path replaces scalar simdgroup reductions with hardware 8×8×8 matrix multiplies. Short-prompt numbers are within noise because matmul dominates there (MMA-flash and legacy share the same Q/K/V/O projection kernels).
 
 ### Deploy Size
 
@@ -130,8 +132,8 @@ ForgeLLM compiles models into hardware-specific code:
 |-------------|--------|---------------------------|---------------|
 | LlamaForCausalLM | SmolLM2 (135M, 360M, 1.7B), Llama 3.2 (1B, 3B), TinyLlama | ✅ Verified | ✅ Verified |
 | Qwen2ForCausalLM | Qwen2.5 (0.5B–7B) | ✅ Verified | ✅ Verified (0.5B Q8_0 on CPU + Metal; fixes [#210](https://github.com/sauravpanda/forge-llm/issues/210)) |
+| Phi3ForCausalLM | Phi-3 Mini | ✅ Verified | ✅ Verified (Phi-3 Mini Q8_0 on Metal; fused QKV/gate+up split at load time in v0.6.7) |
 | MistralForCausalLM | Mistral 7B (sliding-window attention) | ✅ Verified | ⚠️ Untested with v0.6.x MMA kernels |
-| Phi3ForCausalLM | Phi-3 Mini | ✅ Verified | ⚠️ Untested with v0.6.x MMA kernels |
 | GemmaForCausalLM | Gemma 2B, 7B | ✅ Verified | ⚠️ Untested with v0.6.x MMA kernels |
 | StableLMForCausalLM | StableLM 1.6B, 3B | ✅ Verified | ⚠️ Untested with v0.6.x MMA kernels |
 

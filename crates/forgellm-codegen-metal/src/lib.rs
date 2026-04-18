@@ -6116,17 +6116,18 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     //     scalar math, ~7-14 % slower than legacy at long contexts (no MMA).
     //   * `attention_mma_flash_batch` adds hardware simdgroup_matrix<half, 8, 8>
     //     MMA for both Q·K^T and P·V, processing Q_BLOCK=8 tokens per TG.
-    //     Gated behind FORGE_MMA_ATTN=1 until verified on all supported models.
-    //     Requires HEAD_DIM ≤ 128 and num_tokens ≥ 8.
+    //     Default path when HEAD_DIM ≤ 128 and num_tokens ≥ 8 (verified on
+    //     Llama, Qwen2.5, Phi-3).  Set FORGE_MMA_ATTN=0 to force legacy.
     writeln!(code, "        let max_seq = base_pos + num_tokens;")?;
     writeln!(code, "        let _ = max_seq;")?;
     writeln!(
         code,
-        "        let use_mma_flash = std::env::var(\"FORGE_MMA_ATTN\")"
+        "        let mma_opt_out = std::env::var(\"FORGE_MMA_ATTN\")"
     )?;
+    writeln!(code, "            .map(|v| v == \"0\").unwrap_or(false);")?;
     writeln!(
         code,
-        "            .map(|v| v == \"1\").unwrap_or(false) && HEAD_DIM <= 128 && num_tokens >= 8;"
+        "        let use_mma_flash = !mma_opt_out && HEAD_DIM <= 128 && num_tokens >= 8;"
     )?;
     writeln!(code, "        if use_mma_flash {{")?;
     writeln!(
@@ -7903,8 +7904,8 @@ mod tests {
 
     #[test]
     fn attention_mma_flash_batch_kernel_wired() {
-        // MMA-accelerated flash attention (issue #212).  Opt-in via
-        // FORGE_MMA_ATTN=1 until default-enabled after broader testing.
+        // MMA-accelerated flash attention (issue #212).  Default-on in v0.7.0
+        // when HEAD_DIM ≤ 128 and num_tokens ≥ 8.  FORGE_MMA_ATTN=0 opts out.
         let config = minimal_config();
         let model_rs = generate_model_rs(&config).unwrap();
         let shaders = generate_metal_shaders(&config);
@@ -7926,8 +7927,12 @@ mod tests {
             "MetalModel must register the MMA flash pipeline"
         );
         assert!(
-            model_rs.contains("FORGE_MMA_ATTN"),
-            "dispatch_attention_batch must gate MMA flash on env var"
+            model_rs.contains("mma_opt_out"),
+            "dispatch_attention_batch must read FORGE_MMA_ATTN as opt-out"
+        );
+        assert!(
+            model_rs.contains("!mma_opt_out && HEAD_DIM <= 128 && num_tokens >= 8"),
+            "MMA flash must be default-on when HEAD_DIM ≤ 128 and num_tokens ≥ 8"
         );
     }
 

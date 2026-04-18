@@ -2,6 +2,59 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.7.0] — 2026-04-17 — MMA Flash Attention Default-On
+
+Minor release: MMA-accelerated flash attention is now the default Metal attention kernel when `HEAD_DIM ≤ 128` and `num_tokens ≥ 8`. Empirically verified on Llama 3.2, Qwen2.5, and Phi-3 Mini. Set `FORGE_MMA_ATTN=0` as an opt-out escape hatch.
+
+### Changed
+- **`dispatch_attention_batch` default flipped** from legacy `attention_batch` to `attention_mma_flash_batch`:
+  - Dispatch criterion: `!FORGE_MMA_ATTN=0 && HEAD_DIM <= 128 && num_tokens >= 8`.
+  - v0.6.6 required `FORGE_MMA_ATTN=1` to enable.  v0.7.0 inverts the gate.
+  - Regression test `attention_mma_flash_batch_kernel_wired` updated to assert the new default and the opt-out conditions.
+
+### Verified (Apple M5 Pro, Q8_0, prefill tok/s)
+
+| Model | Legacy (opt-out) | v0.7.0 default (MMA flash) | Δ |
+|-------|-----------------:|--------------------------:|--:|
+| Llama-3.2-1B @ 2,501 tok | 1,134 | **1,775** | +56% |
+| Llama-3.2-1B @ 3,006 tok | 995 | **1,699** | +71% |
+| Qwen2.5-0.5B @ 666 tok | 3,730 | **4,515** | +21% |
+| Qwen2.5-0.5B @ 2,501 tok | 2,408 | **3,540** | +47% |
+| Phi-3 Mini @ 1,201 tok | 465 | **607** | +30% |
+| Phi-3 Mini @ 3,001 tok | 278 | **480** | +73% |
+
+### Correctness
+
+- **Llama 3.2 (GQA 4:1, head_dim=64)**: byte-identical to legacy on SmolLM2-135M @ 203 tok and Llama-3.2-1B @ 406/806/1510/3006 tok (v0.6.6 verification).
+- **Qwen2.5 (GQA 7:1 + QKV bias, head_dim=64)**: coherent on both paths; ULP-level softmax divergence ~90 tokens into decode, top-5 token rankings identical at the prefill boundary.
+- **Phi-3 Mini (MHA, head_dim=96)**: top-5 logits identical to legacy across all prompts tested; output text coherent and matches the HF reference behavior.
+
+### Documentation correction (supersedes v0.6.7 CHANGELOG)
+
+The v0.6.7 release notes listed Phi-3 Metal AOT as broken ("logits collapse to newline"). That was a misread of greedy-decode degeneration — the forward pass was always correct once the v0.6.7 weight split landed. Phi-3 Metal now tests green end-to-end and is the headline verification target for this release.
+
+### Migration from v0.6.x
+
+No code changes required. Rebuild and redeploy:
+
+```bash
+cargo install --force forgellm-cli   # 0.7.0
+forge compile --model my-model.gguf --output ./my-model --target metal
+# rebuild and run; MMA flash dispatches automatically on prompts ≥ 8 tokens
+```
+
+To pin to the v0.6.6 behavior while validating in your environment:
+
+```bash
+FORGE_MMA_ATTN=0 ./my-model weights.bin tokenizer.json "..."
+```
+
+### Deferred to v0.7.x / v0.8.0
+
+- Gemma (head_dim=256, exercises the legacy fallback path).
+- StableLM / Mistral Metal AOT coverage.
+- Blog post covering the MMA flash kernel design.
+
 ## [0.6.7] — 2026-04-17 — Phi-3 Weight Splitting + Qwen2.5 MMA Flash Verified
 
 Weight-loader support for Phi-3 GGUFs (fused `attn_qkv` / `ffn_up` tensors) so the IR graph, interpreter, and AOT export paths that all expect split Llama-style names can consume them unchanged. Also empirically verified the v0.6.6 MMA flash kernel on Qwen2.5-0.5B.

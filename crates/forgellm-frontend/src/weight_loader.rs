@@ -1314,23 +1314,51 @@ mod tests {
 
         split_fused_tensors_f32(&mut weights, 1, 4, 2, 2, 2, 6);
 
-        assert_eq!(weights.get("model.layers.0.self_attn.q_proj.weight").unwrap().len(), 16);
-        assert_eq!(weights.get("model.layers.0.self_attn.k_proj.weight").unwrap().len(), 16);
-        assert_eq!(weights.get("model.layers.0.self_attn.v_proj.weight").unwrap().len(), 16);
         assert_eq!(
-            weights.get("model.layers.0.self_attn.q_proj.weight").unwrap(),
+            weights
+                .get("model.layers.0.self_attn.q_proj.weight")
+                .unwrap()
+                .len(),
+            16
+        );
+        assert_eq!(
+            weights
+                .get("model.layers.0.self_attn.k_proj.weight")
+                .unwrap()
+                .len(),
+            16
+        );
+        assert_eq!(
+            weights
+                .get("model.layers.0.self_attn.v_proj.weight")
+                .unwrap()
+                .len(),
+            16
+        );
+        assert_eq!(
+            weights
+                .get("model.layers.0.self_attn.q_proj.weight")
+                .unwrap(),
             &(1..=16).map(|x| x as f32).collect::<Vec<f32>>()[..]
         );
         assert_eq!(
-            weights.get("model.layers.0.self_attn.v_proj.weight").unwrap(),
+            weights
+                .get("model.layers.0.self_attn.v_proj.weight")
+                .unwrap(),
             &(33..=48).map(|x| x as f32).collect::<Vec<f32>>()[..]
         );
         assert!(weights
             .get("model.layers.0.self_attn.qkv_proj.weight")
             .is_none());
 
-        assert_eq!(weights.get("model.layers.0.mlp.gate_proj.weight").unwrap(), &gate[..]);
-        assert_eq!(weights.get("model.layers.0.mlp.up_proj.weight").unwrap(), &up[..]);
+        assert_eq!(
+            weights.get("model.layers.0.mlp.gate_proj.weight").unwrap(),
+            &gate[..]
+        );
+        assert_eq!(
+            weights.get("model.layers.0.mlp.up_proj.weight").unwrap(),
+            &up[..]
+        );
     }
 
     #[test]
@@ -1355,7 +1383,13 @@ mod tests {
         split_fused_tensors_f32(&mut weights, 1, 4, 2, 2, 2, 6);
         // Nothing added or removed.
         assert_eq!(weights.tensors.len(), tensors.len());
-        assert_eq!(weights.get("model.layers.0.mlp.up_proj.weight").unwrap().len(), 24);
+        assert_eq!(
+            weights
+                .get("model.layers.0.mlp.up_proj.weight")
+                .unwrap()
+                .len(),
+            24
+        );
     }
 
     #[test]
@@ -1365,14 +1399,19 @@ mod tests {
         // block boundaries.
         let block_bytes: [u8; 34] = {
             let mut b = [0u8; 34];
-            b[0] = 0x00; b[1] = 0x3C; // f16 scale = 1.0
-            for i in 0..32 { b[2 + i] = i as u8; }
+            b[0] = 0x00;
+            b[1] = 0x3C; // f16 scale = 1.0
+            for i in 0..32 {
+                b[2 + i] = i as u8;
+            }
             b
         };
         let mut q_block = block_bytes;
         let mut k_block = block_bytes;
         let mut v_block = block_bytes;
-        q_block[2] = 1; k_block[2] = 2; v_block[2] = 3;
+        q_block[2] = 1;
+        k_block[2] = 2;
+        v_block[2] = 3;
         let mut fused = Vec::with_capacity(34 * 3);
         fused.extend_from_slice(&q_block);
         fused.extend_from_slice(&k_block);
@@ -1387,9 +1426,15 @@ mod tests {
         // hidden=1, heads=kv_heads=1, head_dim=32, intermediate=0 → Q=K=V= 32 elems each.
         split_fused_tensors(&mut weights, 1, 1, 1, 1, 32, 0);
 
-        let q = weights.get_q8_raw("model.layers.0.self_attn.q_proj.weight").unwrap();
-        let k = weights.get_q8_raw("model.layers.0.self_attn.k_proj.weight").unwrap();
-        let v = weights.get_q8_raw("model.layers.0.self_attn.v_proj.weight").unwrap();
+        let q = weights
+            .get_q8_raw("model.layers.0.self_attn.q_proj.weight")
+            .unwrap();
+        let k = weights
+            .get_q8_raw("model.layers.0.self_attn.k_proj.weight")
+            .unwrap();
+        let v = weights
+            .get_q8_raw("model.layers.0.self_attn.v_proj.weight")
+            .unwrap();
         assert_eq!(q.len(), 34);
         assert_eq!(k.len(), 34);
         assert_eq!(v.len(), 34);
