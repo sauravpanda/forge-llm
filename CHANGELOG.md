@@ -2,6 +2,34 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.7.2] — 2026-04-17 — Fused Decode-Path Dispatches (Metal)
+
+Patch release: single-token decode now reuses the existing batched `rope_qk_batch` and `copy_kv_both_batch` helpers (with M=1) instead of issuing four separate dispatches per layer. Two fewer dispatches + barriers per layer per decode step.
+
+### Changed
+- **`dispatch_rope_offset` ×2 → `dispatch_rope_qk_batch(M=1)`** in the generated `forward()` and `forward_profile()` paths. Q and K rotate in one kernel launch instead of two.
+- **`dispatch_copy_from_offset_f16` ×2 → `dispatch_copy_kv_both_batch(M=1)`** — K and V append to the f16 cache in one dispatch.
+- Dropped the now-unused local `k_byte_offset` / `v_byte_offset` (decode path uses float offsets via the batched helper).
+
+### Performance (Apple M5 Pro, Q8_0, decode tok/s)
+
+| Workload | v0.7.1 | **v0.7.2** | Δ |
+|----------|-------:|-----------:|--:|
+| SmolLM2-135M, 128-tok decode | 405 | **503** | **+24%** |
+| Llama-3.2-1B, short decode | 162 | **173** | +7% |
+| Llama-3.2-1B, decode @ 2,502-tok ctx | 85.8 | **89.9** | +5% |
+| Phi-3 Mini, decode @ 3,001-tok ctx | 30.8 | 30.8 | ~0% |
+
+Small models see the biggest gain because dispatch overhead is a larger fraction of their per-layer work. Phi-3 Mini (32 layers × 32 MHA KV heads) is already dominated by in-kernel compute, so saving 2 dispatches/layer is lost in the noise.
+
+### Correctness
+
+- **Llama-3.2-1B** decode byte-identical to v0.7.1 on the "theory of relativity" test.
+- **Qwen2.5-0.5B** coherent on the "history of AI" test.
+- **Phi-3 Mini** coherent on the cat story test.
+
+Output identity vs v0.7.1 where the path emitted the same fused kernel numerically (same `rope_qk_batch`, same `copy_kv_both_batch`), just invoked at M=1 instead of M>1.
+
 ## [0.7.1] — 2026-04-17 — FP16 KV Cache (Metal)
 
 Patch release: KV cache storage changed from f32 (4 bytes/element) to f16 (2 bytes/element). Halves KV RAM footprint and KV read bandwidth during attention.

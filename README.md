@@ -18,7 +18,7 @@ Benchmarks on Apple M5 Pro, 8-bit quantization, 64-token generation.
 
 | Model | ForgeLLM Metal | MLX (8-bit) | llama.cpp (Q8_0) | vs MLX | vs llama.cpp |
 |-------|---------------|-------------|-------------------|--------|-------------|
-| SmolLM2-135M | **496 tok/s** | 414 tok/s | 481 tok/s | **1.20x** | **1.03x** |
+| SmolLM2-135M | **503 tok/s** | 414 tok/s | 481 tok/s | **1.21x** | **1.05x** |
 | SmolLM2-360M | **289 tok/s** | 264 tok/s | 267 tok/s | **1.09x** | **1.08x** |
 | Llama-3.2-1B | **178 tok/s** | 111 tok/s | 130 tok/s | **1.60x** | **1.37x** |
 | Llama-3.2-3B | **70.4 tok/s** | 42.2 tok/s | 67.8 tok/s | **1.67x** | **1.04x** |

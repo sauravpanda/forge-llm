@@ -3261,7 +3261,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     let hidden = config.hidden_size;
     let intermediate = config.intermediate_size;
     let _num_layers = config.num_layers;
-    let num_heads = config.num_attention_heads;
+    let _num_heads = config.num_attention_heads;
     let num_kv_heads = config.num_kv_heads;
     let head_dim = config.head_dim;
     let vocab = config.vocab_size;
@@ -4034,8 +4034,8 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            for layer in 0..NUM_LAYERS {{")?;
     writeln!(code)?;
     let q_byte_offset = 0usize;
-    let k_byte_offset = hidden * 4;
-    let v_byte_offset = (hidden + kv_dim) * 4;
+    let k_float_offset = hidden;
+    let v_float_offset = hidden + kv_dim;
 
     writeln!(
         code,
@@ -4065,29 +4065,20 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     }
     writeln!(
         code,
-        "                // RoPE on Q portion (qkv_buf offset 0) and K portion (qkv_buf offset {k_byte_offset})"
+        "                // Fused Q+K RoPE in one dispatch (saves 1 dispatch + barrier vs separate Q and K rope)"
     )?;
     writeln!(
         code,
-        "                self.dispatch_rope_offset(&enc, &self.qkv_buf, {q_byte_offset}, {num_heads}, {head_dim}, pos);"
-    )?;
-    writeln!(
-        code,
-        "                self.dispatch_rope_offset(&enc, &self.qkv_buf, {k_byte_offset}, {num_kv_heads}, {head_dim}, pos);"
+        "                self.dispatch_rope_qk_batch(&enc, &self.qkv_buf, 1, pos, {qkv_rows});"
     )?;
     writeln!(code)?;
     writeln!(
         code,
-        "                // KV cache update from fused qkv_buf (K at offset {k_byte_offset}, V at offset {v_byte_offset})"
-    )?;
-    writeln!(code, "                let kv_offset = pos * {kv_dim};")?;
-    writeln!(
-        code,
-        "                self.dispatch_copy_from_offset_f16(&enc, &self.qkv_buf, {k_byte_offset}, &self.k_cache[layer], kv_offset, {kv_dim});"
+        "                // Fused K+V cache update in one dispatch (f32 qkv_buf -> f16 KV cache)"
     )?;
     writeln!(
         code,
-        "                self.dispatch_copy_from_offset_f16(&enc, &self.qkv_buf, {v_byte_offset}, &self.v_cache[layer], kv_offset, {kv_dim});"
+        "                self.dispatch_copy_kv_both_batch(&enc, &self.qkv_buf, &self.k_cache[layer], &self.v_cache[layer], 1, {kv_dim}, pos, {qkv_rows}, {k_float_offset}, {v_float_offset});"
     )?;
     writeln!(code)?;
     writeln!(
@@ -4273,20 +4264,11 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     }
     writeln!(
         code,
-        "                self.dispatch_rope_offset(&enc, &self.qkv_buf, {q_byte_offset}, {num_heads}, {head_dim}, pos);"
+        "                self.dispatch_rope_qk_batch(&enc, &self.qkv_buf, 1, pos, {qkv_rows});"
     )?;
     writeln!(
         code,
-        "                self.dispatch_rope_offset(&enc, &self.qkv_buf, {k_byte_offset}, {num_kv_heads}, {head_dim}, pos);"
-    )?;
-    writeln!(code, "                let kv_offset = pos * {kv_dim};")?;
-    writeln!(
-        code,
-        "                self.dispatch_copy_from_offset_f16(&enc, &self.qkv_buf, {k_byte_offset}, &self.k_cache[layer], kv_offset, {kv_dim});"
-    )?;
-    writeln!(
-        code,
-        "                self.dispatch_copy_from_offset_f16(&enc, &self.qkv_buf, {v_byte_offset}, &self.v_cache[layer], kv_offset, {kv_dim});"
+        "                self.dispatch_copy_kv_both_batch(&enc, &self.qkv_buf, &self.k_cache[layer], &self.v_cache[layer], 1, {kv_dim}, pos, {qkv_rows}, {k_float_offset}, {v_float_offset});"
     )?;
     writeln!(
         code,
@@ -7964,6 +7946,39 @@ mod tests {
         assert!(
             model_rs.contains("attention_flash_batch_pipeline"),
             "MetalModel must register the flash attention pipeline"
+        );
+    }
+
+    #[test]
+    fn decode_uses_fused_rope_and_kv_copy() {
+        // v0.7.2: single-token decode reuses `rope_qk_batch` (M=1) and
+        // `copy_kv_both_batch` (M=1) instead of calling the separate
+        // rope_offset + copy_from_offset_f16 pairs, saving 2 dispatches +
+        // barriers per layer.
+        let config = minimal_config();
+        let model_rs = generate_model_rs(&config).unwrap();
+
+        // forward() and forward_profile() each have a decode loop.
+        // Locate `pub fn forward(` and `pub fn forward_profile(` and verify
+        // the fused dispatches appear between the function header and the
+        // start of forward_prefill (which also uses these fused helpers).
+        let forward_start = model_rs.find("pub fn forward(").expect("forward missing");
+        let forward_end = model_rs[forward_start..]
+            .find("pub fn forward_prefill(")
+            .expect("forward_prefill missing");
+        let forward_body = &model_rs[forward_start..forward_start + forward_end];
+
+        assert!(
+            forward_body.contains("dispatch_rope_qk_batch(&enc, &self.qkv_buf, 1"),
+            "single-token forward must use fused rope_qk_batch with M=1"
+        );
+        assert!(
+            forward_body.contains("dispatch_copy_kv_both_batch(&enc, &self.qkv_buf,"),
+            "single-token forward must use fused copy_kv_both_batch"
+        );
+        assert!(
+            !forward_body.contains("dispatch_copy_from_offset_f16"),
+            "decode path should no longer call the per-K/per-V copy"
         );
     }
 
