@@ -484,6 +484,7 @@ mod tests {
             dtype: DType::F16,
             sliding_window_size: None,
             qkv_bias: false,
+            hidden_activation: HiddenActivation::SiLU,
         }
     }
 
@@ -503,6 +504,7 @@ mod tests {
             dtype: DType::BF16,
             sliding_window_size: None,
             qkv_bias: false,
+            hidden_activation: HiddenActivation::SiLU,
         }
     }
 
@@ -593,6 +595,7 @@ mod tests {
             dtype: DType::BF16,
             sliding_window_size: None,
             qkv_bias: true,
+            hidden_activation: HiddenActivation::SiLU,
         };
 
         let graph = build_graph(&config).unwrap();
@@ -629,6 +632,7 @@ mod tests {
             dtype: DType::F16,
             sliding_window_size: None,
             qkv_bias: true,
+            hidden_activation: HiddenActivation::SiLU,
         };
 
         let graph = build_graph(&config).unwrap();
@@ -662,6 +666,10 @@ mod tests {
             Architecture::StableLM,
         ] {
             let qkv_bias = matches!(arch, Architecture::Qwen2);
+            let hidden_activation = match arch {
+                Architecture::Gemma => HiddenActivation::GeluApprox,
+                _ => HiddenActivation::SiLU,
+            };
             let config = ModelConfig {
                 architecture: arch.clone(),
                 hidden_size: 64,
@@ -677,6 +685,7 @@ mod tests {
                 dtype: DType::F16,
                 sliding_window_size: None,
                 qkv_bias,
+                hidden_activation,
             };
             let result = build_graph(&config);
             assert!(result.is_ok(), "failed to build graph for {arch}");

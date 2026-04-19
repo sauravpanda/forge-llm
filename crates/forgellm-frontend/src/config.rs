@@ -116,6 +116,12 @@ impl HFConfig {
         // Sliding window comes from config.json `sliding_window` field (Mistral).
         let sliding_window_size = self.sliding_window;
 
+        // Gemma-1 uses approximate (tanh) GeLU in the FFN gated activation.
+        let hidden_activation = match architecture {
+            Architecture::Gemma => crate::ir::HiddenActivation::GeluApprox,
+            _ => crate::ir::HiddenActivation::SiLU,
+        };
+
         Some(ModelConfig {
             architecture,
             hidden_size,
@@ -131,6 +137,7 @@ impl HFConfig {
             dtype,
             sliding_window_size,
             qkv_bias,
+            hidden_activation,
         })
     }
 }

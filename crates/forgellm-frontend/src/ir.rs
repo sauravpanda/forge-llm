@@ -311,6 +311,18 @@ impl fmt::Display for Architecture {
     }
 }
 
+/// Activation used in the FFN gated-linear-unit (gate ⊙ activation(up)).
+///
+/// Llama/Qwen2/Mistral/Phi-3/StableLM use `SiLU` (`x * sigmoid(x)`).
+/// Gemma-1 uses `GeluApprox` (tanh-based GeLU:
+/// `0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum HiddenActivation {
+    #[default]
+    SiLU,
+    GeluApprox,
+}
+
 /// Configuration describing a transformer model's hyperparameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
@@ -333,6 +345,9 @@ pub struct ModelConfig {
     /// Whether Q, K, V projections have bias terms. `true` for Qwen2.
     #[serde(default)]
     pub qkv_bias: bool,
+    /// FFN activation (SiLU for Llama/Qwen/etc.; GeluApprox for Gemma-1).
+    #[serde(default)]
+    pub hidden_activation: HiddenActivation,
 }
 
 impl ModelConfig {
@@ -646,6 +661,7 @@ mod tests {
             dtype: DType::F16,
             sliding_window_size: None,
             qkv_bias: false,
+            hidden_activation: HiddenActivation::SiLU,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -672,6 +688,7 @@ mod tests {
             dtype: DType::F16,
             sliding_window_size: Some(4096),
             qkv_bias: false,
+            hidden_activation: HiddenActivation::SiLU,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -698,6 +715,7 @@ mod tests {
             dtype: DType::BF16,
             sliding_window_size: None,
             qkv_bias: true,
+            hidden_activation: HiddenActivation::SiLU,
         };
 
         assert!(config.qkv_bias);
@@ -722,6 +740,7 @@ mod tests {
             dtype: DType::F16,
             sliding_window_size: None,
             qkv_bias: false,
+            hidden_activation: HiddenActivation::SiLU,
         };
 
         let graph = Graph::new("llama-1b").with_config(config);

@@ -235,6 +235,7 @@ pub fn infer_model_config(
         dtype,
         sliding_window_size: None,
         qkv_bias,
+        hidden_activation: crate::ir::HiddenActivation::SiLU,
     })
 }
 

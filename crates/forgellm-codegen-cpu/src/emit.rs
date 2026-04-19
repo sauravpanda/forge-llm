@@ -3503,6 +3503,7 @@ mod tests {
             dtype: DType::F16,
             sliding_window_size: None,
             qkv_bias: false,
+            hidden_activation: HiddenActivation::SiLU,
         }
     }
 
@@ -3634,6 +3635,7 @@ mod tests {
             dtype: DType::F16,
             sliding_window_size: None,
             qkv_bias: false,
+            hidden_activation: HiddenActivation::SiLU,
         };
 
         let graph = graph_builder::build_graph(&config).unwrap();
@@ -3661,6 +3663,7 @@ mod tests {
             dtype: DType::BF16,
             sliding_window_size: None,
             qkv_bias: false,
+            hidden_activation: HiddenActivation::SiLU,
         };
 
         let graph = graph_builder::build_graph(&config).unwrap();
@@ -3812,6 +3815,7 @@ mod tests {
             dtype: DType::F16,
             sliding_window_size: None,
             qkv_bias: false,
+            hidden_activation: HiddenActivation::SiLU,
         };
         let graph = graph_builder::build_graph(&config).unwrap();
         let code = generate(&graph).unwrap();
@@ -3856,6 +3860,7 @@ mod tests {
             dtype: DType::F16,
             sliding_window_size: None,
             qkv_bias: false,
+            hidden_activation: HiddenActivation::SiLU,
         };
         let graph = graph_builder::build_graph(&config).unwrap();
         let code = generate(&graph).unwrap();
@@ -3933,6 +3938,7 @@ mod tests {
             dtype: DType::Q8_0,
             sliding_window_size: None,
             qkv_bias: false,
+            hidden_activation: HiddenActivation::SiLU,
         }
     }
 
@@ -4061,6 +4067,7 @@ mod tests {
             dtype: DType::F16,
             sliding_window_size: None,
             qkv_bias: true,
+            hidden_activation: HiddenActivation::SiLU,
         };
         let graph = graph_builder::build_graph(&config).unwrap();
         let code = generate(&graph).unwrap();
@@ -4151,6 +4158,7 @@ mod tests {
             dtype: DType::F16,
             sliding_window_size: Some(64),
             qkv_bias: false,
+            hidden_activation: HiddenActivation::SiLU,
         };
         let graph = graph_builder::build_graph(&config).unwrap();
         let code = generate(&graph).unwrap();
@@ -4230,6 +4238,7 @@ mod tests {
             dtype: DType::Q4_0,
             sliding_window_size: None,
             qkv_bias: false,
+            hidden_activation: HiddenActivation::SiLU,
         }
     }
 
@@ -4405,6 +4414,7 @@ mod tests {
             dtype: DType::F16,
             sliding_window_size: None,
             qkv_bias: false,
+            hidden_activation: HiddenActivation::SiLU,
         }
     }
 
@@ -4806,6 +4816,7 @@ mod tests {
             dtype: DType::F16,
             sliding_window_size: None,
             qkv_bias: false,
+            hidden_activation: HiddenActivation::SiLU,
         };
         let graph = graph_builder::build_graph(&config).unwrap();
         let code = generate(&graph).unwrap();
@@ -4867,6 +4878,7 @@ mod tests {
             dtype: DType::F16,
             sliding_window_size: None,
             qkv_bias: false,
+            hidden_activation: HiddenActivation::SiLU,
         };
         let graph = graph_builder::build_graph(&config).unwrap();
         let code = generate(&graph).unwrap();

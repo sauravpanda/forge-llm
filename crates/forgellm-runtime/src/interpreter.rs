@@ -35,6 +35,19 @@ pub fn forward(
     let offset = token_id as usize * hidden;
     hidden_state.copy_from_slice(&embed_w[offset..offset + hidden]);
 
+    // Gemma-1 scales the embedding by sqrt(hidden_size) after lookup.
+    // Doing it here (not to the stored weight) preserves tied embeddings for
+    // the final logit projection.
+    if matches!(
+        config.architecture,
+        forgellm_frontend::ir::Architecture::Gemma
+    ) {
+        let scale = (hidden as f32).sqrt();
+        for v in hidden_state.iter_mut() {
+            *v *= scale;
+        }
+    }
+
     // Pre-allocate buffers
     let mut normed = vec![0.0f32; hidden];
     let mut q = vec![0.0f32; num_heads * head_dim];
@@ -120,7 +133,12 @@ pub fn forward(
         let down_w = weights.tensor(&format!("{prefix}.mlp.down_proj.weight"));
 
         matmul(&mut gate, &normed, gate_w, 1, hidden, intermediate);
-        silu(&mut gate_act, &gate);
+        match config.hidden_activation {
+            forgellm_frontend::ir::HiddenActivation::SiLU => silu(&mut gate_act, &gate),
+            forgellm_frontend::ir::HiddenActivation::GeluApprox => {
+                kernels::gelu(&mut gate_act, &gate)
+            }
+        }
         matmul(&mut up, &normed, up_w, 1, hidden, intermediate);
         elementwise_mul(&mut ffn_hidden, &gate_act, &up);
         matmul(&mut ffn_out, &ffn_hidden, down_w, 1, intermediate, hidden);
@@ -302,6 +320,7 @@ mod tests {
             dtype: DType::F32,
             sliding_window_size: None,
             qkv_bias: false,
+            hidden_activation: HiddenActivation::SiLU,
         };
 
         let graph = forgellm_frontend::graph_builder::build_graph(&config).unwrap();
@@ -386,6 +405,7 @@ mod tests {
             dtype: DType::F32,
             sliding_window_size: None,
             qkv_bias: false,
+            hidden_activation: HiddenActivation::SiLU,
         };
 
         let graph = forgellm_frontend::graph_builder::build_graph(&config).unwrap();
@@ -465,6 +485,7 @@ mod tests {
             dtype: DType::F32,
             sliding_window_size: None,
             qkv_bias: false,
+            hidden_activation: HiddenActivation::SiLU,
         };
 
         let graph = forgellm_frontend::graph_builder::build_graph(&config).unwrap();

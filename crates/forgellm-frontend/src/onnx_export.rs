@@ -6,7 +6,7 @@
 //! # Usage
 //! ```no_run
 //! use std::path::Path;
-//! use forgellm_frontend::{graph_builder, weight_loader::ModelWeights, ir::{ModelConfig, Architecture, DType}};
+//! use forgellm_frontend::{graph_builder, weight_loader::ModelWeights, ir::{ModelConfig, Architecture, DType, HiddenActivation}};
 //! use forgellm_frontend::onnx_export::export_onnx;
 //!
 //! # fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -25,6 +25,7 @@
 //!     dtype: DType::F16,
 //!     sliding_window_size: None,
 //!     qkv_bias: false,
+//!     hidden_activation: HiddenActivation::SiLU,
 //! };
 //! let graph = graph_builder::build_graph(&config)?;
 //! let weights = ModelWeights { tensors: Default::default() };
@@ -393,7 +394,7 @@ mod tests {
 
     use super::*;
     use crate::graph_builder::build_graph;
-    use crate::ir::{Architecture, DType, ModelConfig};
+    use crate::ir::{Architecture, DType, HiddenActivation, ModelConfig};
 
     /// Minimal config for fast tests.
     fn tiny_config() -> ModelConfig {
@@ -412,6 +413,7 @@ mod tests {
             dtype: DType::F16,
             sliding_window_size: None,
             qkv_bias: false,
+            hidden_activation: HiddenActivation::SiLU,
         }
     }
 

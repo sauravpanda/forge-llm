@@ -83,6 +83,7 @@ mod tests {
             dtype: DType::F16,
             sliding_window_size: None,
             qkv_bias: false,
+            hidden_activation: HiddenActivation::SiLU,
         };
 
         let graph = graph_builder::build_graph(&config).unwrap();
@@ -110,6 +111,7 @@ mod tests {
             dtype: DType::F16,
             sliding_window_size: None,
             qkv_bias: false,
+            hidden_activation: HiddenActivation::SiLU,
         };
 
         let graph = graph_builder::build_graph(&config).unwrap();

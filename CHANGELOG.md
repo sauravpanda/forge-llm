@@ -2,6 +2,33 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.7.5] — 2026-04-18 — Gemma-1 Interpreter Support
+
+Minor release: `forge run` (the interpreter) now produces coherent output for Gemma-1 GGUFs. The previous "✅ Verified" claim in the README was false — the interpreter was silently running the Llama forward pass on Gemma weights, which is the wrong activation function (SiLU vs GeLU-approx) and misses Gemma's post-lookup embedding scale.
+
+### Changed
+
+- **`ModelConfig`** gains a `hidden_activation: HiddenActivation` field (`SiLU` | `GeluApprox`), `#[serde(default)]` so existing configs deserialize unchanged.
+- **CLI GGUF + HFConfig parsers** set `hidden_activation = GeluApprox` when `architecture == Gemma`; everything else stays `SiLU`.
+- **Interpreter FFN** dispatches on `config.hidden_activation` for the gate activation (`silu_mul` → `gelu_mul` when Gemma).
+- **Interpreter embedding lookup** multiplies the hidden state by `sqrt(hidden_size)` when the model is Gemma, matching HF's reference forward pass. This happens after the lookup (not via weight rewrite) so tied-embedding layouts — where `lm_head` shares the `embed_tokens` buffer — keep the logit projection unscaled.
+- **Prompt encoding** uses `Tokenizer::encode_with_special` instead of `encode` so the tokenizer's post_processor can add the BOS / template tokens that Gemma requires for coherent generation. Verified to not regress SmolLM.
+
+### Not handled by this release
+
+- Gemma's RMS-norm `+1` offset. Standard `llama.cpp`-converted Gemma GGUFs already bake `w' = w + 1` into stored norm weights (see `convert_hf_to_gguf.py`), so no runtime adjustment is needed for GGUF-origin weights. A public `apply_gemma_weight_tweaks` helper is exposed for future Safetensors-origin support, where the tweak would be needed.
+- Gemma-2 and Gemma-3 (softcap, dual norms per sublayer, sliding window alternation). Left intentionally unsupported — the `gemma2` GGUF arch string is recognized at the enum level but no forward-pass logic handles the additional ops.
+- AOT-Metal support for Gemma-1 (planned for a follow-up release).
+
+### Verified
+
+- `bartowski/gemma-1.1-2b-it-Q8_0.gguf` produces coherent text via `forge run` on the "meaning of life" prompt: *"a profound question that has captivated philosophers and theologians for centuries. While there is no definitive answer, exploring this question can lead to profound insights into the nature of existence"*.
+- `HuggingFaceTB/SmolLM2-135M-Instruct-Q8_0.gguf` (Llama arch) still produces the same coherent text as v0.7.4.
+
+### Correctness
+
+- All 259 workspace tests pass (including 71 Metal, 112 frontend, 62 CPU codegen, 53 runtime).
+
 ## [0.7.4] — 2026-04-18 — Decode Attention V-step Restructure (Metal)
 
 Patch release: the V-weighted-sum loop in `kernel void attention` is rewritten so each simdgroup (32 lanes) cooperatively reduces over `seq_len` for one `d4` output chunk, instead of each thread looping over `seq_len` alone for one `d4`. This fixes a large parallelism underutilization on `head_dim=64` — where only 16 of 256 threads per threadgroup were productive — without changing the Q·K^T or softmax steps.

@@ -7109,6 +7109,7 @@ mod tests {
             dtype: DType::F32,
             sliding_window_size: None,
             qkv_bias: false,
+            hidden_activation: HiddenActivation::SiLU,
         }
     }
 
@@ -7516,6 +7517,7 @@ mod tests {
             dtype: DType::Q8_0,
             sliding_window_size: None,
             qkv_bias: false,
+            hidden_activation: HiddenActivation::SiLU,
         }
     }
 
@@ -7818,6 +7820,7 @@ mod tests {
             dtype: DType::Q4_0,
             sliding_window_size: None,
             qkv_bias: false,
+            hidden_activation: HiddenActivation::SiLU,
         }
     }
 

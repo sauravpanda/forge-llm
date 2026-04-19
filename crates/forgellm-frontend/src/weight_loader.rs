@@ -169,6 +169,52 @@ impl ModelWeights {
     }
 }
 
+/// Apply Gemma-1's RMS-norm `+1` offset in place (loaded f32 weights).
+///
+/// Gemma-1's RMS norm formula is `x * (1 + w) / rsqrt(...)` rather than the
+/// standard `x * w / rsqrt(...)`. Equivalent to storing `w' = w + 1` and then
+/// using the standard formula, so kernels need no new code path.
+///
+/// Applied to every `*.input_layernorm.weight`, `*.post_attention_layernorm.weight`,
+/// and `model.norm.weight` tensor present in the map.
+///
+/// **IMPORTANT:** standard `llama.cpp`-converted Gemma GGUFs already have the
+/// `+1` offset baked into the stored weights (see `convert_hf_to_gguf.py`:
+/// `data_torch = data_torch + 1` for `.norm.weight` tensors). Do **not** call
+/// this helper on a GGUF-loaded `ModelWeights` — you would double-offset.
+///
+/// This helper is intended for raw HuggingFace / Safetensors weights, where
+/// the `+1` is normally applied inside the reference RMSNorm forward pass.
+/// No call site inside ForgeLLM uses it automatically today; it is exported
+/// for future Safetensors-origin Gemma support.
+///
+/// Embedding scale (`sqrt(hidden_size)`) is **not** handled here because
+/// `model.embed_tokens.weight` may be tied to `lm_head.weight`; the scale is
+/// applied at embed-lookup time in the interpreter instead.
+pub fn apply_gemma_weight_tweaks(
+    weights: &mut ModelWeights,
+    _hidden_size: usize,
+    num_layers: usize,
+) {
+    for layer in 0..num_layers {
+        for name in [
+            format!("model.layers.{layer}.input_layernorm.weight"),
+            format!("model.layers.{layer}.post_attention_layernorm.weight"),
+        ] {
+            if let Some(w) = weights.tensors.get_mut(&name) {
+                for v in w.iter_mut() {
+                    *v += 1.0;
+                }
+            }
+        }
+    }
+    if let Some(w) = weights.tensors.get_mut("model.norm.weight") {
+        for v in w.iter_mut() {
+            *v += 1.0;
+        }
+    }
+}
+
 /// Errors during weight loading.
 #[derive(Debug, thiserror::Error)]
 pub enum WeightLoadError {

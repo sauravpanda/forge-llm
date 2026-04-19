@@ -11,7 +11,7 @@
 use forgellm_codegen_cpu::generate;
 use forgellm_frontend::{
     graph_builder,
-    ir::{Architecture, DType, ModelConfig},
+    ir::{Architecture, DType, HiddenActivation, ModelConfig},
 };
 use std::path::Path;
 
@@ -37,6 +37,7 @@ fn tiny_deterministic_config() -> ModelConfig {
         dtype: DType::F32,
         sliding_window_size: None,
         qkv_bias: false,
+        hidden_activation: HiddenActivation::SiLU,
     }
 }
 

@@ -521,6 +521,14 @@ fn load_model_config(model_path: &str) -> Result<ModelConfig> {
         // Qwen2 has bias terms on Q, K, V projections.
         let qkv_bias = matches!(architecture, forgellm_frontend::ir::Architecture::Qwen2);
 
+        // Gemma-1 uses approximate (tanh) GeLU; all others use SiLU.
+        let hidden_activation = match architecture {
+            forgellm_frontend::ir::Architecture::Gemma => {
+                forgellm_frontend::ir::HiddenActivation::GeluApprox
+            }
+            _ => forgellm_frontend::ir::HiddenActivation::SiLU,
+        };
+
         let dtype = detect_gguf_dtype(&gguf_file);
 
         Ok(ModelConfig {
@@ -538,6 +546,7 @@ fn load_model_config(model_path: &str) -> Result<ModelConfig> {
             dtype,
             sliding_window_size,
             qkv_bias,
+            hidden_activation,
         })
     } else if path.is_dir() {
         // HuggingFace directory with config.json
@@ -1106,9 +1115,11 @@ fn cmd_run(
         }
     };
 
-    // Encode prompt
+    // Encode prompt with special tokens so the tokenizer's post_processor
+    // can prepend BOS / add any required template wrappers (Gemma needs BOS
+    // for coherent output; other models typically tolerate it).
     let prompt_tokens = tokenizer
-        .encode(prompt)
+        .encode_with_special(prompt)
         .with_context(|| "failed to encode prompt")?;
     let total_budget = config.max_seq_len.min(prompt_tokens.len() + max_tokens);
     eprintln!(
@@ -1398,7 +1409,7 @@ fn handle_completion(
         }
     };
 
-    let prompt_tokens = tokenizer.encode(prompt)?;
+    let prompt_tokens = tokenizer.encode_with_special(prompt)?;
     let mut cache = KVCache::with_capacity(
         config.num_layers,
         config.num_kv_heads,
@@ -1476,7 +1487,7 @@ fn cmd_bench(
     let gguf_file = gguf::parse(Cursor::new(&data))?;
     let weights = weight_loader::load_all(&mut Cursor::new(&data), &gguf_file)?;
 
-    let prompt_tokens = tokenizer.encode(prompt)?;
+    let prompt_tokens = tokenizer.encode_with_special(prompt)?;
 
     println!(
         "Benchmark: {} | {} layers | hidden={}",
@@ -1702,7 +1713,7 @@ fn handle_completion_stream(
         }
     };
 
-    let prompt_tokens = tokenizer.encode(prompt)?;
+    let prompt_tokens = tokenizer.encode_with_special(prompt)?;
     let mut cache = KVCache::with_capacity(
         config.num_layers,
         config.num_kv_heads,
