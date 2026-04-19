@@ -114,9 +114,13 @@ codegen-units = 1
 
 fn generate_metal_shaders(config: &ModelConfig) -> String {
     // The vec_tile shared memory array must fit the largest column dimension
-    // used in any matmul kernel.  For standard LLM architectures this is
-    // max(hidden_size, intermediate_size).  Apple Silicon provides 32 KB of
+    // used in any matmul kernel. For standard LLM architectures this is
+    // max(hidden_size, intermediate_size). Apple Silicon provides 32 KB of
     // threadgroup memory; at 4 bytes per float that caps us at 8192 elements.
+    // For models with intermediate_size > 8192 (e.g. Gemma-2B with 16384),
+    // the per-token matmul_q8/matmul_q8_batch dispatch helpers route the
+    // down-proj call through matmul_q8_gemm_batch instead, which reads
+    // inputs directly from device memory without caching.
     let vec_tile_size = config.hidden_size.max(config.intermediate_size).min(8192);
     // The attention-scores shared array must be at least effective_seq_len
     // elements; anything smaller silently overflows for long prompts.  For
@@ -406,6 +410,27 @@ kernel void silu_mul_fused(
     float g = gate_up[id];
     float u = gate_up[n + id];
     output[id] = (g / (1.0f + fast::exp(-g))) * u;
+}
+
+// ── gelu_mul_fused ─────────────────────────────────────────────────────
+// Fused GELU-tanh-approx × multiply. Same layout as silu_mul_fused but
+// uses the tanh-approximate GELU (matches HF's `gelu_pytorch_tanh`, which
+// is what Gemma-1 uses):
+//   GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+//   output[i] = GELU(gate_up[i]) * gate_up[n + i]
+kernel void gelu_mul_fused(
+    device const float* gate_up [[buffer(0)]],
+    device float* output        [[buffer(1)]],
+    constant uint& n            [[buffer(2)]],
+    uint id [[thread_position_in_grid]])
+{
+    if (id >= n) return;
+    constexpr float SQRT_2_OVER_PI = 0.7978845608f;
+    float g = gate_up[id];
+    float u = gate_up[n + id];
+    float inner = SQRT_2_OVER_PI * (g + 0.044715f * g * g * g);
+    float gelu = 0.5f * g * (1.0f + precise::tanh(inner));
+    output[id] = gelu * u;
 }
 
 // ── elementwise_add ─────────────────────────────────────────────────────
@@ -1034,6 +1059,29 @@ kernel void silu_mul_fused_batch(
     output[token * n + i] = (g / (1.0f + fast::exp(-g))) * u;
 }
 
+// ── gelu_mul_fused_batch ───────────────────────────────────────────────
+// Fused GELU-tanh-approx × multiply for a batch (Gemma-1 FFN).
+// Same layout as silu_mul_fused_batch but with `gelu_pytorch_tanh`.
+kernel void gelu_mul_fused_batch(
+    device const float* gate_up [[buffer(0)]],  // [M, 2*n]
+    device float* output        [[buffer(1)]],  // [M, n]
+    constant uint& n            [[buffer(2)]],
+    constant uint& num_tokens   [[buffer(3)]],
+    uint id [[thread_position_in_grid]])
+{
+    uint total = num_tokens * n;
+    if (id >= total) return;
+    uint token = id / n;
+    uint i = id % n;
+    uint gu_base = token * 2 * n;
+    constexpr float SQRT_2_OVER_PI = 0.7978845608f;
+    float g = gate_up[gu_base + i];
+    float u = gate_up[gu_base + n + i];
+    float inner = SQRT_2_OVER_PI * (g + 0.044715f * g * g * g);
+    float gelu = 0.5f * g * (1.0f + precise::tanh(inner));
+    output[token * n + i] = gelu * u;
+}
+
 // ── add_inplace_batch ──────────────────────────────────────────────────
 // In-place residual connection for a batch: a[i] += b[i] for all M*n elements.
 kernel void add_inplace_batch(
@@ -1044,6 +1092,21 @@ kernel void add_inplace_batch(
 {
     if (id >= total) return;
     a[id] += b[id];
+}
+
+// ── scale_buffer ───────────────────────────────────────────────────────
+// Multiply every element of a buffer by a scalar in place. Used by the
+// Gemma-1 prefill path to scale embeddings by `sqrt(hidden_size)` after
+// the batched embed lookup (Gemma-1 scales embeddings right after lookup
+// in the HF reference forward pass).
+kernel void scale_buffer(
+    device float* data      [[buffer(0)]],
+    constant float& scale   [[buffer(1)]],
+    constant uint& count    [[buffer(2)]],
+    uint id [[thread_position_in_grid]])
+{
+    if (id >= count) return;
+    data[id] *= scale;
 }
 
 // ── copy_embedding_batch ───────────────────────────────────────────────
@@ -3134,7 +3197,7 @@ fn emit_metal_model_struct(
     )?;
     writeln!(
         code,
-        "    copy_embedding_batch_pipeline: ComputePipelineState,"
+        "    copy_embedding_batch_pipeline: ComputePipelineState,\n    scale_buffer_pipeline: ComputePipelineState,"
     )?;
     writeln!(code, "    attention_batch_pipeline: ComputePipelineState,")?;
     writeln!(
@@ -3343,6 +3406,18 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code)?;
 
     // Create compute pipelines
+    // Select the FFN activation kernel. Gemma-1 uses tanh-approximate GeLU
+    // (`gelu_pytorch_tanh`); everything else uses SiLU. The `silu_mul_fused*`
+    // pipeline fields are reused — they simply hold the GeLU kernel when
+    // Gemma is the target.
+    let activation_kernel = match config.hidden_activation {
+        HiddenActivation::SiLU => "silu_mul_fused",
+        HiddenActivation::GeluApprox => "gelu_mul_fused",
+    };
+    let activation_kernel_batch = match config.hidden_activation {
+        HiddenActivation::SiLU => "silu_mul_fused_batch",
+        HiddenActivation::GeluApprox => "gelu_mul_fused_batch",
+    };
     writeln!(code, "        // Create compute pipelines")?;
     for (var, fn_name) in [
         ("matmul_pipeline", "matmul_vec"),
@@ -3352,7 +3427,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         ("rope_pipeline", "rope"),
         ("softmax_pipeline", "softmax"),
         ("silu_mul_pipeline", "silu_mul"),
-        ("silu_mul_fused_pipeline", "silu_mul_fused"),
+        ("silu_mul_fused_pipeline", activation_kernel),
         ("add_pipeline", "elementwise_add"),
         ("attention_pipeline", "attention"),
         ("add_inplace_pipeline", "add_inplace"),
@@ -3370,9 +3445,10 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         ("matmul_q4_batch_pipeline", "matmul_vec_q4_batch"),
         ("rms_norm_batch_pipeline", "rms_norm_batch"),
         ("rope_batch_pipeline", "rope_batch"),
-        ("silu_mul_fused_batch_pipeline", "silu_mul_fused_batch"),
+        ("silu_mul_fused_batch_pipeline", activation_kernel_batch),
         ("add_inplace_batch_pipeline", "add_inplace_batch"),
         ("copy_embedding_batch_pipeline", "copy_embedding_batch"),
+        ("scale_buffer_pipeline", "scale_buffer"),
         ("attention_batch_pipeline", "attention_batch"),
         ("attention_flash_batch_pipeline", "attention_flash_batch"),
         (
@@ -3921,6 +3997,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            silu_mul_fused_batch_pipeline,")?;
     writeln!(code, "            add_inplace_batch_pipeline,")?;
     writeln!(code, "            copy_embedding_batch_pipeline,")?;
+    writeln!(code, "            scale_buffer_pipeline,")?;
     writeln!(code, "            attention_batch_pipeline,")?;
     writeln!(code, "            attention_flash_batch_pipeline,")?;
     writeln!(code, "            attention_mma_flash_batch_pipeline,")?;
@@ -4055,6 +4132,23 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "                    hidden_ptr,")?;
     writeln!(code, "                    HIDDEN_SIZE,")?;
     writeln!(code, "                );")?;
+    if matches!(config.hidden_activation, HiddenActivation::GeluApprox) {
+        // Gemma-1 multiplies the embedding by sqrt(hidden_size) after lookup.
+        // Applied here rather than at weight load time so tied embeddings
+        // (lm_head shares the `embed_tokens` buffer) keep the logit projection
+        // unscaled.
+        writeln!(
+            code,
+            "                const GEMMA_EMBED_SCALE: f32 = {scale:e}_f32;",
+            scale = (hidden as f32).sqrt(),
+        )?;
+        writeln!(code, "                for i in 0..HIDDEN_SIZE {{")?;
+        writeln!(
+            code,
+            "                    *hidden_ptr.add(i) *= GEMMA_EMBED_SCALE;"
+        )?;
+        writeln!(code, "                }}")?;
+    }
     writeln!(
         code,
         "                std::ptr::copy_nonoverlapping(hidden_ptr, residual_ptr, HIDDEN_SIZE);"
@@ -4263,6 +4357,19 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "                hidden_ptr,")?;
     writeln!(code, "                HIDDEN_SIZE,")?;
     writeln!(code, "            );")?;
+    if matches!(config.hidden_activation, HiddenActivation::GeluApprox) {
+        writeln!(
+            code,
+            "            const GEMMA_EMBED_SCALE: f32 = {scale:e}_f32;",
+            scale = (hidden as f32).sqrt(),
+        )?;
+        writeln!(code, "            for i in 0..HIDDEN_SIZE {{")?;
+        writeln!(
+            code,
+            "                *hidden_ptr.add(i) *= GEMMA_EMBED_SCALE;"
+        )?;
+        writeln!(code, "            }}")?;
+    }
     writeln!(
         code,
         "            std::ptr::copy_nonoverlapping(hidden_ptr, residual_ptr, HIDDEN_SIZE);"
@@ -4520,6 +4627,18 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "            self.dispatch_copy_embedding_batch(&enc, m);"
     )?;
+    if matches!(config.hidden_activation, HiddenActivation::GeluApprox) {
+        // Gemma-1: scale embeddings by sqrt(hidden_size) after lookup.
+        writeln!(
+            code,
+            "            // Gemma-1 embedding scale by sqrt(hidden_size)"
+        )?;
+        writeln!(
+            code,
+            "            self.dispatch_scale_buffer(&enc, &self.batch_hidden_buf, {scale:e}_f32, m * {hidden});",
+            scale = (hidden as f32).sqrt(),
+        )?;
+    }
     // Copy batch_hidden -> batch_residual
     writeln!(
         code,
@@ -4789,6 +4908,44 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     )?;
     writeln!(code, "        let r: u32 = rows as u32;")?;
     writeln!(code, "        let c: u32 = cols as u32;")?;
+    // matmul_q8 caches the input vector in a 8192-float threadgroup tile;
+    // for cols > 8192 (e.g. Gemma-2B's 16384-wide down-proj) the tile
+    // overflows. Route large-col calls through the gemm kernel with M=1 —
+    // it reads inputs directly from device memory without caching.
+    writeln!(code, "        if cols > 8192 {{")?;
+    writeln!(code, "            let nt: u32 = 1u32;")?;
+    writeln!(
+        code,
+        "            enc.set_compute_pipeline_state(&self.matmul_q8_gemm_batch_pipeline);"
+    )?;
+    writeln!(code, "            enc.set_buffer(0, Some(weight), 0);")?;
+    writeln!(code, "            enc.set_buffer(1, Some(input), 0);")?;
+    writeln!(code, "            enc.set_buffer(2, Some(output), 0);")?;
+    writeln!(
+        code,
+        "            enc.set_bytes(3, mem::size_of::<u32>() as u64, &nt as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "            enc.set_bytes(4, mem::size_of::<u32>() as u64, &r as *const u32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "            enc.set_bytes(5, mem::size_of::<u32>() as u64, &c as *const u32 as *const _);"
+    )?;
+    writeln!(code, "            let row_tgs = ((rows + 31) / 32) as u64;")?;
+    writeln!(code, "            let tg_size = MTLSize::new(256, 1, 1);")?;
+    writeln!(
+        code,
+        "            let grid_size = MTLSize::new(row_tgs, 1, 1);"
+    )?;
+    writeln!(
+        code,
+        "            enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(code, "            unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
+    writeln!(code, "            return;")?;
+    writeln!(code, "        }}")?;
     writeln!(
         code,
         "        enc.set_compute_pipeline_state(&self.matmul_q8_pipeline);"
@@ -5425,6 +5582,42 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
+    // dispatch_scale_buffer (Gemma-1 embedding scaling)
+    writeln!(
+        code,
+        "    /// Multiply every element of `data` by `scale` in place."
+    )?;
+    writeln!(
+        code,
+        "    fn dispatch_scale_buffer(&self, enc: &ComputeCommandEncoderRef, data: &Buffer, scale: f32, count: usize) {{"
+    )?;
+    writeln!(code, "        let n: u32 = count as u32;")?;
+    writeln!(
+        code,
+        "        enc.set_compute_pipeline_state(&self.scale_buffer_pipeline);"
+    )?;
+    writeln!(code, "        enc.set_buffer(0, Some(data), 0);")?;
+    writeln!(
+        code,
+        "        enc.set_bytes(1, mem::size_of::<f32>() as u64, &scale as *const f32 as *const _);"
+    )?;
+    writeln!(
+        code,
+        "        enc.set_bytes(2, mem::size_of::<u32>() as u64, &n as *const u32 as *const _);"
+    )?;
+    writeln!(code, "        let tg_size = MTLSize::new(256, 1, 1);")?;
+    writeln!(
+        code,
+        "        let grid_size = MTLSize::new(((count + 255) / 256) as u64, 1, 1);"
+    )?;
+    writeln!(
+        code,
+        "        enc.dispatch_thread_groups(grid_size, tg_size);"
+    )?;
+    writeln!(code, "        unsafe {{ let _: () = metal::objc::msg_send![enc, memoryBarrierWithScope:1u64]; }}")?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
+
     // dispatch_rms_norm_batch
     writeln!(
         code,
@@ -5682,7 +5875,15 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "            enc.dispatch_thread_groups(grid_size, tg_size);"
     )?;
-    writeln!(code, "        }} else if num_tokens >= TOKENS_PER_TG_Q8 {{")?;
+    // Route to gemm for cols > 8192 too — the per-token matmul_q8_batch
+    // caches the input vector in a VEC_TILE_SIZE (8192-float) threadgroup
+    // array, which overflows for cols = intermediate_size > 8192 (e.g.
+    // Gemma-2B's 16384-wide down-proj). Gemm reads inputs directly from
+    // device memory so it handles any cols width.
+    writeln!(
+        code,
+        "        }} else if num_tokens >= TOKENS_PER_TG_Q8 || cols > 8192 {{"
+    )?;
     writeln!(
         code,
         "            enc.set_compute_pipeline_state(&self.matmul_q8_gemm_batch_pipeline);"

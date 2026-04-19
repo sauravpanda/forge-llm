@@ -144,7 +144,7 @@ ForgeLLM compiles models into hardware-specific code:
 | Qwen2ForCausalLM | Qwen2.5 (0.5B–7B) | ✅ Verified | ✅ Verified (0.5B Q8_0 on CPU + Metal; fixes [#210](https://github.com/sauravpanda/forge-llm/issues/210)) |
 | Phi3ForCausalLM | Phi-3 Mini | ✅ Verified | ✅ Verified (Phi-3 Mini Q8_0 on Metal; fused QKV/gate+up split at load time in v0.6.7) |
 | MistralForCausalLM | Mistral 7B (sliding-window attention) | ⚠️ Runs Llama forward pass (unsafe for SWA prompts > 4096 tokens) | ⚠️ Untested with v0.6.x MMA kernels |
-| GemmaForCausalLM | Gemma-1 2B | ✅ Verified (Gemma-1 interpreter: post-lookup embedding scale, GeLU-approx activation; `+1` RMS offset is baked into `llama.cpp`-converted GGUFs so no runtime adjustment is needed — fixed in v0.7.5) | ❌ Not yet (planned next release) |
+| GemmaForCausalLM | Gemma-1 2B | ✅ Verified (post-lookup embedding scale, GeLU-approx activation; `+1` RMS offset is baked into `llama.cpp`-converted GGUFs so no runtime adjustment is needed — fixed in v0.7.5) | ✅ Verified (Gemma-1 2B Q8_0 on Metal: GELU kernel + batched embed-scale + large-col matmul routing — byte-identical to interpreter, v0.7.6) |
 | GemmaForCausalLM (v2/v3) | Gemma-2, Gemma-3 | ❌ Not supported — needs logit softcap, dual norms per sublayer, sliding-window alternation | ❌ Not yet |
 | StableLMForCausalLM | StableLM 1.6B, 3B | ⚠️ Runs Llama forward pass (LayerNorm + parallel residual + partial RoPE not implemented) | ⚠️ Untested with v0.6.x MMA kernels |
 

@@ -2,6 +2,35 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.7.6] — 2026-04-18 — Gemma-1 AOT Metal Support
+
+Minor release: Gemma-1-2B now compiles and runs on Metal with `forge compile --target metal`. Output is byte-identical to the v0.7.5 interpreter at 32 tokens for the "meaning of life" prompt, at 12× the throughput (89.8 tok/s vs 7.3 tok/s on M5 Pro, Q8_0).
+
+### Fixed
+
+- **`matmul_q8` / `matmul_q8_batch` vec_tile overflow on `cols > 8192`**: both kernels cached the input vector in a `threadgroup float vec_tile[VEC_TILE_SIZE]` array capped at 8192 floats (32 KB — the device TG memory limit on Apple Silicon). For architectures with `intermediate_size > 8192` (Gemma-2B uses 16384), the down-projection matmul's `for (uint i = tid; i < cols; i += 256) vec_tile[i] = input[i];` loop silently wrote past the end of the array. The dispatch helpers now route large-col calls (`cols > 8192`) through `matmul_q8_gemm_batch`, which reads inputs directly from device memory without caching. Single-token decode path (`dispatch_matmul_q8`) dispatches gemm with `M = 1`; batched prefill path (`dispatch_matmul_q8_batch`) extends its existing gemm-path condition to `num_tokens >= TOKENS_PER_TG_Q8 || cols > 8192`.
+
+### Added
+
+- **Metal GELU kernels** — `gelu_mul_fused` and `gelu_mul_fused_batch` use tanh-approximate GELU (matches HF's `gelu_pytorch_tanh`, Gemma-1's default). Correctness verified against a CPU reference with max abs error `1.19e-7` over `g ∈ [-3, 3]`.
+- **Codegen conditional activation pipeline** — when `config.hidden_activation == GeluApprox`, the `silu_mul_fused*` struct fields are populated with the GELU kernel compiled variants. The dispatch helper signatures and FFN forward code are unchanged (the kernel behind the pipeline just differs).
+- **`scale_buffer` kernel** + `dispatch_scale_buffer` helper — Gemma-1 multiplies input embeddings by `sqrt(hidden_size)` right after lookup. Single-token `forward()` / `forward_profile()` paths apply this scaling via a tight Rust loop in the embed-lookup block (unified memory makes this free). Batched prefill applies it via the new `scale_buffer` compute kernel after `dispatch_copy_embedding_batch`. Both paths are gated on `HiddenActivation::GeluApprox` so non-Gemma models are unaffected.
+
+### Performance (Apple M5 Pro, Q8_0)
+
+| Workload | Interpreter | **Metal** | Δ |
+|----------|------------:|----------:|--:|
+| Gemma-1.1-2B, short decode | 7.3 tok/s | **89.8 tok/s** | **12.3×** |
+
+### Correctness
+
+- **Byte-identical output** vs v0.7.5 interpreter at 32 tokens on Gemma-1.1-2B ("meaning of life" prompt): *"a profound question that has captivated philosophers and theologians for centuries. While there is no definitive answer, exploring this question can lead to profound insights into the nature of existence"*.
+- All 71 Metal codegen tests pass. Non-Gemma models (SmolLM-135M, Llama-3.2-1B) unaffected — the vec_tile routing only triggers on `cols > 8192`, which none of them hit.
+
+### Debug path
+
+The root-cause bug took most of the session to isolate. The GELU kernel tested correct in isolation (max error `1.19e-7`); the embedding scale was applied in both forward paths. The final bisection: bypassing `forward_prefill_batch` for the whole prompt produced coherent Gemma output; sweeping the prefill-batch cutoff `M` showed the bug appeared at `M ≥ 4` — matching the `num_tokens >= TOKENS_PER_TG_Q8 (= 4)` dispatch threshold, which kicks in `matmul_q8_gemm_batch`. But disabling that path still produced garbage at every `M` because the fallback `matmul_q8_batch` also overflows `vec_tile` on Gemma's down-proj. The fix above routes `cols > 8192` through gemm at every `M`.
+
 ## [0.7.5] — 2026-04-18 — Gemma-1 Interpreter Support
 
 Minor release: `forge run` (the interpreter) now produces coherent output for Gemma-1 GGUFs. The previous "✅ Verified" claim in the README was false — the interpreter was silently running the Llama forward pass on Gemma weights, which is the wrong activation function (SiLU vs GeLU-approx) and misses Gemma's post-lookup embedding scale.
