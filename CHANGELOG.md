@@ -2,6 +2,44 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.7.4] — 2026-04-18 — Decode Attention V-step Restructure (Metal)
+
+Patch release: the V-weighted-sum loop in `kernel void attention` is rewritten so each simdgroup (32 lanes) cooperatively reduces over `seq_len` for one `d4` output chunk, instead of each thread looping over `seq_len` alone for one `d4`. This fixes a large parallelism underutilization on `head_dim=64` — where only 16 of 256 threads per threadgroup were productive — without changing the Q·K^T or softmax steps.
+
+### Changed
+
+- **V-step outer loop**: `for (uint d4 = tid; d4 < head_dim4; d4 += 256)` → `for (uint d4 = simd_id; d4 < head_dim4; d4 += 8)`. 8 simdgroups handle 8 `d4` values per outer iteration.
+- **V-step inner loop**: each lane now handles `s = simd_lane, simd_lane+32, simd_lane+64, ...` across the full `seq_len`, loading one `half4` per `s` per lane.
+- **Reduction**: four component-wise `simd_sum` calls reduce the 32 lane partials per `d4`; lane 0 of each simdgroup writes the `float4` output.
+- Removed the `s += 4` unroll from the V loop — each lane already strides 32 positions per iter, which gives enough memory-level parallelism.
+- Same transformation applied to the scalar fallback for `head_dim % 4 != 0` (unused on current supported models — all use `head_dim ∈ {64, 96, 128}`).
+
+### Performance (Apple M5 Pro, Q8_0, decode tok/s, median of 3)
+
+| Workload | v0.7.3 | **v0.7.4** | Δ |
+|----------|-------:|-----------:|--:|
+| SmolLM2-135M, ~10-tok decode | 564 | 567 | noise |
+| SmolLM2-135M, decode @ ~900-tok ctx | 203 | **296** | **+46%** |
+| SmolLM2-135M, decode @ ~2250-tok ctx | 103 | **165** | **+60%** |
+| Llama-3.2-1B, ~10-tok decode | 170 | 172 | noise |
+| Llama-3.2-1B, decode @ ~2250-tok ctx | 99.6 | **123.9** | **+24%** |
+
+`head_dim=64` (both SmolLM2-135M and Llama-3.2-1B) sees the largest gain because the previous layout kept only 16 / 256 threads productive in the V-step; the new layout keeps all 256 productive.
+
+Profile breakdown for Llama-3.2-1B @ 2502-tok decode, layer time:
+
+| | v0.7.3 | v0.7.4 |
+|---|-------:|-------:|
+| Layers (GPU) | 8.82 ms | **6.90 ms** |
+
+That -22% on layer time maps cleanly onto the +24% decode throughput after the constant per-token overhead of norm+logits and embedding lookup is folded in.
+
+### Correctness
+
+- Byte-identical output text on SmolLM-135M and Llama-3.2-1B vs v0.7.3 for the "meaning of life" prompt.
+- The V-step reduction is a sum over exactly the same terms in a different order; all supported `head_dim` values are multiples of 4 so no scalar-fallback paths fire.
+- All 71 Metal codegen tests pass, including the strengthened `decode_attention_uses_half4_vectorized_loads` which now also asserts the `simd_sum` reduction and simdgroup-partitioned `d4` loop.
+
 ## [0.7.3] — 2026-04-18 — Vectorized Decode Attention (Metal)
 
 Patch release: the single-token decode attention kernel (`kernel void attention`) now issues `half4` loads against the f16 KV cache, mirroring the prefill path. Both the Q·K^T dot product and the scores·V weighted sum go through vectorized loads, with a scalar fallback for head_dim not divisible by 4 (unused on current supported architectures — all have head_dim ∈ {64, 96, 128}).

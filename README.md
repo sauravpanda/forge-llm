@@ -25,13 +25,13 @@ Benchmarks on Apple M5 Pro, 8-bit quantization, 64-token generation.
 
 ### Long-Context Decode (tok/s)
 
-v0.7.3 vectorizes the decode-path attention kernel with `half4` loads (Q·K^T and scores·V), mirroring the prefill kernel. Short-context decode is matmul-bound and unchanged; long-context decode is attention-bound and speeds up meaningfully.
+v0.7.3 vectorized the decode-path attention kernel with `half4` loads. v0.7.4 restructures the V-weighted-sum so each simdgroup (32 lanes) cooperatively reduces over `seq_len` for one `d4` chunk, fixing a large parallelism underutilization on `head_dim=64` (the old layout kept only 16 / 256 threads productive; the new one keeps all 256 productive). Short-context decode is matmul-bound and unchanged; long-context decode is attention-bound and speeds up sharply.
 
-| Model | Context | v0.7.2 | **v0.7.3** | Δ |
-|-------|--------:|-------:|-----------:|--:|
-| SmolLM2-135M | ~900 tok | 174 | **202** | **+16%** |
-| SmolLM2-135M | ~2250 tok | 84 | **99** | **+18%** |
-| Llama-3.2-1B | ~2250 tok | 87 | **96** | **+10%** |
+| Model | Context | v0.7.2 | v0.7.3 | **v0.7.4** | v0.7.2 → v0.7.4 |
+|-------|--------:|-------:|-------:|-----------:|----------------:|
+| SmolLM2-135M | ~900 tok  | 174 | 202 | **296** | **+70%** |
+| SmolLM2-135M | ~2250 tok |  84 |  99 | **165** | **+96%** |
+| Llama-3.2-1B | ~2250 tok |  87 |  96 | **124** | **+42%** |
 
 ### Prefill Speed (tok/s, long prompt)
 

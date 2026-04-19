@@ -878,38 +878,49 @@ kernel void attention(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Step 3: Weighted sum of V: output = scores · V, half4 vectorized.
-    // Mirrors attention_batch prefill: each thread handles 4 d-dims via
-    // half4 loads, with scalar fallback for head_dim not divisible by 4.
-    uint seq_len4 = seq_len & ~3u;  // largest multiple of 4 <= seq_len
+    // Step 3: Weighted sum of V: output = scores · V.
+    //
+    // v0.7.4 restructure: one simdgroup per d4 chunk. The 32 lanes in a
+    // simdgroup partition the seq_len dimension (lane handles positions
+    // s = simd_lane, simd_lane+32, simd_lane+64, ...) and reduce their
+    // partial sums via simd_sum.  This keeps all 256 threads productive
+    // for head_dim ∈ {64, 96, 128}; the old "one thread per d4" layout
+    // kept only 16/256 threads productive for head_dim=64.
+    //
+    // 8 simdgroups handle 8 d4s per outer iteration:
+    //   head_dim=64  (head_dim4=16): 2 iters
+    //   head_dim=96  (head_dim4=24): 3 iters
+    //   head_dim=128 (head_dim4=32): 4 iters
     uint v_stride = num_kv_heads * head_dim;
-    for (uint d4 = tid; d4 < head_dim4; d4 += 256) {
+    for (uint d4 = simd_id; d4 < head_dim4; d4 += 8) {
         uint d = d4 * 4;
-        float4 acc = float4(0.0);
         uint v_base = kv_head * head_dim + d;
-        for (uint s = 0; s < seq_len4; s += 4) {
-            float sc0 = scores[s];
-            float sc1 = scores[s + 1];
-            float sc2 = scores[s + 2];
-            float sc3 = scores[s + 3];
-            acc += sc0 * float4(*(device const half4*)(v_cache + s * v_stride + v_base))
-                 + sc1 * float4(*(device const half4*)(v_cache + (s+1) * v_stride + v_base))
-                 + sc2 * float4(*(device const half4*)(v_cache + (s+2) * v_stride + v_base))
-                 + sc3 * float4(*(device const half4*)(v_cache + (s+3) * v_stride + v_base));
+        float4 partial = float4(0.0);
+        for (uint s = simd_lane; s < seq_len; s += 32) {
+            half4 v = *(device const half4*)(v_cache + s * v_stride + v_base);
+            partial += scores[s] * float4(v);
         }
-        for (uint s = seq_len4; s < seq_len; s++) {
-            acc += scores[s] * float4(*(device const half4*)(v_cache + s * v_stride + v_base));
+        // Reduce the 32 lanes of this simdgroup to lane 0 per component.
+        partial.x = simd_sum(partial.x);
+        partial.y = simd_sum(partial.y);
+        partial.z = simd_sum(partial.z);
+        partial.w = simd_sum(partial.w);
+        if (simd_lane == 0) {
+            *(device float4*)(output + q_off + d) = partial;
         }
-        *(device float4*)(output + q_off + d) = acc;
     }
-    // Scalar fallback for remaining dimensions (unused for current models)
-    for (uint d = head_dim4 * 4 + tid; d < head_dim; d += 256) {
-        float acc = 0.0;
+    // Scalar fallback for dims not divisible by 4 (unused for current models —
+    // all supported head_dims are in {64, 96, 128}). Same simd-per-d layout.
+    for (uint d = head_dim4 * 4 + simd_id; d < head_dim; d += 8) {
         uint v_base = kv_head * head_dim + d;
-        for (uint s = 0; s < seq_len; s++) {
-            acc += scores[s] * float(v_cache[s * v_stride + v_base]);
+        float partial = 0.0;
+        for (uint s = simd_lane; s < seq_len; s += 32) {
+            partial += scores[s] * float(v_cache[s * v_stride + v_base]);
         }
-        output[q_off + d] = acc;
+        partial = simd_sum(partial);
+        if (simd_lane == 0) {
+            output[q_off + d] = partial;
+        }
     }
 }
 
@@ -8055,9 +8066,10 @@ mod tests {
 
     #[test]
     fn decode_attention_uses_half4_vectorized_loads() {
-        // v0.7.3: the decode `kernel void attention` vectorizes both the
-        // Q·K^T dot product and the scores·V weighted sum via half4 loads
-        // (and float4 stores on output), mirroring the prefill path.
+        // v0.7.3: vectorized K/V via half4 + float4.
+        // v0.7.4: V-step restructured — one simdgroup per d4 chunk, 32 lanes
+        // partition seq_len with simd_sum reduction. Fixes head_dim=64 under-
+        // utilization (16 productive threads → 256 productive threads).
         let config = minimal_config();
         let shaders = generate_metal_shaders(&config);
 
@@ -8085,6 +8097,19 @@ mod tests {
         assert!(
             body.contains("head_dim4"),
             "decode attention must iterate head_dim in chunks of 4"
+        );
+        // v0.7.4: V-step uses simd_sum per component to reduce across 32 lanes.
+        assert!(
+            body.contains("simd_sum(partial.x)")
+                && body.contains("simd_sum(partial.y)")
+                && body.contains("simd_sum(partial.z)")
+                && body.contains("simd_sum(partial.w)"),
+            "decode attention V-step must reduce float4 partials via simd_sum"
+        );
+        // And the V-step outer loop must iterate d4 across simdgroups (simd_id), not threads (tid).
+        assert!(
+            body.contains("for (uint d4 = simd_id; d4 < head_dim4; d4 += 8)"),
+            "decode attention V-step must partition d4 across simdgroups"
         );
     }
 
