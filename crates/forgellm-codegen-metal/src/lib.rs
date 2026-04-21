@@ -2337,9 +2337,14 @@ kernel void matmul_q8_mma32_hh4_wide(
     uint tok_base = tgid.y * MMA32_TOK_TILE;
     if (row_base >= rows || tok_base >= num_tokens) return;
 
-    // 64 weight rows × 64 K + 32 tok × 64 K = 12 KB shared mem.
+    // 64 weight rows × 64 K = 8 KB, plus a 4 KB shared buffer that serves
+    // as the token tile during compute and as the C-store scratch during
+    // the parallel store phase (same 2048-half footprint; the trailing
+    // threadgroup_barrier at the end of the outer loop orders the reuse).
+    // Total TG mem: 12 KB.
     threadgroup half w_tile[64 * 64];
-    threadgroup half t_tile[MMA32_TOK_TILE * 64];
+    threadgroup half shared_buf[MMA32_TOK_TILE * 64];
+    threadgroup half* t_tile = shared_buf;
 
     uint sg_row_base = simd_id * 16;  // each SG owns 16 contiguous rows
 
@@ -2463,8 +2468,10 @@ kernel void matmul_q8_mma32_hh4_wide(
     }
 
     // ── Parallel store of 8 C_ij across 32 lanes ──
-    // scratch: 4 SGs × 8 C × 64 halves = 2048 halves = 4 KB.
-    threadgroup half scratch[4 * 8 * 64];
+    // Alias the 2048-half shared_buf (previously used as t_tile) as the
+    // C-store scratch: 4 SGs × 8 C × 64 halves = 2048 halves — same size.
+    // The outer-loop trailing barrier guarantees all t_tile reads are done.
+    threadgroup half* scratch = shared_buf;
     uint sg_base = simd_id * 512;
     simdgroup_store(C00, scratch + sg_base +   0, 8);
     simdgroup_store(C01, scratch + sg_base +  64, 8);
