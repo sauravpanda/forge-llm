@@ -2314,6 +2314,192 @@ kernel void matmul_q8_mma32_hh4(
     }
 }
 
+// ── matmul_q8_mma32_hh4_wide ───────────────────────────────────────────
+// Tile-inflated variant of hh4: 32 tok × 64 row TG output with 4 SGs
+// laid 1×4 along the row dim.  Each SG produces a 32×16 sub-tile (8 C_ij:
+// 4 tok strips × 2 col strips), giving 64 MMAs per SG per K=64 outer iter
+// vs 32 in regular hh4.  TG-level load:MMA ratio improves from 1:1 to
+// 1.33:1 — simdgroup_loads from TG memory are amortized across 2× more
+// compute.  Dispatch requires rows % 64 == 0 in addition to the regular
+// hh4 conditions.
+kernel void matmul_q8_mma32_hh4_wide(
+    device const uchar* matrix   [[buffer(0)]],
+    device const float* inputs   [[buffer(1)]],
+    device float* outputs        [[buffer(2)]],
+    constant uint& num_tokens    [[buffer(3)]],
+    constant uint& rows          [[buffer(4)]],
+    constant uint& cols          [[buffer(5)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]])
+{
+    uint row_base = tgid.x * 64;
+    uint tok_base = tgid.y * MMA32_TOK_TILE;
+    if (row_base >= rows || tok_base >= num_tokens) return;
+
+    // 64 weight rows × 64 K + 32 tok × 64 K = 12 KB shared mem.
+    threadgroup half w_tile[64 * 64];
+    threadgroup half t_tile[MMA32_TOK_TILE * 64];
+
+    uint sg_row_base = simd_id * 16;  // each SG owns 16 contiguous rows
+
+    // 8 C accumulators per SG: tok_strip ∈ {0,1,2,3} × col_strip ∈ {0,1}.
+    simdgroup_matrix<half, 8, 8> C00 = simdgroup_matrix<half, 8, 8>(half(0));
+    simdgroup_matrix<half, 8, 8> C01 = simdgroup_matrix<half, 8, 8>(half(0));
+    simdgroup_matrix<half, 8, 8> C10 = simdgroup_matrix<half, 8, 8>(half(0));
+    simdgroup_matrix<half, 8, 8> C11 = simdgroup_matrix<half, 8, 8>(half(0));
+    simdgroup_matrix<half, 8, 8> C20 = simdgroup_matrix<half, 8, 8>(half(0));
+    simdgroup_matrix<half, 8, 8> C21 = simdgroup_matrix<half, 8, 8>(half(0));
+    simdgroup_matrix<half, 8, 8> C30 = simdgroup_matrix<half, 8, 8>(half(0));
+    simdgroup_matrix<half, 8, 8> C31 = simdgroup_matrix<half, 8, 8>(half(0));
+
+    uint blocks_per_row = cols / 32;
+    uint row_bytes = blocks_per_row * 34;
+
+    // 128 threads cover 64 weight rows × 32 K per block: tid_row_a ∈ 0..31
+    // takes rows 0..32, tid_row_a+32 takes rows 32..64.  tid_k_start ∈
+    // {0,8,16,24} selects the 8-wide K slice within the block.
+    uint tid_row_a = tid / 4;
+    uint tid_row_b = tid_row_a + 32;
+    uint tid_k_start = (tid % 4) * 8;
+
+    for (uint blk2 = 0; blk2 < blocks_per_row; blk2 += 2) {
+        // ── Weight tile: 2 blocks (K=0..32, K=32..64) × 2 row halves ──
+        for (uint blk_off = 0; blk_off < 2; blk_off++) {
+            uint blk = blk2 + blk_off;
+            uint tile_k_base = blk_off * 32;
+            // rows 0..32
+            {
+                device const uchar* rp = matrix + (row_base + tid_row_a) * row_bytes + blk * 34;
+                half sc = *(device const half*)rp;
+                device const int8_t* qp = (device const int8_t*)(rp + 2) + tid_k_start;
+                threadgroup half* wp = w_tile + tid_row_a * 64 + tile_k_base + tid_k_start;
+                wp[0] = half(int(qp[0])) * sc;
+                wp[1] = half(int(qp[1])) * sc;
+                wp[2] = half(int(qp[2])) * sc;
+                wp[3] = half(int(qp[3])) * sc;
+                wp[4] = half(int(qp[4])) * sc;
+                wp[5] = half(int(qp[5])) * sc;
+                wp[6] = half(int(qp[6])) * sc;
+                wp[7] = half(int(qp[7])) * sc;
+            }
+            // rows 32..64
+            {
+                device const uchar* rp = matrix + (row_base + tid_row_b) * row_bytes + blk * 34;
+                half sc = *(device const half*)rp;
+                device const int8_t* qp = (device const int8_t*)(rp + 2) + tid_k_start;
+                threadgroup half* wp = w_tile + tid_row_b * 64 + tile_k_base + tid_k_start;
+                wp[0] = half(int(qp[0])) * sc;
+                wp[1] = half(int(qp[1])) * sc;
+                wp[2] = half(int(qp[2])) * sc;
+                wp[3] = half(int(qp[3])) * sc;
+                wp[4] = half(int(qp[4])) * sc;
+                wp[5] = half(int(qp[5])) * sc;
+                wp[6] = half(int(qp[6])) * sc;
+                wp[7] = half(int(qp[7])) * sc;
+            }
+        }
+        // ── Token tile: float4 loads, both K halves ──
+        // Each thread loads 1 (tok, k_slice) pair.  tid_row_a is the tok;
+        // threads with tid_row_a >= num_tokens-tok_base write zeros.  Token
+        // loads are naturally redundant across the 4 threads sharing a tok
+        // (different k_start) — matches regular hh4.
+        {
+            uint tok = tok_base + tid_row_a;
+            threadgroup half* tp_a = t_tile + tid_row_a * 64 + tid_k_start;
+            threadgroup half* tp_b = t_tile + tid_row_a * 64 + 32 + tid_k_start;
+            if (tok < num_tokens) {
+                device const float4* ip4_a = (device const float4*)(
+                    inputs + tok * cols + blk2 * 32 + tid_k_start);
+                device const float4* ip4_b = (device const float4*)(
+                    inputs + tok * cols + (blk2 + 1) * 32 + tid_k_start);
+                float4 va0 = ip4_a[0]; float4 va1 = ip4_a[1];
+                float4 vb0 = ip4_b[0]; float4 vb1 = ip4_b[1];
+                tp_a[0] = half(va0.x); tp_a[1] = half(va0.y);
+                tp_a[2] = half(va0.z); tp_a[3] = half(va0.w);
+                tp_a[4] = half(va1.x); tp_a[5] = half(va1.y);
+                tp_a[6] = half(va1.z); tp_a[7] = half(va1.w);
+                tp_b[0] = half(vb0.x); tp_b[1] = half(vb0.y);
+                tp_b[2] = half(vb0.z); tp_b[3] = half(vb0.w);
+                tp_b[4] = half(vb1.x); tp_b[5] = half(vb1.y);
+                tp_b[6] = half(vb1.z); tp_b[7] = half(vb1.w);
+            } else {
+                tp_a[0] = half(0); tp_a[1] = half(0);
+                tp_a[2] = half(0); tp_a[3] = half(0);
+                tp_a[4] = half(0); tp_a[5] = half(0);
+                tp_a[6] = half(0); tp_a[7] = half(0);
+                tp_b[0] = half(0); tp_b[1] = half(0);
+                tp_b[2] = half(0); tp_b[3] = half(0);
+                tp_b[4] = half(0); tp_b[5] = half(0);
+                tp_b[6] = half(0); tp_b[7] = half(0);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Inner K=64 loop: 8 sub_k × 8 MMAs per SG = 64 MMAs.  Per sub_k,
+        // each SG does 4 A-loads (tok strips 0-7, 8-15, 16-23, 24-31) +
+        // 2 B-loads (row cols 0-7, 8-15) → 6 loads, 8 MMAs (1.33:1).
+        for (uint k_sub = 0; k_sub < 8; k_sub++) {
+            simdgroup_matrix<half, 8, 8> A0, A1, A2, A3, Blo, Bhi;
+            simdgroup_load(A0, t_tile +  0 * 64 + k_sub * 8, 64, ulong2(0, 0), false);
+            simdgroup_load(A1, t_tile +  8 * 64 + k_sub * 8, 64, ulong2(0, 0), false);
+            simdgroup_load(A2, t_tile + 16 * 64 + k_sub * 8, 64, ulong2(0, 0), false);
+            simdgroup_load(A3, t_tile + 24 * 64 + k_sub * 8, 64, ulong2(0, 0), false);
+            simdgroup_load(Blo, w_tile + (sg_row_base + 0) * 64 + k_sub * 8,
+                           64, ulong2(0, 0), true);
+            simdgroup_load(Bhi, w_tile + (sg_row_base + 8) * 64 + k_sub * 8,
+                           64, ulong2(0, 0), true);
+            simdgroup_multiply_accumulate(C00, A0, Blo, C00);
+            simdgroup_multiply_accumulate(C01, A0, Bhi, C01);
+            simdgroup_multiply_accumulate(C10, A1, Blo, C10);
+            simdgroup_multiply_accumulate(C11, A1, Bhi, C11);
+            simdgroup_multiply_accumulate(C20, A2, Blo, C20);
+            simdgroup_multiply_accumulate(C21, A2, Bhi, C21);
+            simdgroup_multiply_accumulate(C30, A3, Blo, C30);
+            simdgroup_multiply_accumulate(C31, A3, Bhi, C31);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // ── Parallel store of 8 C_ij across 32 lanes ──
+    // scratch: 4 SGs × 8 C × 64 halves = 2048 halves = 4 KB.
+    threadgroup half scratch[4 * 8 * 64];
+    uint sg_base = simd_id * 512;
+    simdgroup_store(C00, scratch + sg_base +   0, 8);
+    simdgroup_store(C01, scratch + sg_base +  64, 8);
+    simdgroup_store(C10, scratch + sg_base + 128, 8);
+    simdgroup_store(C11, scratch + sg_base + 192, 8);
+    simdgroup_store(C20, scratch + sg_base + 256, 8);
+    simdgroup_store(C21, scratch + sg_base + 320, 8);
+    simdgroup_store(C30, scratch + sg_base + 384, 8);
+    simdgroup_store(C31, scratch + sg_base + 448, 8);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 32 lanes × 16 writes per lane = 512 outputs per SG.  Decompose as
+    // pass ∈ {0,1} for col_strip, pass_ij ∈ 0..3 for tok_strip, col 0..7.
+    uint lane = tid % 32;
+    uint pass_ij = lane / 8;    // 0..3 — selects tok strip (4-lane group per strip ... wait no)
+    uint col = lane % 8;        // 0..7
+    // lane/8 in {0..3} → 4 tok strips.  col ∈ 0..7.  8 lanes × 8 rows per C = 64 writes per C,
+    // matches the 8×8 layout.  Two passes for col_strip 0 and 1.
+    uint tok_start = tok_base + pass_ij * 8;
+    uint out_row_lo = row_base + sg_row_base + col;          // cols 0..7 of this SG's row block
+    uint out_row_hi = row_base + sg_row_base + 8 + col;      // cols 8..15
+    // Scratch offsets for C_{pass_ij, 0} and C_{pass_ij, 1}.  Each C is 64 halves;
+    // within the SG block: C00=0, C01=64, C10=128, C11=192, C20=256, C21=320, C30=384, C31=448.
+    uint src_base_lo = sg_base + pass_ij * 128 + col;        // 0, 128, 256, 384
+    uint src_base_hi = sg_base + pass_ij * 128 + 64 + col;   // 64, 192, 320, 448
+
+    for (uint m = 0; m < 8; m++) {
+        uint tok_idx = tok_start + m;
+        if (tok_idx < num_tokens) {
+            outputs[tok_idx * rows + out_row_lo] = float(scratch[src_base_lo + m * 8]);
+            outputs[tok_idx * rows + out_row_hi] = float(scratch[src_base_hi + m * 8]);
+        }
+    }
+}
+
 // ── add_bias_batch ─────────────────────────────────────────────────────
 // Broadcast-add a per-row bias vector to every row of an [M, rows] output.
 // Used for Qwen2 QKV bias after the fused qkv matmul.
@@ -3283,6 +3469,10 @@ fn emit_metal_model_struct(
         code,
         "    matmul_q8_mma32_hh4_pipeline: ComputePipelineState,"
     )?;
+    writeln!(
+        code,
+        "    matmul_q8_mma32_hh4_wide_pipeline: ComputePipelineState,"
+    )?;
     if config.qkv_bias {
         writeln!(code, "    add_bias_batch_pipeline: ComputePipelineState,")?;
     }
@@ -3544,6 +3734,10 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         ("matmul_q8_mma32_h_pipeline", "matmul_q8_mma32_h"),
         ("matmul_q8_mma32_h4_pipeline", "matmul_q8_mma32_h4"),
         ("matmul_q8_mma32_hh4_pipeline", "matmul_q8_mma32_hh4"),
+        (
+            "matmul_q8_mma32_hh4_wide_pipeline",
+            "matmul_q8_mma32_hh4_wide",
+        ),
         ("matmul_q4_batch_pipeline", "matmul_vec_q4_batch"),
         ("rms_norm_batch_pipeline", "rms_norm_batch"),
         ("rope_batch_pipeline", "rope_batch"),
@@ -4090,6 +4284,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            matmul_q8_mma32_h_pipeline,")?;
     writeln!(code, "            matmul_q8_mma32_h4_pipeline,")?;
     writeln!(code, "            matmul_q8_mma32_hh4_pipeline,")?;
+    writeln!(code, "            matmul_q8_mma32_hh4_wide_pipeline,")?;
     if config.qkv_bias {
         writeln!(code, "            add_bias_batch_pipeline,")?;
     }
@@ -5891,8 +6086,18 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            let use_h4 = cols >= 2048;")?;
     writeln!(code, "            // hh4 uses a K=64 tile (two Q8_0 blocks per barrier);")?;
     writeln!(code, "            // require cols % 64 == 0 and fall back to h4 otherwise.")?;
+    writeln!(code, "            // hh4_wide additionally doubles the TG row tile to 64,")?;
+    writeln!(code, "            // inflating per-SG accumulators from 4 to 8 — requires")?;
+    writeln!(code, "            // rows % 64 == 0.")?;
+    writeln!(code, "            let use_hh4_wide = num_tokens >= 256 && cols % 64 == 0 && rows % 64 == 0;")?;
+    writeln!(code, "            let use_hh4      = num_tokens >= 256 && cols % 64 == 0;")?;
     writeln!(code, "            let pipe = if use_h4 {{")?;
-    writeln!(code, "                if num_tokens >= 256 && cols % 64 == 0 {{")?;
+    writeln!(code, "                if use_hh4_wide {{")?;
+    writeln!(
+        code,
+        "                    &self.matmul_q8_mma32_hh4_wide_pipeline"
+    )?;
+    writeln!(code, "                }} else if use_hh4 {{")?;
     writeln!(
         code,
         "                    &self.matmul_q8_mma32_hh4_pipeline"
@@ -5922,7 +6127,8 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "            enc.set_bytes(5, mem::size_of::<u32>() as u64, &c as *const u32 as *const _);"
     )?;
-    writeln!(code, "            let row_tgs = rows / MMA32_ROW_TILE;")?;
+    writeln!(code, "            let row_tile = if use_h4 && use_hh4_wide {{ 64 }} else {{ MMA32_ROW_TILE }};")?;
+    writeln!(code, "            let row_tgs = rows / row_tile;")?;
     writeln!(
         code,
         "            let tok_tgs = (num_tokens + MMA32_TOK_TILE - 1) / MMA32_TOK_TILE;"
