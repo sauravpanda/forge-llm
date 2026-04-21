@@ -1094,6 +1094,50 @@ kernel void gelu_mul_fused_batch(
     output[token * n + i] = gelu * u;
 }
 
+// ── silu_mul_fused_batch_f16io / gelu_mul_fused_batch_f16io ───────────
+// MPS-path variants that read the gate_up matmul output directly as f16
+// and write the FFN-hidden directly as f16 for the following MPS down
+// matmul.  Skipping the post-gate_up and pre-down convert kernels was
+// measured at ~6% prefill savings on Gemma-1-2B (convert bandwidth is
+// dominated by the gate_up output, which is 32768 cols wide).
+kernel void silu_mul_fused_batch_f16io(
+    device const half* gate_up [[buffer(0)]],  // [M, 2*n] f16
+    device half* output        [[buffer(1)]],  // [M, n] f16
+    constant uint& n           [[buffer(2)]],
+    constant uint& num_tokens  [[buffer(3)]],
+    uint id [[thread_position_in_grid]])
+{
+    uint total = num_tokens * n;
+    if (id >= total) return;
+    uint token = id / n;
+    uint i = id % n;
+    uint gu_base = token * 2 * n;
+    float g = float(gate_up[gu_base + i]);
+    float u = float(gate_up[gu_base + n + i]);
+    float out = (g / (1.0f + fast::exp(-g))) * u;
+    output[token * n + i] = half(out);
+}
+
+kernel void gelu_mul_fused_batch_f16io(
+    device const half* gate_up [[buffer(0)]],  // [M, 2*n] f16
+    device half* output        [[buffer(1)]],  // [M, n] f16
+    constant uint& n           [[buffer(2)]],
+    constant uint& num_tokens  [[buffer(3)]],
+    uint id [[thread_position_in_grid]])
+{
+    uint total = num_tokens * n;
+    if (id >= total) return;
+    uint token = id / n;
+    uint i = id % n;
+    uint gu_base = token * 2 * n;
+    constexpr float SQRT_2_OVER_PI = 0.7978845608f;
+    float g = float(gate_up[gu_base + i]);
+    float u = float(gate_up[gu_base + n + i]);
+    float inner = SQRT_2_OVER_PI * (g + 0.044715f * g * g * g);
+    float gelu = 0.5f * g * (1.0f + precise::tanh(inner));
+    output[token * n + i] = half(gelu * u);
+}
+
 // ── add_inplace_batch ──────────────────────────────────────────────────
 // In-place residual connection for a batch: a[i] += b[i] for all M*n elements.
 kernel void add_inplace_batch(
@@ -3745,6 +3789,10 @@ fn emit_metal_model_struct(
             code,
             "    convert_f16_to_f32_pipeline: ComputePipelineState,"
         )?;
+        writeln!(
+            code,
+            "    silu_mul_fused_batch_f16io_pipeline: ComputePipelineState,"
+        )?;
     }
     if use_mps_attn {
         writeln!(
@@ -3981,6 +4029,10 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         HiddenActivation::SiLU => "silu_mul_fused_batch",
         HiddenActivation::GeluApprox => "gelu_mul_fused_batch",
     };
+    let activation_kernel_batch_f16io = match config.hidden_activation {
+        HiddenActivation::SiLU => "silu_mul_fused_batch_f16io",
+        HiddenActivation::GeluApprox => "gelu_mul_fused_batch_f16io",
+    };
     writeln!(code, "        // Create compute pipelines")?;
     for (var, fn_name) in [
         ("matmul_pipeline", "matmul_vec"),
@@ -4050,6 +4102,10 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
                 "        let {var} = make_pipeline(&device, &library, \"{fn_name}\");"
             )?;
         }
+        writeln!(
+            code,
+            "        let silu_mul_fused_batch_f16io_pipeline = make_pipeline(&device, &library, \"{activation_kernel_batch_f16io}\");"
+        )?;
     }
     if use_mps_attn {
         for (var, fn_name) in [
@@ -4689,6 +4745,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         writeln!(code, "            dequant_q8_to_f16_pipeline,")?;
         writeln!(code, "            convert_f32_to_f16_pipeline,")?;
         writeln!(code, "            convert_f16_to_f32_pipeline,")?;
+        writeln!(code, "            silu_mul_fused_batch_f16io_pipeline,")?;
         if num_kv_heads == 1 {
             writeln!(code, "            extract_q_to_f16_mqa_pipeline,")?;
             writeln!(code, "            softmax_causal_scale_f16_pipeline,")?;
@@ -5439,12 +5496,12 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         writeln!(code, "            }}")?;
         // MPS gate_up
         writeln!(code, "            self.mps_matmul_f16(&cmd, &self.layers[layer].gate_up_weight_f16, m, {gate_up_rows} as u64, {hidden} as u64);")?;
-        // Segment D: gate_up output convert, silu_mul, convert for down
+        // Segment D: f16-in/f16-out activation — skips the gate_up post-convert
+        // (32768-wide output) and the down pre-convert (16384-wide input),
+        // writing directly into mps_in_f16 for the next MPS matmul.
         writeln!(code, "            {{")?;
         writeln!(code, "                let enc = cmd.new_compute_command_encoder();")?;
-        writeln!(code, "                self.dispatch_convert_f16_to_f32(&enc, &self.mps_out_f16, &self.batch_gate_up_buf, m * {gate_up_rows});")?;
-        writeln!(code, "                self.dispatch_silu_mul_fused_batch(&enc, &self.batch_gate_up_buf, &self.batch_ffn_hidden_buf, {intermediate}, m);")?;
-        writeln!(code, "                self.dispatch_convert_f32_to_f16(&enc, &self.batch_ffn_hidden_buf, &self.mps_in_f16, m * {intermediate});")?;
+        writeln!(code, "                self.dispatch_silu_mul_fused_batch_f16io(&enc, &self.mps_out_f16, &self.mps_in_f16, {intermediate}, m);")?;
         writeln!(code, "                enc.end_encoding();")?;
         writeln!(code, "            }}")?;
         // MPS down
@@ -5533,6 +5590,19 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         writeln!(code, "        enc.set_buffer(1, Some(dst), 0);")?;
         writeln!(code, "        enc.set_bytes(2, std::mem::size_of::<u32>() as u64, &n32 as *const u32 as *const _);")?;
         writeln!(code, "        enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(256, 1, 1));")?;
+        writeln!(code, "    }}")?;
+        writeln!(code)?;
+
+        writeln!(code, "    fn dispatch_silu_mul_fused_batch_f16io(&self, enc: &ComputeCommandEncoderRef, gate_up: &Buffer, output: &Buffer, n: usize, m: usize) {{")?;
+        writeln!(code, "        let n32: u32 = n as u32;")?;
+        writeln!(code, "        let m32: u32 = m as u32;")?;
+        writeln!(code, "        enc.set_compute_pipeline_state(&self.silu_mul_fused_batch_f16io_pipeline);")?;
+        writeln!(code, "        enc.set_buffer(0, Some(gate_up), 0);")?;
+        writeln!(code, "        enc.set_buffer(1, Some(output), 0);")?;
+        writeln!(code, "        enc.set_bytes(2, 4, &n32 as *const u32 as *const _);")?;
+        writeln!(code, "        enc.set_bytes(3, 4, &m32 as *const u32 as *const _);")?;
+        writeln!(code, "        let total = (n * m) as u64;")?;
+        writeln!(code, "        enc.dispatch_threads(MTLSize::new(total, 1, 1), MTLSize::new(256, 1, 1));")?;
         writeln!(code, "    }}")?;
         writeln!(code)?;
 

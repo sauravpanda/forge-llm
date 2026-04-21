@@ -2,6 +2,35 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.7.10] — 2026-04-21 — f16-In/Out GeLU·Mul Fusion
+
+Eliminates two convert kernels per layer around the FFN activation on the MPS prefill path.  The convert-kernel no-op ablation measured ~6% headroom; fusing the post-gate_up `convert_f16→f32` and pre-down `convert_f32→f16` into a single f16-in/f16-out activation kernel captures it.
+
+### Performance (Apple M5 Pro, Gemma-1.1-2B Q8_0)
+
+| Prompt length | v0.7.9 | **v0.7.10** | Δ | vs llama.cpp |
+|---|---:|---:|---:|---:|
+| 1001 tokens | 4116 tok/s | **4776 tok/s** | +16% | **+40%** |
+| 2601 tokens | 4541 tok/s | **5225 tok/s** | +15% | **+54%** |
+
+Cumulative v0.7.6 → v0.7.10: **5.1× @ 2601 tokens, 4.2× @ 1001 tokens.**
+
+### Added
+
+- **`silu_mul_fused_batch_f16io` / `gelu_mul_fused_batch_f16io`** — reads the gate_up matmul output directly as f16 from `mps_out_f16` and writes the FFN-hidden directly as f16 into `mps_in_f16` for the next MPS matmul.  All arithmetic in f32 internally; only the load/store are f16.
+- **`dispatch_silu_mul_fused_batch_f16io` helper** — wired into the MPS prefill layer body, replacing the three-step (convert f16→f32, activation, convert f32→f16) sequence.
+
+### Bandwidth saved per layer @ 2601 tokens
+
+- gate_up post-convert: 164 MB read + 327 MB write skipped
+- down pre-convert: 82 MB read + 41 MB write skipped
+- Total: 614 MB per layer × 18 layers = 11 GB of device-memory traffic removed per prefill.
+
+### Correctness
+
+- Byte-identical output on Gemma-1.1-2B "meaning of life" prompt vs v0.7.9.
+- 71/71 Metal codegen tests pass.
+
 ## [0.7.9] — 2026-04-21 — MPS-Materialized Attention (Faster Than llama.cpp)
 
 For MQA (num_kv_heads = 1) models on the MPS prefill path, attention is now materialized as two MPS matmuls plus a dedicated causal-masked softmax kernel — replacing the streaming flash-attention kernel for the batched prefill.
