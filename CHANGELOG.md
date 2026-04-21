@@ -2,6 +2,39 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.7.11] — 2026-04-21 — MPS Attention for GQA Models
+
+Extends the MPS-materialized attention path from MQA only (v0.7.9) to any Q8_0 model with hidden ≥ 2048 and an integer-divisible `num_heads / num_kv_heads` ratio — in particular Llama-3.2-1B (32 heads / 8 KV heads, num_groups = 4).
+
+### Performance (Apple M5 Pro, Llama-3.2-1B-Instruct Q8_0)
+
+| Prompt length | MPS matmul only (pre-v0.7.11) | **v0.7.11 (MPS attn)** | Δ |
+|---|---:|---:|---:|
+| 1002 tokens | 3060 tok/s | **6934 tok/s** | **+127%** |
+| 2602 tokens | 3490 tok/s | **6778 tok/s** | **+94%** |
+
+### Added
+
+- **`extract_q_to_f16_gqa`** kernel — writes Q in kv-head-major layout `[num_kv_heads, M*num_groups, head_dim]` so each kv-head's Q lives in a contiguous buffer slice.
+- **`softmax_causal_scale_f16_gqa`** kernel — row-major softmax for the GQA layout; derives the per-row token via `tok = (row / num_groups) % M` for causal masking.
+- **`gqa_out_reshape_f16_to_f32`** kernel — unshuffles the P@V output from kv-head-major back into `[M, num_heads, head_dim]` f32.
+- **`mps::matrix_with_offset`** objc helper — wraps `-[MPSMatrix initWithBuffer:offset:descriptor:]`.
+- **`mps_matmul_f16_offsets`** rust helper — per-kv-head MPS matmul with explicit offsets into the Q / K / V / scores buffers.
+
+### How
+
+Per attention block: one loop over `num_kv_heads` issuing a MPS Q·K^T matmul (alpha = 1/√head_dim) into the attn_scores buffer, one GQA softmax dispatch, one loop issuing MPS P·V matmuls into mps_out, and a final f16→f32 reshape.  Each MPS matmul for GQA is smaller (M·num_groups × head_dim × seq_len) than the MQA single call, but there are `num_kv_heads` of them — aggregate compute matches.
+
+Why offsets instead of batched MPS? The K/V caches have `num_kv_heads` heads interleaved within each row (`rowBytes = num_kv_heads * head_dim * 2`).  Trying to use MPS `matrixBytes` striding on overlapping slices of the same rows produced wrong numerics; MPS's batch model assumes non-overlapping matrix regions.
+
+Gate: `is_q8 && hidden_size >= 2048 && num_kv_heads > 1 && num_kv_heads < num_heads && num_heads % num_kv_heads == 0`.  MQA (`num_kv_heads == 1`) keeps the existing path; MHA (`num_kv_heads == num_heads`) continues on flash attention.
+
+### Correctness
+
+- Gemma-1.1-2B MQA unchanged (5195 tok/s @ 2601, byte-identical "meaning of life" output to v0.7.10).
+- Llama-3.2-1B GQA: "The capital of France is Paris. The Eiffel Tower is located in..." matches the flash-attention baseline.
+- 71/71 Metal codegen tests pass.
+
 ## [0.7.10] — 2026-04-21 — f16-In/Out GeLU·Mul Fusion
 
 Eliminates two convert kernels per layer around the FFN activation on the MPS prefill path.  The convert-kernel no-op ablation measured ~6% headroom; fusing the post-gate_up `convert_f16→f32` and pre-down `convert_f32→f16` into a single f16-in/f16-out activation kernel captures it.
