@@ -2,6 +2,33 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.7.7] — 2026-04-20 — Gemma-1 Prefill MMA Throughput
+
+Minor release focused on Apple Silicon prefill throughput for Gemma-class models (hidden ≥ 2048). No API changes; non-Gemma models are unaffected (dispatch conditions `cols ≥ 2048 && num_tokens ≥ 256 && cols % 64 == 0`).
+
+### Performance (Apple M5 Pro, Gemma-1.1-2B Q8_0)
+
+| Prompt length | v0.7.6 | **v0.7.7** | Δ |
+|---|---:|---:|--:|
+| 1001 tokens | 1147 tok/s | **1304 tok/s** | **+14%** |
+| 2601 tokens | 1031 tok/s | **1155 tok/s** | **+12%** |
+
+### Added
+
+- **`matmul_q8_mma32_hh4`** — K=64 tile variant of the all-FP16 MMA matmul (two Q8_0 blocks per threadgroup barrier). One `device const half*` scale read per row (vs eight). `float4` token loads for the inline f32→f16 conversion. 32-lane parallel C-tile store (vs lane-0 serial).
+- **`matmul_q8_mma32_hh4_wide`** — 32 tok × 64 row threadgroup tile with 4 simdgroups laid 1×4 along the row dim; each SG produces a 32×16 sub-tile with 8 accumulators, doubling MMAs per barrier. Dispatched when `rows % 64 == 0` (all four Gemma-1-2B matmul shapes qualify).
+- **Aliased threadgroup memory in `hh4_wide`** — the 2048-half token tile and the 2048-half C-store scratch are never simultaneously live; the trailing outer-loop barrier orders the reuse. Drops the kernel's TG-mem footprint from 16 KB to 12 KB and improves concurrent-TG occupancy.
+- **`attention_mma_flash_batch` extended to `head_dim=256`** — `K_BLOCK=32` with `v_sh` dropped keeps total TG memory under 32 KB (V is read directly from the cache in Phase 4). Closes head_dim=256 to MMA flash attention for Gemma-1.
+
+### Correctness
+
+- Byte-identical output vs v0.7.6 on Gemma-1.1-2B across sampled prompts.
+- 71/71 Metal codegen tests pass.
+
+### Honest framing
+
+v0.7.7 extracts the local maximum of the hh4 algorithm at 12 KB TG memory. Further explorations this cycle (K=128 outer tile, 8-SG layout, double-buffered ping-pong tiles, attention K_BLOCK=16 + `v_sh`, hardcoded-constant shape specialization) each regressed or broke even. The remaining ~2.5× gap to llama.cpp on Gemma prefill is split roughly matmul 61% / attention 29% / other 10% (measured via kernel-ablation binaries); closing it further likely requires either a fundamentally different matmul algorithm (e.g. pre-dequantization to f16 + MPSMatrixMultiplication-class kernels) or structural attention work (phase merging / SG-local reductions).
+
 ## [0.7.6] — 2026-04-18 — Gemma-1 AOT Metal Support
 
 Minor release: Gemma-1-2B now compiles and runs on Metal with `forge compile --target metal`. Output is byte-identical to the v0.7.5 interpreter at 32 tokens for the "meaning of life" prompt, at 12× the throughput (89.8 tok/s vs 7.3 tok/s on M5 Pro, Q8_0).
