@@ -2,6 +2,38 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.7.9] — 2026-04-21 — MPS-Materialized Attention (Faster Than llama.cpp)
+
+For MQA (num_kv_heads = 1) models on the MPS prefill path, attention is now materialized as two MPS matmuls plus a dedicated causal-masked softmax kernel — replacing the streaming flash-attention kernel for the batched prefill.
+
+### Performance (Apple M5 Pro, Gemma-1.1-2B Q8_0)
+
+| Prompt length | v0.7.6 | v0.7.8 (MPS matmul) | **v0.7.9 (MPS attn)** | Cumulative Δ | vs llama.cpp |
+|---|---:|---:|---:|---:|---:|
+| 1001 tokens | 1147 tok/s | 3088 tok/s | **4116 tok/s** | **3.6×** | **~117%** |
+| 2601 tokens | 1031 tok/s | 2136 tok/s | **4541 tok/s** | **4.4×** | **~134%** |
+
+ForgeLLM Metal prefill now beats llama.cpp on Gemma-1.1-2B at both tested prompt lengths on the same hardware.
+
+### How
+
+- **Q extraction** (`extract_q_to_f16_mqa`): one kernel copies the Q slice out of the fused `[M, qkv_stride]` f32 buffer into a contiguous `[M*num_heads, head_dim]` f16 buffer so MPS can treat all Q heads as a single matrix.
+- **Q @ K^T via MPS** with `alpha = 1/sqrt(head_dim)`: K cache (MQA: `[seq_len, head_dim]` f16) is used directly with no copy.  Output written into `attn_scores_f16` (stride = `MAX_SEQ_LEN`).
+- **Causal softmax** (`softmax_causal_scale_f16`): one simdgroup per (token, head) row; three-pass row-max / row-sum / normalize using `simd_max` / `simd_sum`.  Mask is applied inline.
+- **P @ V via MPS**: scores f16 times the V cache f16 directly into `mps_out_f16`.
+- **Post-convert** to f32 for the downstream O projection.
+
+Gated on `is_q8 && hidden_size >= 2048 && num_kv_heads == 1` (GQA and MHA models keep the existing flash-MMA kernel).
+
+### Correctness
+
+- Byte-identical output on Gemma-1.1-2B "meaning of life" prompt vs v0.7.8.
+- 71/71 Metal codegen tests pass.
+
+### Memory
+
++32 MB `attn_scores_f16` scratch (`MAX_BATCH × NUM_HEADS × MAX_SEQ_LEN × 2`) plus +2 MB `q_f16`.  Both allocated from private Metal storage once at load.
+
 ## [0.7.8] — 2026-04-20 — MPSMatrixMultiplication Prefill Path
 
 Major prefill performance jump for Gemma-class models (hidden ≥ 2048) via Apple's Metal Performance Shaders.  Non-qualifying models are unaffected.

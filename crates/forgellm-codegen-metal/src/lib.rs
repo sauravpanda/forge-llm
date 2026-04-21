@@ -2547,6 +2547,76 @@ kernel void convert_f16_to_f32(
     out[id] = float(in[id]);
 }
 
+// ── extract_q_to_f16_mqa ─────────────────────────────────────────────
+// Copies the Q slice of the fused QKV buffer into a contiguous
+// [M*num_heads, head_dim] f16 layout so we can feed it to one big MPS
+// matmul against the shared K cache (MQA).  batch_qkv is row-major
+// [M, qkv_stride] f32; Q occupies the first (num_heads*head_dim) floats
+// of each row.
+kernel void extract_q_to_f16_mqa(
+    device const float* batch_qkv [[buffer(0)]],
+    device half* q_out            [[buffer(1)]],
+    constant uint& m              [[buffer(2)]],
+    constant uint& num_heads_c    [[buffer(3)]],
+    constant uint& head_dim_c     [[buffer(4)]],
+    constant uint& qkv_stride     [[buffer(5)]],
+    uint id [[thread_position_in_grid]])
+{
+    uint hidden = num_heads_c * head_dim_c;
+    uint total = m * hidden;
+    if (id >= total) return;
+    uint tok = id / hidden;
+    uint rem = id - tok * hidden;
+    uint head = rem / head_dim_c;
+    uint d = rem - head * head_dim_c;
+    float v = batch_qkv[tok * qkv_stride + head * head_dim_c + d];
+    q_out[(tok * num_heads_c + head) * head_dim_c + d] = half(v);
+}
+
+// ── softmax_causal_scale_f16 ─────────────────────────────────────────
+// In-place row-wise softmax with scale and causal mask on the score
+// matrix S[M*num_heads, seq_len] f16.  The caller provides row_stride
+// so that S can live in a MAX_SEQ_LEN-wide scratch buffer even when
+// the current seq_len is smaller.  One simdgroup (32 threads) per row.
+kernel void softmax_causal_scale_f16(
+    device half* s               [[buffer(0)]],
+    constant uint& m             [[buffer(1)]],
+    constant uint& num_heads_c   [[buffer(2)]],
+    constant uint& seq_len       [[buffer(3)]],
+    constant uint& row_stride    [[buffer(4)]],
+    constant uint& base_pos      [[buffer(5)]],
+    constant float& scale        [[buffer(6)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]])
+{
+    uint total_rows = m * num_heads_c;
+    if (tgid >= total_rows) return;
+    uint tok = tgid / num_heads_c;
+    uint max_kv = base_pos + tok;
+    device half* row = s + tgid * row_stride;
+
+    float local_max = -INFINITY;
+    for (uint k = simd_lane; k < seq_len; k += 32) {
+        float v = (k <= max_kv) ? float(row[k]) * scale : -INFINITY;
+        local_max = max(local_max, v);
+    }
+    float row_max = simd_max(local_max);
+
+    float local_sum = 0.0;
+    for (uint k = simd_lane; k < seq_len; k += 32) {
+        float v = (k <= max_kv) ? float(row[k]) * scale : -INFINITY;
+        local_sum += fast::exp(v - row_max);
+    }
+    float row_sum = simd_sum(local_sum);
+    float inv = 1.0 / row_sum;
+
+    for (uint k = simd_lane; k < seq_len; k += 32) {
+        float v = (k <= max_kv) ? float(row[k]) * scale : -INFINITY;
+        float p = (k <= max_kv) ? fast::exp(v - row_max) * inv : 0.0;
+        row[k] = half(p);
+    }
+}
+
 // ── add_bias_batch ─────────────────────────────────────────────────────
 // Broadcast-add a per-row bias vector to every row of an [M, rows] output.
 // Used for Qwen2 QKV bias after the fused qkv matmul.
@@ -3661,6 +3731,7 @@ fn emit_metal_model_struct(
         code,
         "    copy_kv_both_batch_pipeline: ComputePipelineState,"
     )?;
+    let use_mps_attn = use_mps && config.num_kv_heads == 1;
     if use_mps {
         writeln!(
             code,
@@ -3675,6 +3746,16 @@ fn emit_metal_model_struct(
             "    convert_f16_to_f32_pipeline: ComputePipelineState,"
         )?;
     }
+    if use_mps_attn {
+        writeln!(
+            code,
+            "    extract_q_to_f16_mqa_pipeline: ComputePipelineState,"
+        )?;
+        writeln!(
+            code,
+            "    softmax_causal_scale_f16_pipeline: ComputePipelineState,"
+        )?;
+    }
     writeln!(code)?;
     if use_mps {
         writeln!(
@@ -3683,6 +3764,10 @@ fn emit_metal_model_struct(
         )?;
         writeln!(code, "    mps_in_f16: Buffer,")?;
         writeln!(code, "    mps_out_f16: Buffer,")?;
+        if use_mps_attn {
+            writeln!(code, "    q_f16: Buffer,")?;
+            writeln!(code, "    attn_scores_f16: Buffer,")?;
+        }
         writeln!(code)?;
     }
     writeln!(code, "    // ── Weight buffers (Metal shared memory) ──")?;
@@ -3953,11 +4038,23 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         )?;
     }
     let use_mps = is_q8 && hidden >= 2048;
+    let use_mps_attn = use_mps && num_kv_heads == 1;
     if use_mps {
         for (var, fn_name) in [
             ("dequant_q8_to_f16_pipeline", "dequant_q8_to_f16"),
             ("convert_f32_to_f16_pipeline", "convert_f32_to_f16"),
             ("convert_f16_to_f32_pipeline", "convert_f16_to_f32"),
+        ] {
+            writeln!(
+                code,
+                "        let {var} = make_pipeline(&device, &library, \"{fn_name}\");"
+            )?;
+        }
+    }
+    if use_mps_attn {
+        for (var, fn_name) in [
+            ("extract_q_to_f16_mqa_pipeline", "extract_q_to_f16_mqa"),
+            ("softmax_causal_scale_f16_pipeline", "softmax_causal_scale_f16"),
         ] {
             writeln!(
                 code,
@@ -4532,6 +4629,17 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
             max_batch = "MAX_BATCH_SIZE",
             max_rows = max_rows
         )?;
+        if use_mps_attn {
+            let _num_heads = config.num_attention_heads;
+            writeln!(
+                code,
+                "        let q_f16 = device.new_buffer((MAX_BATCH_SIZE * NUM_HEADS * HEAD_DIM * 2) as u64, MTLResourceOptions::StorageModePrivate);"
+            )?;
+            writeln!(
+                code,
+                "        let attn_scores_f16 = device.new_buffer((MAX_BATCH_SIZE * NUM_HEADS * MAX_SEQ_LEN * 2) as u64, MTLResourceOptions::StorageModePrivate);"
+            )?;
+        }
         writeln!(code)?;
     }
 
@@ -4581,8 +4689,16 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         writeln!(code, "            dequant_q8_to_f16_pipeline,")?;
         writeln!(code, "            convert_f32_to_f16_pipeline,")?;
         writeln!(code, "            convert_f16_to_f32_pipeline,")?;
+        if num_kv_heads == 1 {
+            writeln!(code, "            extract_q_to_f16_mqa_pipeline,")?;
+            writeln!(code, "            softmax_causal_scale_f16_pipeline,")?;
+        }
         writeln!(code, "            mps_in_f16,")?;
         writeln!(code, "            mps_out_f16,")?;
+        if num_kv_heads == 1 {
+            writeln!(code, "            q_f16,")?;
+            writeln!(code, "            attn_scores_f16,")?;
+        }
     }
     writeln!(code, "            embed_buf,")?;
     writeln!(code, "            layers,")?;
@@ -5253,19 +5369,63 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         writeln!(code, "            }}")?;
         // MPS QKV
         writeln!(code, "            self.mps_matmul_f16(&cmd, &self.layers[layer].qkv_weight_f16, m, {qkv_rows} as u64, {hidden} as u64);")?;
-        // Segment B: output convert, optional QKV bias, rope, kv, attn, convert attn_out to f16 for O matmul
-        writeln!(code, "            {{")?;
-        writeln!(code, "                let enc = cmd.new_compute_command_encoder();")?;
-        writeln!(code, "                self.dispatch_convert_f16_to_f32(&enc, &self.mps_out_f16, &self.batch_qkv_buf, m * {qkv_rows});")?;
-        if config.qkv_bias {
-            writeln!(code, "                self.dispatch_add_bias_batch(&enc, &self.batch_qkv_buf, &self.layers[layer].qkv_bias, m, {qkv_rows});")?;
+        if !use_mps_attn {
+            // Segment B (non-MQA or otherwise ineligible): keep the old
+            // flash-attention dispatch.
+            writeln!(code, "            {{")?;
+            writeln!(code, "                let enc = cmd.new_compute_command_encoder();")?;
+            writeln!(code, "                self.dispatch_convert_f16_to_f32(&enc, &self.mps_out_f16, &self.batch_qkv_buf, m * {qkv_rows});")?;
+            if config.qkv_bias {
+                writeln!(code, "                self.dispatch_add_bias_batch(&enc, &self.batch_qkv_buf, &self.layers[layer].qkv_bias, m, {qkv_rows});")?;
+            }
+            writeln!(code, "                self.dispatch_rope_qk_batch(&enc, &self.batch_qkv_buf, m, start_pos, {qkv_rows});")?;
+            writeln!(code, "                self.dispatch_copy_kv_both_batch(&enc, &self.batch_qkv_buf, &self.k_cache[layer], &self.v_cache[layer], m, {kv_dim}, start_pos, {qkv_rows}, {k_float_offset}, {v_float_offset});")?;
+            writeln!(code, "                self.dispatch_attention_batch(&enc, &self.batch_qkv_buf, &self.k_cache[layer], &self.v_cache[layer], &self.batch_attn_out_buf, m, start_pos, {qkv_rows});")?;
+            writeln!(code, "                self.dispatch_convert_f32_to_f16(&enc, &self.batch_attn_out_buf, &self.mps_in_f16, m * {hidden});")?;
+            writeln!(code, "                enc.end_encoding();")?;
+            writeln!(code, "            }}")?;
+        } else {
+            // MQA: materialize attention via MPS (Q@K^T, softmax, P@V).
+            writeln!(code, "            {{")?;
+            writeln!(code, "                let enc = cmd.new_compute_command_encoder();")?;
+            writeln!(code, "                self.dispatch_convert_f16_to_f32(&enc, &self.mps_out_f16, &self.batch_qkv_buf, m * {qkv_rows});")?;
+            if config.qkv_bias {
+                writeln!(code, "                self.dispatch_add_bias_batch(&enc, &self.batch_qkv_buf, &self.layers[layer].qkv_bias, m, {qkv_rows});")?;
+            }
+            writeln!(code, "                self.dispatch_rope_qk_batch(&enc, &self.batch_qkv_buf, m, start_pos, {qkv_rows});")?;
+            writeln!(code, "                self.dispatch_copy_kv_both_batch(&enc, &self.batch_qkv_buf, &self.k_cache[layer], &self.v_cache[layer], m, {kv_dim}, start_pos, {qkv_rows}, {k_float_offset}, {v_float_offset});")?;
+            writeln!(code, "                self.dispatch_extract_q_to_f16_mqa(&enc, m);")?;
+            writeln!(code, "                enc.end_encoding();")?;
+            writeln!(code, "            }}")?;
+            // Q @ K^T with alpha = 1/sqrt(head_dim).
+            let kv_row_bytes = num_kv_heads * head_dim * 2;
+            let scores_stride = effective_seq_len * 2;
+            writeln!(code, "            {{")?;
+            writeln!(code, "                let seq_len_u: u64 = (start_pos + m) as u64;")?;
+            writeln!(code, "                let mnh: u64 = (m * NUM_HEADS) as u64;")?;
+            writeln!(code, "                let hd_u: u64 = HEAD_DIM as u64;")?;
+            writeln!(code, "                let scale_f64 = 1.0_f64 / (HEAD_DIM as f64).sqrt();")?;
+            writeln!(code, "                self.mps_matmul_f16_general(&cmd, &self.q_f16, mnh, hd_u, hd_u * 2, &self.k_cache[layer], seq_len_u, hd_u, {kv_row_bytes} as u64, &self.attn_scores_f16, {scores_stride} as u64, true, mnh, seq_len_u, hd_u, scale_f64);")?;
+            writeln!(code, "            }}")?;
+            writeln!(code, "            {{")?;
+            writeln!(code, "                let enc = cmd.new_compute_command_encoder();")?;
+            writeln!(code, "                self.dispatch_softmax_causal_scale_f16(&enc, m, start_pos + m, MAX_SEQ_LEN, start_pos, 1.0_f32);")?;
+            writeln!(code, "                enc.end_encoding();")?;
+            writeln!(code, "            }}")?;
+            // P @ V.
+            writeln!(code, "            {{")?;
+            writeln!(code, "                let seq_len_u: u64 = (start_pos + m) as u64;")?;
+            writeln!(code, "                let mnh: u64 = (m * NUM_HEADS) as u64;")?;
+            writeln!(code, "                let hd_u: u64 = HEAD_DIM as u64;")?;
+            writeln!(code, "                self.mps_matmul_f16_general(&cmd, &self.attn_scores_f16, mnh, seq_len_u, {scores_stride} as u64, &self.v_cache[layer], seq_len_u, hd_u, {kv_row_bytes} as u64, &self.mps_out_f16, hd_u * 2, false, mnh, hd_u, seq_len_u, 1.0_f64);")?;
+            writeln!(code, "            }}")?;
+            writeln!(code, "            {{")?;
+            writeln!(code, "                let enc = cmd.new_compute_command_encoder();")?;
+            writeln!(code, "                self.dispatch_convert_f16_to_f32(&enc, &self.mps_out_f16, &self.batch_attn_out_buf, m * {hidden});")?;
+            writeln!(code, "                self.dispatch_convert_f32_to_f16(&enc, &self.batch_attn_out_buf, &self.mps_in_f16, m * {hidden});")?;
+            writeln!(code, "                enc.end_encoding();")?;
+            writeln!(code, "            }}")?;
         }
-        writeln!(code, "                self.dispatch_rope_qk_batch(&enc, &self.batch_qkv_buf, m, start_pos, {qkv_rows});")?;
-        writeln!(code, "                self.dispatch_copy_kv_both_batch(&enc, &self.batch_qkv_buf, &self.k_cache[layer], &self.v_cache[layer], m, {kv_dim}, start_pos, {qkv_rows}, {k_float_offset}, {v_float_offset});")?;
-        writeln!(code, "                self.dispatch_attention_batch(&enc, &self.batch_qkv_buf, &self.k_cache[layer], &self.v_cache[layer], &self.batch_attn_out_buf, m, start_pos, {qkv_rows});")?;
-        writeln!(code, "                self.dispatch_convert_f32_to_f16(&enc, &self.batch_attn_out_buf, &self.mps_in_f16, m * {hidden});")?;
-        writeln!(code, "                enc.end_encoding();")?;
-        writeln!(code, "            }}")?;
         // MPS O
         writeln!(code, "            self.mps_matmul_f16(&cmd, &self.layers[layer].o_weight_f16, m, {hidden} as u64, {hidden} as u64);")?;
         // Segment C: O output convert, add_inplace, ffn_norm, convert for gate_up
@@ -5375,6 +5535,65 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         writeln!(code, "        enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(256, 1, 1));")?;
         writeln!(code, "    }}")?;
         writeln!(code)?;
+
+        if num_kv_heads == 1 {
+            // General MPS matmul (explicit row strides / transpose flag).
+            writeln!(code, "    #[allow(clippy::too_many_arguments)]")?;
+            writeln!(code, "    fn mps_matmul_f16_general(&self, cmd: &CommandBufferRef, left_buf: &Buffer, left_rows: u64, left_cols: u64, left_stride_bytes: u64, right_buf: &Buffer, right_rows: u64, right_cols: u64, right_stride_bytes: u64, result_buf: &Buffer, result_stride_bytes: u64, transpose_right: bool, result_rows: u64, result_cols: u64, interior_cols: u64, alpha: f64) {{")?;
+            writeln!(code, "        use metal::objc::runtime::Object;")?;
+            writeln!(code, "        unsafe {{")?;
+            writeln!(code, "            let left_desc = mps::descriptor(left_rows, left_cols, left_stride_bytes, mps::MPS_DATA_TYPE_F16);")?;
+            writeln!(code, "            let right_desc = mps::descriptor(right_rows, right_cols, right_stride_bytes, mps::MPS_DATA_TYPE_F16);")?;
+            writeln!(code, "            let result_desc = mps::descriptor(result_rows, result_cols, result_stride_bytes, mps::MPS_DATA_TYPE_F16);")?;
+            writeln!(code, "            let left = mps::matrix(left_buf.as_ptr() as *mut Object, left_desc);")?;
+            writeln!(code, "            let right = mps::matrix(right_buf.as_ptr() as *mut Object, right_desc);")?;
+            writeln!(code, "            let result = mps::matrix(result_buf.as_ptr() as *mut Object, result_desc);")?;
+            writeln!(code, "            let op = mps::matmul_op(self.device.as_ptr() as *mut Object, false, transpose_right, result_rows, result_cols, interior_cols, alpha, 0.0);")?;
+            writeln!(code, "            mps::encode(op, cmd.as_ptr() as *mut Object, left, right, result);")?;
+            writeln!(code, "            mps::release(op);")?;
+            writeln!(code, "            mps::release(left);")?;
+            writeln!(code, "            mps::release(right);")?;
+            writeln!(code, "            mps::release(result);")?;
+            writeln!(code, "        }}")?;
+            writeln!(code, "    }}")?;
+            writeln!(code)?;
+            // Q extraction kernel dispatch.
+            writeln!(code, "    fn dispatch_extract_q_to_f16_mqa(&self, enc: &ComputeCommandEncoderRef, m: usize) {{")?;
+            writeln!(code, "        let m32 = m as u32;")?;
+            writeln!(code, "        let nh = NUM_HEADS as u32;")?;
+            writeln!(code, "        let hd = HEAD_DIM as u32;")?;
+            writeln!(code, "        let qkv_stride: u32 = {} as u32;", qkv_rows)?;
+            writeln!(code, "        enc.set_compute_pipeline_state(&self.extract_q_to_f16_mqa_pipeline);")?;
+            writeln!(code, "        enc.set_buffer(0, Some(&self.batch_qkv_buf), 0);")?;
+            writeln!(code, "        enc.set_buffer(1, Some(&self.q_f16), 0);")?;
+            writeln!(code, "        enc.set_bytes(2, 4, &m32 as *const u32 as *const _);")?;
+            writeln!(code, "        enc.set_bytes(3, 4, &nh as *const u32 as *const _);")?;
+            writeln!(code, "        enc.set_bytes(4, 4, &hd as *const u32 as *const _);")?;
+            writeln!(code, "        enc.set_bytes(5, 4, &qkv_stride as *const u32 as *const _);")?;
+            writeln!(code, "        let total = (m * NUM_HEADS * HEAD_DIM) as u64;")?;
+            writeln!(code, "        enc.dispatch_threads(MTLSize::new(total, 1, 1), MTLSize::new(256, 1, 1));")?;
+            writeln!(code, "    }}")?;
+            writeln!(code)?;
+            // Softmax dispatch.
+            writeln!(code, "    fn dispatch_softmax_causal_scale_f16(&self, enc: &ComputeCommandEncoderRef, m: usize, seq_len: usize, row_stride: usize, base_pos: usize, scale: f32) {{")?;
+            writeln!(code, "        let m32 = m as u32;")?;
+            writeln!(code, "        let nh = NUM_HEADS as u32;")?;
+            writeln!(code, "        let sl = seq_len as u32;")?;
+            writeln!(code, "        let rs = row_stride as u32;")?;
+            writeln!(code, "        let bp = base_pos as u32;")?;
+            writeln!(code, "        enc.set_compute_pipeline_state(&self.softmax_causal_scale_f16_pipeline);")?;
+            writeln!(code, "        enc.set_buffer(0, Some(&self.attn_scores_f16), 0);")?;
+            writeln!(code, "        enc.set_bytes(1, 4, &m32 as *const u32 as *const _);")?;
+            writeln!(code, "        enc.set_bytes(2, 4, &nh as *const u32 as *const _);")?;
+            writeln!(code, "        enc.set_bytes(3, 4, &sl as *const u32 as *const _);")?;
+            writeln!(code, "        enc.set_bytes(4, 4, &rs as *const u32 as *const _);")?;
+            writeln!(code, "        enc.set_bytes(5, 4, &bp as *const u32 as *const _);")?;
+            writeln!(code, "        enc.set_bytes(6, 4, &scale as *const f32 as *const _);")?;
+            writeln!(code, "        let rows = (m * NUM_HEADS) as u64;")?;
+            writeln!(code, "        enc.dispatch_thread_groups(MTLSize::new(rows, 1, 1), MTLSize::new(32, 1, 1));")?;
+            writeln!(code, "    }}")?;
+            writeln!(code)?;
+        }
     }
 
     // ── Private dispatch helpers (all take a shared compute encoder) ──
