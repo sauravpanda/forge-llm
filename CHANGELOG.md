@@ -2,6 +2,35 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.7.8] — 2026-04-20 — MPSMatrixMultiplication Prefill Path
+
+Major prefill performance jump for Gemma-class models (hidden ≥ 2048) via Apple's Metal Performance Shaders.  Non-qualifying models are unaffected.
+
+### Performance (Apple M5 Pro, Gemma-1.1-2B Q8_0)
+
+| Prompt length | v0.7.7 | **v0.7.8** | Δ vs v0.7.7 | Δ vs v0.7.6 |
+|---|---:|---:|---:|---:|
+| 1001 tokens | 1304 tok/s | **3088 tok/s** | **+137%** | +169% |
+| 2601 tokens | 1155 tok/s | **2136 tok/s** | **+85%** | +107% |
+
+That's 87% of llama.cpp's Gemma-1-2B throughput at 1001 tokens, 63% at 2601 tokens on the same hardware (up from 35–40% at v0.7.7).
+
+### How
+
+- **Pre-dequantization at load**: `dequant_q8_to_f16` runs once per prefill weight and writes a contiguous `[rows, cols]` row-major f16 buffer alongside the existing Q8_0 one.  Adds ~2.6 GB of additional weight memory for Gemma-1-2B.
+- **MPSMatrixMultiplication dispatch**: all four prefill matmuls (QKV, O, gate_up, down) run through `MPSMatrixMultiplication` f16×f16→f16.  Called via raw `objc` — the `metal` crate does not expose MPS matrix bindings.
+- **f32↔f16 convert kernels** (`convert_f32_to_f16`, `convert_f16_to_f32`) wrap every MPS call: residual stream stays f32, but MPS inputs/outputs are f16.  The compute encoder is split into 4 sub-encoders per layer (one per matmul phase) because MPS creates its own internal encoder.
+- **Gated on `is_q8 && hidden >= 2048`** — smaller Q8 models (SmolLM-135M at hidden=576) keep the existing `hh4_wide` path unchanged; the conversion-kernel overhead dominates at small hidden.
+
+### Correctness
+
+- Byte-identical output on Gemma-1.1-2B "meaning of life" prompt vs v0.7.7: *"a profound question that has captivated philosophers and theologians for centuries. While there is no definitive answer, exploring this question can lead to profound insights into the nature of existence."*
+- 71/71 Metal codegen tests pass.
+
+### Why this works where hh4 tuning didn't
+
+Prior v0.7.x matmul work extracted the local maximum of our 8-accumulator/12 KB-TG-memory algorithm family at ~17% of f16 peak.  The remaining 3× gap was structural — MPS uses a fundamentally different tile/scheduling strategy.  This release doesn't tune our kernel; it delegates to a kernel that already runs at ~54% of peak.
+
 ## [0.7.7] — 2026-04-20 — Gemma-1 Prefill MMA Throughput
 
 Minor release focused on Apple Silicon prefill throughput for Gemma-class models (hidden ≥ 2048). No API changes; non-Gemma models are unaffected (dispatch conditions `cols ≥ 2048 && num_tokens ≥ 256 && cols % 64 == 0`).

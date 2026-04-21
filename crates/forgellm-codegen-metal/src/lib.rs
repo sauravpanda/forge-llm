@@ -2507,6 +2507,46 @@ kernel void matmul_q8_mma32_hh4_wide(
     }
 }
 
+// ── dequant_q8_to_f16 / convert_f32_to_f16 / convert_f16_to_f32 ──────
+// Support kernels for the MPSMatrixMultiplication path (emitted only when
+// the model qualifies).  dequant runs once at load time; the convert pair
+// wraps every MPS matmul call in prefill (input f32→f16, output f16→f32).
+kernel void dequant_q8_to_f16(
+    device const uchar* q8_matrix [[buffer(0)]],
+    device half* f16_out          [[buffer(1)]],
+    constant uint& num_blocks     [[buffer(2)]],
+    uint id [[thread_position_in_grid]])
+{
+    if (id >= num_blocks) return;
+    device const uchar* bp = q8_matrix + id * 34;
+    half sc = *(device const half*)bp;
+    device const int8_t* qp = (device const int8_t*)(bp + 2);
+    device half* op = f16_out + id * 32;
+    for (uint i = 0; i < 32; i++) {
+        op[i] = half(int(qp[i])) * sc;
+    }
+}
+
+kernel void convert_f32_to_f16(
+    device const float* in  [[buffer(0)]],
+    device half* out        [[buffer(1)]],
+    constant uint& n        [[buffer(2)]],
+    uint id [[thread_position_in_grid]])
+{
+    if (id >= n) return;
+    out[id] = half(in[id]);
+}
+
+kernel void convert_f16_to_f32(
+    device const half* in   [[buffer(0)]],
+    device float* out       [[buffer(1)]],
+    constant uint& n        [[buffer(2)]],
+    uint id [[thread_position_in_grid]])
+{
+    if (id >= n) return;
+    out[id] = float(in[id]);
+}
+
 // ── add_bias_batch ─────────────────────────────────────────────────────
 // Broadcast-add a per-row bias vector to every row of an [M, rows] output.
 // Used for Qwen2 QKV bias after the fused qkv matmul.
@@ -3363,6 +3403,109 @@ fn emit_model_header(code: &mut String, config: &ModelConfig) -> Result<(), Meta
     writeln!(code, "use std::mem;")?;
     writeln!(code)?;
 
+    let use_mps = config.dtype == DType::Q8_0 && config.hidden_size >= 2048;
+    if use_mps {
+        writeln!(code, "use metal::foreign_types::ForeignTypeRef;")?;
+        writeln!(code)?;
+        writeln!(
+            code,
+            "// ── MPS (Metal Performance Shaders) raw objc bindings ─────────"
+        )?;
+        writeln!(
+            code,
+            "// The `metal` crate does not expose MPSMatrixMultiplication; we call"
+        )?;
+        writeln!(
+            code,
+            "// it directly via `objc`.  Used for the four large prefill matmuls"
+        )?;
+        writeln!(
+            code,
+            "// on Q8_0 models with hidden >= 2048 (Gemma-1-2B and up).  Weights"
+        )?;
+        writeln!(
+            code,
+            "// are pre-dequantized to f16 once at load time."
+        )?;
+        writeln!(code, "mod mps {{")?;
+        writeln!(
+            code,
+            "    use metal::objc::runtime::Object;"
+        )?;
+        writeln!(
+            code,
+            "    use metal::objc::{{class, msg_send, sel, sel_impl}};"
+        )?;
+        writeln!(code)?;
+        writeln!(code, "    pub const MPS_DATA_TYPE_F16: u32 = 0x10000010;")?;
+        writeln!(code)?;
+        writeln!(
+            code,
+            "    pub unsafe fn descriptor(rows: u64, columns: u64, row_bytes: u64, data_type: u32) -> *mut Object {{"
+        )?;
+        writeln!(code, "        let cls = class!(MPSMatrixDescriptor);")?;
+        writeln!(code, "        msg_send![cls,")?;
+        writeln!(code, "            matrixDescriptorWithRows: rows")?;
+        writeln!(code, "            columns: columns")?;
+        writeln!(code, "            rowBytes: row_bytes")?;
+        writeln!(code, "            dataType: data_type]")?;
+        writeln!(code, "    }}")?;
+        writeln!(code)?;
+        writeln!(
+            code,
+            "    pub unsafe fn matrix(buf_ptr: *mut Object, desc: *mut Object) -> *mut Object {{"
+        )?;
+        writeln!(code, "        let cls = class!(MPSMatrix);")?;
+        writeln!(
+            code,
+            "        let instance: *mut Object = msg_send![cls, alloc];"
+        )?;
+        writeln!(
+            code,
+            "        msg_send![instance, initWithBuffer: buf_ptr descriptor: desc]"
+        )?;
+        writeln!(code, "    }}")?;
+        writeln!(code)?;
+        writeln!(
+            code,
+            "    pub unsafe fn matmul_op(device_ptr: *mut Object, transpose_left: bool, transpose_right: bool, result_rows: u64, result_cols: u64, interior_cols: u64, alpha: f64, beta: f64) -> *mut Object {{"
+        )?;
+        writeln!(code, "        let cls = class!(MPSMatrixMultiplication);")?;
+        writeln!(
+            code,
+            "        let instance: *mut Object = msg_send![cls, alloc];"
+        )?;
+        writeln!(code, "        msg_send![instance,")?;
+        writeln!(code, "            initWithDevice: device_ptr")?;
+        writeln!(code, "            transposeLeft: transpose_left")?;
+        writeln!(code, "            transposeRight: transpose_right")?;
+        writeln!(code, "            resultRows: result_rows")?;
+        writeln!(code, "            resultColumns: result_cols")?;
+        writeln!(code, "            interiorColumns: interior_cols")?;
+        writeln!(code, "            alpha: alpha")?;
+        writeln!(code, "            beta: beta]")?;
+        writeln!(code, "    }}")?;
+        writeln!(code)?;
+        writeln!(
+            code,
+            "    pub unsafe fn encode(op: *mut Object, cmd_ptr: *mut Object, left: *mut Object, right: *mut Object, result: *mut Object) {{"
+        )?;
+        writeln!(code, "        let _: () = msg_send![op,")?;
+        writeln!(code, "            encodeToCommandBuffer: cmd_ptr")?;
+        writeln!(code, "            leftMatrix: left")?;
+        writeln!(code, "            rightMatrix: right")?;
+        writeln!(code, "            resultMatrix: result];")?;
+        writeln!(code, "    }}")?;
+        writeln!(code)?;
+        writeln!(code, "    pub unsafe fn release(obj: *mut Object) {{")?;
+        writeln!(code, "        if !obj.is_null() {{")?;
+        writeln!(code, "            let _: () = msg_send![obj, release];")?;
+        writeln!(code, "        }}")?;
+        writeln!(code, "    }}")?;
+        writeln!(code, "}}")?;
+        writeln!(code)?;
+    }
+
     // Model constants
     writeln!(
         code,
@@ -3417,6 +3560,11 @@ fn emit_metal_model_struct(
     code: &mut String,
     config: &ModelConfig,
 ) -> Result<(), MetalCodegenError> {
+    // MPS (Metal Performance Shaders) matmul path: pre-dequantize Q8_0
+    // weights to contiguous f16 once at model load, then dispatch MPS
+    // f16×f16→f16 for the four prefill matmuls.  Gated on Q8_0 + large
+    // hidden; smaller models don't benefit from the conversion overhead.
+    let use_mps = config.dtype == DType::Q8_0 && config.hidden_size >= 2048;
     writeln!(
         code,
         "// ── MetalModel ──────────────────────────────────────────"
@@ -3513,7 +3661,30 @@ fn emit_metal_model_struct(
         code,
         "    copy_kv_both_batch_pipeline: ComputePipelineState,"
     )?;
+    if use_mps {
+        writeln!(
+            code,
+            "    dequant_q8_to_f16_pipeline: ComputePipelineState,"
+        )?;
+        writeln!(
+            code,
+            "    convert_f32_to_f16_pipeline: ComputePipelineState,"
+        )?;
+        writeln!(
+            code,
+            "    convert_f16_to_f32_pipeline: ComputePipelineState,"
+        )?;
+    }
     writeln!(code)?;
+    if use_mps {
+        writeln!(
+            code,
+            "    // ── MPS matmul scratch (sized for the largest shape) ──"
+        )?;
+        writeln!(code, "    mps_in_f16: Buffer,")?;
+        writeln!(code, "    mps_out_f16: Buffer,")?;
+        writeln!(code)?;
+    }
     writeln!(code, "    // ── Weight buffers (Metal shared memory) ──")?;
     writeln!(
         code,
@@ -3620,6 +3791,7 @@ fn emit_layer_buffers_struct(
     code: &mut String,
     config: &ModelConfig,
 ) -> Result<(), MetalCodegenError> {
+    let use_mps = config.dtype == DType::Q8_0 && config.hidden_size >= 2048;
     writeln!(
         code,
         "/// Per-layer weight buffers for attention and FFN projections."
@@ -3646,6 +3818,13 @@ fn emit_layer_buffers_struct(
     )?;
     writeln!(code, "    gate_up_weight: Buffer,")?;
     writeln!(code, "    down_weight: Buffer,")?;
+    if use_mps {
+        writeln!(code, "    // Pre-dequantized f16 copies for the MPS matmul path.")?;
+        writeln!(code, "    qkv_weight_f16: Buffer,")?;
+        writeln!(code, "    o_weight_f16: Buffer,")?;
+        writeln!(code, "    gate_up_weight_f16: Buffer,")?;
+        writeln!(code, "    down_weight_f16: Buffer,")?;
+    }
     writeln!(code, "}}")?;
     writeln!(code)?;
 
@@ -3772,6 +3951,19 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
             code,
             "        let add_bias_batch_pipeline = make_pipeline(&device, &library, \"add_bias_batch\");"
         )?;
+    }
+    let use_mps = is_q8 && hidden >= 2048;
+    if use_mps {
+        for (var, fn_name) in [
+            ("dequant_q8_to_f16_pipeline", "dequant_q8_to_f16"),
+            ("convert_f32_to_f16_pipeline", "convert_f32_to_f16"),
+            ("convert_f16_to_f32_pipeline", "convert_f16_to_f32"),
+        ] {
+            writeln!(
+                code,
+                "        let {var} = make_pipeline(&device, &library, \"{fn_name}\");"
+            )?;
+        }
     }
     writeln!(code)?;
 
@@ -4080,6 +4272,29 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         )?;
     }
 
+    let use_mps_init = is_q8 && hidden >= 2048;
+    if use_mps_init {
+        let qkv_bytes = qkv_rows * hidden * 2;
+        let o_bytes = hidden * hidden * 2;
+        let gu_bytes = gate_up_rows * hidden * 2;
+        let down_bytes = hidden * intermediate * 2;
+        writeln!(
+            code,
+            "            let qkv_weight_f16 = device.new_buffer({qkv_bytes} as u64, MTLResourceOptions::StorageModePrivate);"
+        )?;
+        writeln!(
+            code,
+            "            let o_weight_f16 = device.new_buffer({o_bytes} as u64, MTLResourceOptions::StorageModePrivate);"
+        )?;
+        writeln!(
+            code,
+            "            let gate_up_weight_f16 = device.new_buffer({gu_bytes} as u64, MTLResourceOptions::StorageModePrivate);"
+        )?;
+        writeln!(
+            code,
+            "            let down_weight_f16 = device.new_buffer({down_bytes} as u64, MTLResourceOptions::StorageModePrivate);"
+        )?;
+    }
     writeln!(code, "            layers.push(LayerBuffers {{")?;
     writeln!(code, "                attn_norm,")?;
     writeln!(code, "                qkv_weight,")?;
@@ -4090,6 +4305,12 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "                ffn_norm,")?;
     writeln!(code, "                gate_up_weight,")?;
     writeln!(code, "                down_weight,")?;
+    if use_mps_init {
+        writeln!(code, "                qkv_weight_f16,")?;
+        writeln!(code, "                o_weight_f16,")?;
+        writeln!(code, "                gate_up_weight_f16,")?;
+        writeln!(code, "                down_weight_f16,")?;
+    }
     writeln!(code, "            }});")?;
     writeln!(code, "        }}")?;
     writeln!(code)?;
@@ -4266,6 +4487,54 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "        }}")?;
     writeln!(code)?;
 
+    if is_q8 && hidden >= 2048 {
+        // Pre-dequantize every Q8_0 prefill weight into a contiguous f16
+        // buffer for MPSMatrixMultiplication.  One-shot dispatch at load
+        // time; the Q8_0 buffers are kept for any non-MPS code paths that
+        // still need them (decode path, non-qualifying matmuls).
+        let qkv_blocks = (qkv_rows * hidden) / 32;
+        let o_blocks = (hidden * hidden) / 32;
+        let gu_blocks = (gate_up_rows * hidden) / 32;
+        let down_blocks = (hidden * intermediate) / 32;
+        writeln!(code, "        {{")?;
+        writeln!(code, "            let cmd = queue.new_command_buffer();")?;
+        writeln!(code, "            let enc = cmd.new_compute_command_encoder();")?;
+        writeln!(code, "            enc.set_compute_pipeline_state(&dequant_q8_to_f16_pipeline);")?;
+        writeln!(code, "            let dispatch = |src: &Buffer, dst: &Buffer, num_blocks: u32| {{")?;
+        writeln!(code, "                enc.set_buffer(0, Some(src), 0);")?;
+        writeln!(code, "                enc.set_buffer(1, Some(dst), 0);")?;
+        writeln!(code, "                enc.set_bytes(2, std::mem::size_of::<u32>() as u64, &num_blocks as *const u32 as *const _);")?;
+        writeln!(code, "                enc.dispatch_threads(MTLSize::new(num_blocks as u64, 1, 1), MTLSize::new(256, 1, 1));")?;
+        writeln!(code, "            }};")?;
+        writeln!(code, "            for layer in &layers {{")?;
+        writeln!(code, "                dispatch(&layer.qkv_weight, &layer.qkv_weight_f16, {qkv_blocks} as u32);")?;
+        writeln!(code, "                dispatch(&layer.o_weight, &layer.o_weight_f16, {o_blocks} as u32);")?;
+        writeln!(code, "                dispatch(&layer.gate_up_weight, &layer.gate_up_weight_f16, {gu_blocks} as u32);")?;
+        writeln!(code, "                dispatch(&layer.down_weight, &layer.down_weight_f16, {down_blocks} as u32);")?;
+        writeln!(code, "            }}")?;
+        writeln!(code, "            enc.end_encoding();")?;
+        writeln!(code, "            cmd.commit();")?;
+        writeln!(code, "            cmd.wait_until_completed();")?;
+        writeln!(code, "        }}")?;
+        writeln!(code)?;
+        // Scratch sized for the largest matmul shape in the prefill path.
+        let max_cols = intermediate.max(hidden);
+        let max_rows = gate_up_rows.max(qkv_rows).max(hidden);
+        writeln!(
+            code,
+            "        let mps_in_f16 = device.new_buffer(({max_batch} * {max_cols} * 2) as u64, MTLResourceOptions::StorageModePrivate);",
+            max_batch = "MAX_BATCH_SIZE",
+            max_cols = max_cols
+        )?;
+        writeln!(
+            code,
+            "        let mps_out_f16 = device.new_buffer(({max_batch} * {max_rows} * 2) as u64, MTLResourceOptions::StorageModePrivate);",
+            max_batch = "MAX_BATCH_SIZE",
+            max_rows = max_rows
+        )?;
+        writeln!(code)?;
+    }
+
     writeln!(code, "        Self {{")?;
     writeln!(code, "            device,")?;
     writeln!(code, "            queue,")?;
@@ -4308,6 +4577,13 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            copy_kv_batch_pipeline,")?;
     writeln!(code, "            rope_qk_batch_pipeline,")?;
     writeln!(code, "            copy_kv_both_batch_pipeline,")?;
+    if is_q8 && hidden >= 2048 {
+        writeln!(code, "            dequant_q8_to_f16_pipeline,")?;
+        writeln!(code, "            convert_f32_to_f16_pipeline,")?;
+        writeln!(code, "            convert_f16_to_f32_pipeline,")?;
+        writeln!(code, "            mps_in_f16,")?;
+        writeln!(code, "            mps_out_f16,")?;
+    }
     writeln!(code, "            embed_buf,")?;
     writeln!(code, "            layers,")?;
     writeln!(code, "            norm_buf,")?;
@@ -4914,168 +5190,120 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "        }}")?;
     writeln!(code)?;
 
-    writeln!(code, "        let cmd = self.queue.new_command_buffer();")?;
-    writeln!(code, "        {{")?;
-    writeln!(
-        code,
-        "            let enc = cmd.new_compute_command_encoder();"
-    )?;
-    writeln!(code)?;
-
-    // 1. Batch embedding lookup
-    writeln!(
-        code,
-        "            // 1. Batch embedding lookup: copy all token embeddings at once"
-    )?;
-    writeln!(
-        code,
-        "            self.dispatch_copy_embedding_batch(&enc, m);"
-    )?;
-    if matches!(config.hidden_activation, HiddenActivation::GeluApprox) {
-        // Gemma-1: scale embeddings by sqrt(hidden_size) after lookup.
-        writeln!(
-            code,
-            "            // Gemma-1 embedding scale by sqrt(hidden_size)"
-        )?;
-        writeln!(
-            code,
-            "            self.dispatch_scale_buffer(&enc, &self.batch_hidden_buf, {scale:e}_f32, m * {hidden});",
-            scale = (hidden as f32).sqrt(),
-        )?;
-    }
-    // Copy batch_hidden -> batch_residual
-    writeln!(
-        code,
-        "            self.dispatch_add_inplace_batch_copy(&enc, &self.batch_hidden_buf, &self.batch_residual_buf, m * {hidden});"
-    )?;
-    writeln!(code)?;
-
-    // 2. Transformer layers
-    writeln!(code, "            // 2. Transformer layers")?;
-    writeln!(code, "            for layer in 0..NUM_LAYERS {{")?;
-    writeln!(code)?;
-
-    // Batch RMS norm: residual -> hidden (batched)
-    writeln!(
-        code,
-        "                // Batch RMS norm: batch_residual -> batch_hidden"
-    )?;
-    writeln!(
-        code,
-        "                self.dispatch_rms_norm_batch(&enc, &self.batch_residual_buf, &self.layers[layer].attn_norm, &self.batch_hidden_buf, m);"
-    )?;
-
-    // Batch QKV matmul
-    writeln!(
-        code,
-        "                // Batch QKV matmul: [M, hidden] x [qkv_rows, hidden]^T -> [M, qkv_rows]"
-    )?;
-    writeln!(
-        code,
-        "                self.{batch_matmul_fn}(&enc, &self.batch_hidden_buf, &self.layers[layer].qkv_weight, &self.batch_qkv_buf, m, {qkv_rows}, {hidden});"
-    )?;
-    if config.qkv_bias {
-        writeln!(
-            code,
-            "                // Qwen2: broadcast-add QKV bias across all M tokens."
-        )?;
-        writeln!(
-            code,
-            "                self.dispatch_add_bias_batch(&enc, &self.batch_qkv_buf, &self.layers[layer].qkv_bias, m, {qkv_rows});"
-        )?;
-    }
-    writeln!(code)?;
-
-    // Fused RoPE on Q+K portions in a single dispatch
+    let use_mps = is_q8 && hidden >= 2048;
     let k_float_offset = hidden;
-    writeln!(
-        code,
-        "                // Fused RoPE on Q+K in one dispatch (saves 1 dispatch + barrier per layer)"
-    )?;
-    writeln!(
-        code,
-        "                self.dispatch_rope_qk_batch(&enc, &self.batch_qkv_buf, m, start_pos, {qkv_rows});"
-    )?;
-    writeln!(code)?;
-
-    // Fused KV cache update: copy both K and V in a single dispatch
     let v_float_offset = hidden + kv_dim;
-    writeln!(
-        code,
-        "                // Fused KV cache update: copy K+V in one dispatch (saves 1 dispatch + barrier per layer)"
-    )?;
-    writeln!(
-        code,
-        "                self.dispatch_copy_kv_both_batch(&enc, &self.batch_qkv_buf, &self.k_cache[layer], &self.v_cache[layer], m, {kv_dim}, start_pos, {qkv_rows}, {k_float_offset}, {v_float_offset});"
-    )?;
-    writeln!(code)?;
+    writeln!(code, "        let cmd = self.queue.new_command_buffer();")?;
 
-    // Batched causal attention: ONE dispatch for all M tokens
-    writeln!(
-        code,
-        "                // Batched causal attention: one dispatch for all M tokens"
-    )?;
-    writeln!(
-        code,
-        "                self.dispatch_attention_batch(&enc, &self.batch_qkv_buf, &self.k_cache[layer], &self.v_cache[layer], &self.batch_attn_out_buf, m, start_pos, {qkv_rows});"
-    )?;
-    writeln!(code)?;
-
-    // Batched O projection: [M, hidden] x [hidden, hidden]^T -> [M, hidden]
-    writeln!(code, "                // Batched O projection")?;
-    writeln!(
-        code,
-        "                self.{batch_matmul_fn}(&enc, &self.batch_attn_out_buf, &self.layers[layer].o_weight, &self.batch_attn_proj_buf, m, {hidden}, {hidden});"
-    )?;
-    writeln!(code)?;
-
-    // Batch add: residual += attn_proj for all tokens
-    writeln!(
-        code,
-        "                self.dispatch_add_inplace_batch_n(&enc, &self.batch_residual_buf, &self.batch_attn_proj_buf, m * {hidden});"
-    )?;
-    writeln!(code)?;
-
-    // Batch FFN
-    writeln!(
-        code,
-        "                // Batch FFN: rms_norm, gate+up matmul, silu_mul, down matmul"
-    )?;
-    writeln!(
-        code,
-        "                self.dispatch_rms_norm_batch(&enc, &self.batch_residual_buf, &self.layers[layer].ffn_norm, &self.batch_hidden_buf, m);"
-    )?;
-    writeln!(
-        code,
-        "                self.{batch_matmul_fn}(&enc, &self.batch_hidden_buf, &self.layers[layer].gate_up_weight, &self.batch_gate_up_buf, m, {gate_up_rows}, {hidden});"
-    )?;
-    writeln!(
-        code,
-        "                self.dispatch_silu_mul_fused_batch(&enc, &self.batch_gate_up_buf, &self.batch_ffn_hidden_buf, {intermediate}, m);"
-    )?;
-    writeln!(
-        code,
-        "                self.{batch_matmul_fn}(&enc, &self.batch_ffn_hidden_buf, &self.layers[layer].down_weight, &self.batch_ffn_out_buf, m, {hidden}, {intermediate});"
-    )?;
-    writeln!(
-        code,
-        "                self.dispatch_add_inplace_batch_n(&enc, &self.batch_residual_buf, &self.batch_ffn_out_buf, m * {hidden});"
-    )?;
-    writeln!(code, "            }}")?;
-    writeln!(code)?;
-
-    // Copy last token's residual to single-token residual_buf for next forward() call
-    writeln!(
-        code,
-        "            // Copy last token's residual to single-token buffer for subsequent forward()"
-    )?;
-    writeln!(
-        code,
-        "            self.dispatch_copy_from_offset_bytes(&enc, &self.batch_residual_buf, (m - 1) * {hidden} * 4, &self.residual_buf, 0, {hidden});"
-    )?;
-    writeln!(code)?;
-    writeln!(code, "            enc.end_encoding();")?;
-    writeln!(code, "        }}")?;
+    if !use_mps {
+        // ── Non-MPS path: one big compute encoder covers the whole prefill ──
+        writeln!(code, "        {{")?;
+        writeln!(code, "            let enc = cmd.new_compute_command_encoder();")?;
+        writeln!(code, "            self.dispatch_copy_embedding_batch(&enc, m);")?;
+        if matches!(config.hidden_activation, HiddenActivation::GeluApprox) {
+            writeln!(
+                code,
+                "            self.dispatch_scale_buffer(&enc, &self.batch_hidden_buf, {scale:e}_f32, m * {hidden});",
+                scale = (hidden as f32).sqrt(),
+            )?;
+        }
+        writeln!(code, "            self.dispatch_add_inplace_batch_copy(&enc, &self.batch_hidden_buf, &self.batch_residual_buf, m * {hidden});")?;
+        writeln!(code, "            for layer in 0..NUM_LAYERS {{")?;
+        writeln!(code, "                self.dispatch_rms_norm_batch(&enc, &self.batch_residual_buf, &self.layers[layer].attn_norm, &self.batch_hidden_buf, m);")?;
+        writeln!(code, "                self.{batch_matmul_fn}(&enc, &self.batch_hidden_buf, &self.layers[layer].qkv_weight, &self.batch_qkv_buf, m, {qkv_rows}, {hidden});")?;
+        if config.qkv_bias {
+            writeln!(code, "                self.dispatch_add_bias_batch(&enc, &self.batch_qkv_buf, &self.layers[layer].qkv_bias, m, {qkv_rows});")?;
+        }
+        writeln!(code, "                self.dispatch_rope_qk_batch(&enc, &self.batch_qkv_buf, m, start_pos, {qkv_rows});")?;
+        writeln!(code, "                self.dispatch_copy_kv_both_batch(&enc, &self.batch_qkv_buf, &self.k_cache[layer], &self.v_cache[layer], m, {kv_dim}, start_pos, {qkv_rows}, {k_float_offset}, {v_float_offset});")?;
+        writeln!(code, "                self.dispatch_attention_batch(&enc, &self.batch_qkv_buf, &self.k_cache[layer], &self.v_cache[layer], &self.batch_attn_out_buf, m, start_pos, {qkv_rows});")?;
+        writeln!(code, "                self.{batch_matmul_fn}(&enc, &self.batch_attn_out_buf, &self.layers[layer].o_weight, &self.batch_attn_proj_buf, m, {hidden}, {hidden});")?;
+        writeln!(code, "                self.dispatch_add_inplace_batch_n(&enc, &self.batch_residual_buf, &self.batch_attn_proj_buf, m * {hidden});")?;
+        writeln!(code, "                self.dispatch_rms_norm_batch(&enc, &self.batch_residual_buf, &self.layers[layer].ffn_norm, &self.batch_hidden_buf, m);")?;
+        writeln!(code, "                self.{batch_matmul_fn}(&enc, &self.batch_hidden_buf, &self.layers[layer].gate_up_weight, &self.batch_gate_up_buf, m, {gate_up_rows}, {hidden});")?;
+        writeln!(code, "                self.dispatch_silu_mul_fused_batch(&enc, &self.batch_gate_up_buf, &self.batch_ffn_hidden_buf, {intermediate}, m);")?;
+        writeln!(code, "                self.{batch_matmul_fn}(&enc, &self.batch_ffn_hidden_buf, &self.layers[layer].down_weight, &self.batch_ffn_out_buf, m, {hidden}, {intermediate});")?;
+        writeln!(code, "                self.dispatch_add_inplace_batch_n(&enc, &self.batch_residual_buf, &self.batch_ffn_out_buf, m * {hidden});")?;
+        writeln!(code, "            }}")?;
+        writeln!(code, "            self.dispatch_copy_from_offset_bytes(&enc, &self.batch_residual_buf, (m - 1) * {hidden} * 4, &self.residual_buf, 0, {hidden});")?;
+        writeln!(code, "            enc.end_encoding();")?;
+        writeln!(code, "        }}")?;
+    } else {
+        // ── MPS path: compute encoders are split around each MPS matmul ──
+        writeln!(code, "        {{")?;
+        writeln!(code, "            let enc = cmd.new_compute_command_encoder();")?;
+        writeln!(code, "            self.dispatch_copy_embedding_batch(&enc, m);")?;
+        if matches!(config.hidden_activation, HiddenActivation::GeluApprox) {
+            writeln!(
+                code,
+                "            self.dispatch_scale_buffer(&enc, &self.batch_hidden_buf, {scale:e}_f32, m * {hidden});",
+                scale = (hidden as f32).sqrt(),
+            )?;
+        }
+        writeln!(code, "            self.dispatch_add_inplace_batch_copy(&enc, &self.batch_hidden_buf, &self.batch_residual_buf, m * {hidden});")?;
+        writeln!(code, "            enc.end_encoding();")?;
+        writeln!(code, "        }}")?;
+        writeln!(code, "        for layer in 0..NUM_LAYERS {{")?;
+        // Segment A: RMS → convert input to f16 for QKV matmul
+        writeln!(code, "            {{")?;
+        writeln!(code, "                let enc = cmd.new_compute_command_encoder();")?;
+        writeln!(code, "                self.dispatch_rms_norm_batch(&enc, &self.batch_residual_buf, &self.layers[layer].attn_norm, &self.batch_hidden_buf, m);")?;
+        writeln!(code, "                self.dispatch_convert_f32_to_f16(&enc, &self.batch_hidden_buf, &self.mps_in_f16, m * {hidden});")?;
+        writeln!(code, "                enc.end_encoding();")?;
+        writeln!(code, "            }}")?;
+        // MPS QKV
+        writeln!(code, "            self.mps_matmul_f16(&cmd, &self.layers[layer].qkv_weight_f16, m, {qkv_rows} as u64, {hidden} as u64);")?;
+        // Segment B: output convert, optional QKV bias, rope, kv, attn, convert attn_out to f16 for O matmul
+        writeln!(code, "            {{")?;
+        writeln!(code, "                let enc = cmd.new_compute_command_encoder();")?;
+        writeln!(code, "                self.dispatch_convert_f16_to_f32(&enc, &self.mps_out_f16, &self.batch_qkv_buf, m * {qkv_rows});")?;
+        if config.qkv_bias {
+            writeln!(code, "                self.dispatch_add_bias_batch(&enc, &self.batch_qkv_buf, &self.layers[layer].qkv_bias, m, {qkv_rows});")?;
+        }
+        writeln!(code, "                self.dispatch_rope_qk_batch(&enc, &self.batch_qkv_buf, m, start_pos, {qkv_rows});")?;
+        writeln!(code, "                self.dispatch_copy_kv_both_batch(&enc, &self.batch_qkv_buf, &self.k_cache[layer], &self.v_cache[layer], m, {kv_dim}, start_pos, {qkv_rows}, {k_float_offset}, {v_float_offset});")?;
+        writeln!(code, "                self.dispatch_attention_batch(&enc, &self.batch_qkv_buf, &self.k_cache[layer], &self.v_cache[layer], &self.batch_attn_out_buf, m, start_pos, {qkv_rows});")?;
+        writeln!(code, "                self.dispatch_convert_f32_to_f16(&enc, &self.batch_attn_out_buf, &self.mps_in_f16, m * {hidden});")?;
+        writeln!(code, "                enc.end_encoding();")?;
+        writeln!(code, "            }}")?;
+        // MPS O
+        writeln!(code, "            self.mps_matmul_f16(&cmd, &self.layers[layer].o_weight_f16, m, {hidden} as u64, {hidden} as u64);")?;
+        // Segment C: O output convert, add_inplace, ffn_norm, convert for gate_up
+        writeln!(code, "            {{")?;
+        writeln!(code, "                let enc = cmd.new_compute_command_encoder();")?;
+        writeln!(code, "                self.dispatch_convert_f16_to_f32(&enc, &self.mps_out_f16, &self.batch_attn_proj_buf, m * {hidden});")?;
+        writeln!(code, "                self.dispatch_add_inplace_batch_n(&enc, &self.batch_residual_buf, &self.batch_attn_proj_buf, m * {hidden});")?;
+        writeln!(code, "                self.dispatch_rms_norm_batch(&enc, &self.batch_residual_buf, &self.layers[layer].ffn_norm, &self.batch_hidden_buf, m);")?;
+        writeln!(code, "                self.dispatch_convert_f32_to_f16(&enc, &self.batch_hidden_buf, &self.mps_in_f16, m * {hidden});")?;
+        writeln!(code, "                enc.end_encoding();")?;
+        writeln!(code, "            }}")?;
+        // MPS gate_up
+        writeln!(code, "            self.mps_matmul_f16(&cmd, &self.layers[layer].gate_up_weight_f16, m, {gate_up_rows} as u64, {hidden} as u64);")?;
+        // Segment D: gate_up output convert, silu_mul, convert for down
+        writeln!(code, "            {{")?;
+        writeln!(code, "                let enc = cmd.new_compute_command_encoder();")?;
+        writeln!(code, "                self.dispatch_convert_f16_to_f32(&enc, &self.mps_out_f16, &self.batch_gate_up_buf, m * {gate_up_rows});")?;
+        writeln!(code, "                self.dispatch_silu_mul_fused_batch(&enc, &self.batch_gate_up_buf, &self.batch_ffn_hidden_buf, {intermediate}, m);")?;
+        writeln!(code, "                self.dispatch_convert_f32_to_f16(&enc, &self.batch_ffn_hidden_buf, &self.mps_in_f16, m * {intermediate});")?;
+        writeln!(code, "                enc.end_encoding();")?;
+        writeln!(code, "            }}")?;
+        // MPS down
+        writeln!(code, "            self.mps_matmul_f16(&cmd, &self.layers[layer].down_weight_f16, m, {hidden} as u64, {intermediate} as u64);")?;
+        // Segment E: down output convert + residual add
+        writeln!(code, "            {{")?;
+        writeln!(code, "                let enc = cmd.new_compute_command_encoder();")?;
+        writeln!(code, "                self.dispatch_convert_f16_to_f32(&enc, &self.mps_out_f16, &self.batch_ffn_out_buf, m * {hidden});")?;
+        writeln!(code, "                self.dispatch_add_inplace_batch_n(&enc, &self.batch_residual_buf, &self.batch_ffn_out_buf, m * {hidden});")?;
+        writeln!(code, "                enc.end_encoding();")?;
+        writeln!(code, "            }}")?;
+        writeln!(code, "        }}")?;
+        // Final copy
+        writeln!(code, "        {{")?;
+        writeln!(code, "            let enc = cmd.new_compute_command_encoder();")?;
+        writeln!(code, "            self.dispatch_copy_from_offset_bytes(&enc, &self.batch_residual_buf, (m - 1) * {hidden} * 4, &self.residual_buf, 0, {hidden});")?;
+        writeln!(code, "            enc.end_encoding();")?;
+        writeln!(code, "        }}")?;
+    }
     writeln!(code)?;
 
     writeln!(code, "        cmd.commit();")?;
@@ -5095,6 +5323,59 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "        self.prev_cmd = None;")?;
     writeln!(code, "    }}")?;
     writeln!(code)?;
+
+    if is_q8 && hidden >= 2048 {
+        // MPS f16 matmul helper + f32↔f16 convert dispatchers.
+        writeln!(
+            code,
+            "    /// MPS f16 matmul: C[M, rows] = A[M, cols] @ weight[rows, cols]^T."
+        )?;
+        writeln!(
+            code,
+            "    /// A is read from self.mps_in_f16 and C is written to self.mps_out_f16."
+        )?;
+        writeln!(code, "    fn mps_matmul_f16(&self, cmd: &CommandBufferRef, weight_f16: &Buffer, m: usize, rows: u64, cols: u64) {{")?;
+        writeln!(code, "        use metal::objc::runtime::Object;")?;
+        writeln!(code, "        let m64: u64 = m as u64;")?;
+        writeln!(code, "        unsafe {{")?;
+        writeln!(code, "            let left_desc = mps::descriptor(m64, cols, cols * 2, mps::MPS_DATA_TYPE_F16);")?;
+        writeln!(code, "            let right_desc = mps::descriptor(rows, cols, cols * 2, mps::MPS_DATA_TYPE_F16);")?;
+        writeln!(code, "            let result_desc = mps::descriptor(m64, rows, rows * 2, mps::MPS_DATA_TYPE_F16);")?;
+        writeln!(code, "            let in_ptr = self.mps_in_f16.as_ptr() as *mut Object;")?;
+        writeln!(code, "            let w_ptr = weight_f16.as_ptr() as *mut Object;")?;
+        writeln!(code, "            let out_ptr = self.mps_out_f16.as_ptr() as *mut Object;")?;
+        writeln!(code, "            let left = mps::matrix(in_ptr, left_desc);")?;
+        writeln!(code, "            let right = mps::matrix(w_ptr, right_desc);")?;
+        writeln!(code, "            let result = mps::matrix(out_ptr, result_desc);")?;
+        writeln!(code, "            let op = mps::matmul_op(self.device.as_ptr() as *mut Object, false, true, m64, rows, cols, 1.0, 0.0);")?;
+        writeln!(code, "            let cmd_ptr = cmd.as_ptr() as *mut Object;")?;
+        writeln!(code, "            mps::encode(op, cmd_ptr, left, right, result);")?;
+        writeln!(code, "            mps::release(op);")?;
+        writeln!(code, "            mps::release(left);")?;
+        writeln!(code, "            mps::release(right);")?;
+        writeln!(code, "            mps::release(result);")?;
+        writeln!(code, "        }}")?;
+        writeln!(code, "    }}")?;
+        writeln!(code)?;
+        writeln!(code, "    fn dispatch_convert_f32_to_f16(&self, enc: &ComputeCommandEncoderRef, src: &Buffer, dst: &Buffer, n: usize) {{")?;
+        writeln!(code, "        let n32: u32 = n as u32;")?;
+        writeln!(code, "        enc.set_compute_pipeline_state(&self.convert_f32_to_f16_pipeline);")?;
+        writeln!(code, "        enc.set_buffer(0, Some(src), 0);")?;
+        writeln!(code, "        enc.set_buffer(1, Some(dst), 0);")?;
+        writeln!(code, "        enc.set_bytes(2, std::mem::size_of::<u32>() as u64, &n32 as *const u32 as *const _);")?;
+        writeln!(code, "        enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(256, 1, 1));")?;
+        writeln!(code, "    }}")?;
+        writeln!(code)?;
+        writeln!(code, "    fn dispatch_convert_f16_to_f32(&self, enc: &ComputeCommandEncoderRef, src: &Buffer, dst: &Buffer, n: usize) {{")?;
+        writeln!(code, "        let n32: u32 = n as u32;")?;
+        writeln!(code, "        enc.set_compute_pipeline_state(&self.convert_f16_to_f32_pipeline);")?;
+        writeln!(code, "        enc.set_buffer(0, Some(src), 0);")?;
+        writeln!(code, "        enc.set_buffer(1, Some(dst), 0);")?;
+        writeln!(code, "        enc.set_bytes(2, std::mem::size_of::<u32>() as u64, &n32 as *const u32 as *const _);")?;
+        writeln!(code, "        enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(256, 1, 1));")?;
+        writeln!(code, "    }}")?;
+        writeln!(code)?;
+    }
 
     // ── Private dispatch helpers (all take a shared compute encoder) ──
     writeln!(
