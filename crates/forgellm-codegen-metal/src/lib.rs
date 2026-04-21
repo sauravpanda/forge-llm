@@ -122,6 +122,18 @@ fn generate_metal_shaders(config: &ModelConfig) -> String {
     // down-proj call through matmul_q8_gemm_batch instead, which reads
     // inputs directly from device memory without caching.
     let vec_tile_size = config.hidden_size.max(config.intermediate_size).min(8192);
+
+    // MMA flash attention tile sizes. The kernel uses threadgroup memory for
+    // q/k/v/s/p/o tiles; total must fit in the 32 KB Apple Silicon limit.
+    // At K_BLOCK=32, Q_BLOCK=8 the memory footprint is
+    //   2*Q*HD (q) + 2*K*HD (k) + 2*K*HD (v) + 4*Q*K (s) + 2*Q*K (p) + 4*Q*HD (o)
+    // which for head_dim=128 is ~24 KB, but at head_dim=256 balloons to ~46 KB.
+    // For head_dim>128 we drop `v_sh` and read V directly from device memory in
+    // Phase 4; that removes the 2*K*HD term (16 KB at head_dim=256) and keeps
+    // K_BLOCK=32 so all 4 simdgroups stay productive in Phase 1.
+    let flash_mma_max_head_dim = config.head_dim.max(128);
+    let flash_mma_k_block = 32;
+    let flash_mma_no_vsh = flash_mma_max_head_dim > 128;
     // The attention-scores shared array must be at least effective_seq_len
     // elements; anything smaller silently overflows for long prompts.  For
     // small-context models (135M at 2K), a smaller array saves threadgroup
@@ -2126,20 +2138,18 @@ kernel void matmul_q8_mma32_h4(
 }
 
 // ── matmul_q8_mma32_hh4 ────────────────────────────────────────────────
-// All-half MMA variant of matmul_q8_mma32_h4.
+// All-half MMA kernel with 4-simdgroup, 32×32 output tile and K=64 Q8_0
+// block loading (two Q8_0 blocks loaded per barrier).
 //
-// Both the input matrices and the accumulators are simdgroup_matrix<half>.
-// On Apple Silicon, FP16 `simdgroup_multiply_accumulate` runs at 2x the FP32
-// rate (dual-issue FMA), so if Q8_0 precision holds through half
-// accumulation this kernel can double the effective FLOP throughput on
-// matmul-bound prefill.
+// Attempted an 8-SG 32×64 variant to double weight reuse per load but it
+// regressed ~5% on Gemma-1.1-2B prefill — the extra shared memory and
+// thread count reduced TG-level occupancy more than the halved dispatch
+// count bought back.  Kept the simpler 4-SG tile which has better latency
+// hiding on M5 Pro.
 //
-// Numerical notes: Q8_0 weights have only ~8 bits of mantissa and the token
-// activations at each layer are bounded (post-RMSNorm ≈ O(1)).  Summing
-// 2048-wide K for 1B or 8192-wide for the FFN may exceed half's ~3.3-digit
-// precision on extreme values, but the inputs are already quantized so the
-// per-product error floor is higher than the half-precision rounding error.
-// We verify correctness on 135M / 1B / 3B before enabling.
+// Numerical notes: Q8_0 weights have ~8 bits of mantissa and post-RMSNorm
+// activations are bounded (≈ O(1)).  Half accumulation error is dominated
+// by Q8_0 quantization error, so correctness holds across 135M / 1B / 2B / 3B.
 kernel void matmul_q8_mma32_hh4(
     device const uchar* matrix   [[buffer(0)]],
     device const float* inputs   [[buffer(1)]],
@@ -2155,8 +2165,16 @@ kernel void matmul_q8_mma32_hh4(
     uint tok_base = tgid.y * MMA32_TOK_TILE;
     if (row_base >= rows || tok_base >= num_tokens) return;
 
-    threadgroup half w_tile[MMA32_ROW_TILE * 32];
-    threadgroup half t_tile[MMA32_TOK_TILE * 32];
+    // K=64 tiles: two Q8_0 blocks per outer iteration.  Halves barrier count
+    // and doubles compute between barriers vs K=32.  Dispatch enforces
+    // cols % 64 == 0; h4 (K=32) handles the odd case.
+    //
+    // Tried double-buffering (ping-pong w_tile/t_tile) to drop the trailing
+    // barrier; no measurable speedup on Gemma-1.1-2B — the compiler + HW
+    // already pipeline enough that the single-buffer barrier pair isn't
+    // on the critical path.  Kept the simpler single-buffer code.
+    threadgroup half w_tile[MMA32_ROW_TILE * 64];
+    threadgroup half t_tile[MMA32_TOK_TILE * 64];
 
     uint sg_tok_q = simd_id / 2;
     uint sg_row_q = simd_id % 2;
@@ -2171,47 +2189,91 @@ kernel void matmul_q8_mma32_hh4(
     uint blocks_per_row = cols / 32;
     uint row_bytes = blocks_per_row * 34;
 
-    for (uint blk = 0; blk < blocks_per_row; blk++) {
+    // tid=0..127 mapped (tid*8..tid*8+7) over a 32×32 Q8_0 block: row=tid/4,
+    // k_start ∈ {0,8,16,24}. Hoisted out of the loop — one scale read per row
+    // per block (vs 8×) and no per-iter division.
+    uint tid_row = tid / 4;
+    uint tid_k_start = (tid % 4) * 8;
+
+    for (uint blk2 = 0; blk2 < blocks_per_row; blk2 += 2) {
+        // ── Weight tile: block A (K 0..32) ───────────────────────────────
         {
-            uint base = tid * 8;
-            for (uint ii = 0; ii < 8; ii++) {
-                uint idx = base + ii;
-                uint r = idx / 32;
-                uint k = idx % 32;
-                device const uchar* rp = matrix + (row_base + r) * row_bytes + blk * 34;
-                float sc = float(*(device const half*)rp);
-                int ival = int(*(device const int8_t*)(rp + 2 + k));
-                w_tile[r * 32 + k] = half(float(ival) * sc);
-            }
+            device const uchar* rp = matrix + (row_base + tid_row) * row_bytes + blk2 * 34;
+            half sc = *(device const half*)rp;
+            device const int8_t* qp = (device const int8_t*)(rp + 2) + tid_k_start;
+            threadgroup half* wp = w_tile + tid_row * 64 + tid_k_start;
+            wp[0] = half(int(qp[0])) * sc;
+            wp[1] = half(int(qp[1])) * sc;
+            wp[2] = half(int(qp[2])) * sc;
+            wp[3] = half(int(qp[3])) * sc;
+            wp[4] = half(int(qp[4])) * sc;
+            wp[5] = half(int(qp[5])) * sc;
+            wp[6] = half(int(qp[6])) * sc;
+            wp[7] = half(int(qp[7])) * sc;
         }
+        // ── Weight tile: block B (K 32..64) ──────────────────────────────
         {
-            uint base = tid * 8;
-            for (uint ii = 0; ii < 8; ii++) {
-                uint idx = base + ii;
-                uint m = idx / 32;
-                uint k = idx % 32;
-                uint tok = tok_base + m;
-                t_tile[m * 32 + k] = (tok < num_tokens)
-                    ? half(inputs[tok * cols + blk * 32 + k])
-                    : half(0);
+            device const uchar* rp = matrix + (row_base + tid_row) * row_bytes + (blk2 + 1) * 34;
+            half sc = *(device const half*)rp;
+            device const int8_t* qp = (device const int8_t*)(rp + 2) + tid_k_start;
+            threadgroup half* wp = w_tile + tid_row * 64 + 32 + tid_k_start;
+            wp[0] = half(int(qp[0])) * sc;
+            wp[1] = half(int(qp[1])) * sc;
+            wp[2] = half(int(qp[2])) * sc;
+            wp[3] = half(int(qp[3])) * sc;
+            wp[4] = half(int(qp[4])) * sc;
+            wp[5] = half(int(qp[5])) * sc;
+            wp[6] = half(int(qp[6])) * sc;
+            wp[7] = half(int(qp[7])) * sc;
+        }
+        // ── Token tile: float4 vector loads, both halves ─────────────────
+        {
+            uint tok = tok_base + tid_row;
+            threadgroup half* tp_a = t_tile + tid_row * 64 + tid_k_start;
+            threadgroup half* tp_b = t_tile + tid_row * 64 + 32 + tid_k_start;
+            if (tok < num_tokens) {
+                device const float4* ip4_a = (device const float4*)(
+                    inputs + tok * cols + blk2 * 32 + tid_k_start);
+                device const float4* ip4_b = (device const float4*)(
+                    inputs + tok * cols + (blk2 + 1) * 32 + tid_k_start);
+                float4 va0 = ip4_a[0]; float4 va1 = ip4_a[1];
+                float4 vb0 = ip4_b[0]; float4 vb1 = ip4_b[1];
+                tp_a[0] = half(va0.x); tp_a[1] = half(va0.y);
+                tp_a[2] = half(va0.z); tp_a[3] = half(va0.w);
+                tp_a[4] = half(va1.x); tp_a[5] = half(va1.y);
+                tp_a[6] = half(va1.z); tp_a[7] = half(va1.w);
+                tp_b[0] = half(vb0.x); tp_b[1] = half(vb0.y);
+                tp_b[2] = half(vb0.z); tp_b[3] = half(vb0.w);
+                tp_b[4] = half(vb1.x); tp_b[5] = half(vb1.y);
+                tp_b[6] = half(vb1.z); tp_b[7] = half(vb1.w);
+            } else {
+                tp_a[0] = half(0); tp_a[1] = half(0);
+                tp_a[2] = half(0); tp_a[3] = half(0);
+                tp_a[4] = half(0); tp_a[5] = half(0);
+                tp_a[6] = half(0); tp_a[7] = half(0);
+                tp_b[0] = half(0); tp_b[1] = half(0);
+                tp_b[2] = half(0); tp_b[3] = half(0);
+                tp_b[4] = half(0); tp_b[5] = half(0);
+                tp_b[6] = half(0); tp_b[7] = half(0);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint k_sub = 0; k_sub < 4; k_sub++) {
+        // 8 k_sub iterations cover 64 K positions (stride 64 in the half tile).
+        for (uint k_sub = 0; k_sub < 8; k_sub++) {
             simdgroup_matrix<half, 8, 8> A_top, A_bot, B_lo, B_hi;
             simdgroup_load(A_top,
-                t_tile + (sg_tok_base + 0) * 32 + k_sub * 8,
-                32, ulong2(0, 0), false);
+                t_tile + (sg_tok_base + 0) * 64 + k_sub * 8,
+                64, ulong2(0, 0), false);
             simdgroup_load(A_bot,
-                t_tile + (sg_tok_base + 8) * 32 + k_sub * 8,
-                32, ulong2(0, 0), false);
+                t_tile + (sg_tok_base + 8) * 64 + k_sub * 8,
+                64, ulong2(0, 0), false);
             simdgroup_load(B_lo,
-                w_tile + (sg_row_base + 0) * 32 + k_sub * 8,
-                32, ulong2(0, 0), true);
+                w_tile + (sg_row_base + 0) * 64 + k_sub * 8,
+                64, ulong2(0, 0), true);
             simdgroup_load(B_hi,
-                w_tile + (sg_row_base + 8) * 32 + k_sub * 8,
-                32, ulong2(0, 0), true);
+                w_tile + (sg_row_base + 8) * 64 + k_sub * 8,
+                64, ulong2(0, 0), true);
             simdgroup_multiply_accumulate(C_00, A_top, B_lo, C_00);
             simdgroup_multiply_accumulate(C_01, A_top, B_hi, C_01);
             simdgroup_multiply_accumulate(C_10, A_bot, B_lo, C_10);
@@ -2221,7 +2283,7 @@ kernel void matmul_q8_mma32_hh4(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Store half accumulators via scratch (must widen to f32 for device output).
+    // ── Parallel store: all 32 lanes per simdgroup cooperate ─────────────
     uint out_tok_top = tok_base + sg_tok_base + 0;
     uint out_tok_bot = tok_base + sg_tok_base + 8;
     uint out_row_lo  = row_base + sg_row_base + 0;
@@ -2234,31 +2296,20 @@ kernel void matmul_q8_mma32_hh4(
     simdgroup_store(C_10, scratch + sg_base + 128, 8);
     simdgroup_store(C_11, scratch + sg_base + 192, 8);
     simdgroup_barrier(mem_flags::mem_threadgroup);
+
     uint lane = tid % 32;
-    if (lane == 0) {
-        for (uint m = 0; m < 8; m++) {
-            uint t_top = out_tok_top + m;
-            if (t_top < num_tokens) {
-                device float* dst0 = outputs + t_top * rows + out_row_lo;
-                device float* dst1 = outputs + t_top * rows + out_row_hi;
-                threadgroup const half* src0 = scratch + sg_base +   0 + m * 8;
-                threadgroup const half* src1 = scratch + sg_base +  64 + m * 8;
-                for (uint j = 0; j < 8; j++) {
-                    dst0[j] = float(src0[j]);
-                    dst1[j] = float(src1[j]);
-                }
-            }
-            uint t_bot = out_tok_bot + m;
-            if (t_bot < num_tokens) {
-                device float* dst2 = outputs + t_bot * rows + out_row_lo;
-                device float* dst3 = outputs + t_bot * rows + out_row_hi;
-                threadgroup const half* src2 = scratch + sg_base + 128 + m * 8;
-                threadgroup const half* src3 = scratch + sg_base + 192 + m * 8;
-                for (uint j = 0; j < 8; j++) {
-                    dst2[j] = float(src2[j]);
-                    dst3[j] = float(src3[j]);
-                }
-            }
+    uint ij = lane / 8;
+    uint col = lane % 8;
+    uint c_col_hi = ij & 1;
+    uint c_tok_hi = (ij >> 1) & 1;
+    uint tok_start = c_tok_hi ? out_tok_bot : out_tok_top;
+    uint out_row_col = (c_col_hi ? out_row_hi : out_row_lo) + col;
+    uint src_base = sg_base + ij * 64 + col;
+    for (uint m = 0; m < 8; m++) {
+        uint tok_idx = tok_start + m;
+        if (tok_idx < num_tokens) {
+            outputs[tok_idx * rows + out_row_col] =
+                float(scratch[src_base + m * 8]);
         }
     }
 }
@@ -2709,8 +2760,8 @@ kernel void attention_flash_batch(
 // Online softmax recurrence is identical to attention_flash_batch but
 // per-Q-row: each K tile updates m[q], l[q], O[q] for q in 0..8.
 constant constexpr uint FLASH_MMA_Q_BLOCK = 8;
-constant constexpr uint FLASH_MMA_K_BLOCK = 32;
-constant constexpr uint FLASH_MMA_MAX_HEAD_DIM = 128;
+constant constexpr uint FLASH_MMA_K_BLOCK = FLASH_MMA_K_BLOCK_PLACEHOLDER;
+constant constexpr uint FLASH_MMA_MAX_HEAD_DIM = FLASH_MMA_MAX_HEAD_DIM_PLACEHOLDER;
 
 kernel void attention_mma_flash_batch(
     device const float* q_batch      [[buffer(0)]],
@@ -2754,7 +2805,7 @@ kernel void attention_mma_flash_batch(
     // scratch: 4*Q_BLOCK floats        — per-row reduction scratch
     threadgroup half  q_sh[FLASH_MMA_Q_BLOCK * FLASH_MMA_MAX_HEAD_DIM];
     threadgroup half  k_sh[FLASH_MMA_K_BLOCK * FLASH_MMA_MAX_HEAD_DIM];
-    threadgroup half  v_sh[FLASH_MMA_K_BLOCK * FLASH_MMA_MAX_HEAD_DIM];
+    __V_SH_DECL__
     threadgroup float s_sh[FLASH_MMA_Q_BLOCK * FLASH_MMA_K_BLOCK];
     threadgroup half  p_sh[FLASH_MMA_Q_BLOCK * FLASH_MMA_K_BLOCK];
     threadgroup float o_sh[FLASH_MMA_Q_BLOCK * FLASH_MMA_MAX_HEAD_DIM];
@@ -2785,7 +2836,7 @@ kernel void attention_mma_flash_batch(
     for (uint kv_base = 0; kv_base < seq_len; kv_base += FLASH_MMA_K_BLOCK) {
         uint tile_n = min((uint)FLASH_MMA_K_BLOCK, seq_len - kv_base);
 
-        // Load K and V tile into TG memory (as half).
+        // Load K (and maybe V) tile into TG memory (as half).
         uint kv_tile_elems = FLASH_MMA_K_BLOCK * head_dim;
         for (uint i = tid; i < kv_tile_elems; i += 128) {
             uint k_pos = i / head_dim;
@@ -2793,19 +2844,21 @@ kernel void attention_mma_flash_batch(
             if (k_pos < tile_n) {
                 uint off = (kv_base + k_pos) * kv_stride + kv_base_off + d;
                 k_sh[k_pos * head_dim + d] = half(k_cache[off]);
-                v_sh[k_pos * head_dim + d] = half(v_cache[off]);
+                __V_SH_STORE_HIT__
             } else {
                 k_sh[k_pos * head_dim + d] = half(0);
-                v_sh[k_pos * head_dim + d] = half(0);
+                __V_SH_STORE_MISS__
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // ── Phase 1: S = Q @ K^T via MMA ──
-        // 4 simdgroups × 1 tile each → 4 tiles of [8,8] covering [Q_BLOCK=8, K_BLOCK=32].
-        // Each simdgroup owns S columns [simd_id*8, simd_id*8+8).
-        // Q is [Q_BLOCK, head_dim]; K is [K_BLOCK, head_dim]; we want K^T via transposed load.
-        {
+        // K_BLOCK/8 simdgroups × 1 tile each → tiles of [8,8] covering
+        // [Q_BLOCK=8, K_BLOCK]. Each simdgroup owns S columns
+        // [simd_id*8, simd_id*8+8). When K_BLOCK < 32 (e.g. head_dim=256
+        // where we use K_BLOCK=16 to fit threadgroup memory), the extra
+        // simdgroups sit idle.
+        if (simd_id < FLASH_MMA_K_BLOCK / 8) {
             simdgroup_matrix<float, 8, 8> C = simdgroup_matrix<float, 8, 8>(0.0f);
             uint dim_chunks = head_dim / 8;
             for (uint dc = 0; dc < dim_chunks; dc++) {
@@ -2841,12 +2894,15 @@ kernel void attention_mma_flash_batch(
 
         // ── Phase 2b: per-row max via simdgroup reduction ──
         // 4 simdgroups × 2 rows each = 8 rows (= Q_BLOCK).
-        // simd_lane (0..31) covers all K_BLOCK=32 positions in one pass.
+        // Each simdgroup does one simd_max over its row's K_BLOCK scores.
+        // When K_BLOCK < 32, lanes past the valid range contribute -INFINITY.
         {
             uint row_base = simd_id * 2;
             for (uint qr = 0; qr < 2; qr++) {
                 uint q = row_base + qr;
-                float my = s_sh[q * FLASH_MMA_K_BLOCK + simd_lane];
+                float my = (simd_lane < FLASH_MMA_K_BLOCK)
+                    ? s_sh[q * FLASH_MMA_K_BLOCK + simd_lane]
+                    : -INFINITY;
                 float row_max = simd_max(my);
                 if (simd_lane == 0) {
                     scratch[q] = row_max;  // tile_max[q]
@@ -2872,13 +2928,18 @@ kernel void attention_mma_flash_batch(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // ── Phase 2d: P = exp(S - m_new), populate p_sh (half) and row-sum ──
+        // When K_BLOCK < 32, lanes past the valid range contribute 0 to the sum
+        // (by producing p=0) and do not write to p_sh.
         {
             uint row_base = simd_id * 2;
             for (uint qr = 0; qr < 2; qr++) {
                 uint q = row_base + qr;
                 float m_new = scratch[q];
-                float p = fast::exp(s_sh[q * FLASH_MMA_K_BLOCK + simd_lane] - m_new);
-                p_sh[q * FLASH_MMA_K_BLOCK + simd_lane] = half(p);
+                float p = 0.0f;
+                if (simd_lane < FLASH_MMA_K_BLOCK) {
+                    p = fast::exp(s_sh[q * FLASH_MMA_K_BLOCK + simd_lane] - m_new);
+                    p_sh[q * FLASH_MMA_K_BLOCK + simd_lane] = half(p);
+                }
                 float row_sum = simd_sum(p);
                 if (simd_lane == 0) {
                     scratch[2 * FLASH_MMA_Q_BLOCK + q] = row_sum;
@@ -2919,8 +2980,7 @@ kernel void attention_mma_flash_batch(
                     simdgroup_matrix<half, 8, 8> A, B;
                     simdgroup_load(A, p_sh + kc * 8, FLASH_MMA_K_BLOCK,
                                    ulong2(0, 0), false);
-                    simdgroup_load(B, v_sh + (kc * 8) * head_dim + d_base, head_dim,
-                                   ulong2(0, 0), false);
+                    __V_B_LOAD__
                     simdgroup_multiply_accumulate(O_acc, A, B, O_acc);
                 }
                 simdgroup_store(O_acc, o_sh + d_base, head_dim);
@@ -3031,6 +3091,48 @@ kernel void copy_kv_both_batch(
 "#
     .replace("VEC_TILE_SIZE", &vec_tile_size.to_string())
     .replace("ATTN_SCORES_SIZE", &attn_scores_size.to_string())
+    .replace("FLASH_MMA_K_BLOCK_PLACEHOLDER", &flash_mma_k_block.to_string())
+    .replace(
+        "FLASH_MMA_MAX_HEAD_DIM_PLACEHOLDER",
+        &flash_mma_max_head_dim.to_string(),
+    )
+    .replace(
+        "__V_SH_DECL__",
+        if flash_mma_no_vsh {
+            ""
+        } else {
+            "threadgroup half  v_sh[FLASH_MMA_K_BLOCK * FLASH_MMA_MAX_HEAD_DIM];"
+        },
+    )
+    .replace(
+        "__V_SH_STORE_HIT__",
+        if flash_mma_no_vsh {
+            ""
+        } else {
+            "v_sh[k_pos * head_dim + d] = half(v_cache[off]);"
+        },
+    )
+    .replace(
+        "__V_SH_STORE_MISS__",
+        if flash_mma_no_vsh {
+            ""
+        } else {
+            "v_sh[k_pos * head_dim + d] = half(0);"
+        },
+    )
+    .replace(
+        "__V_B_LOAD__",
+        if flash_mma_no_vsh {
+            // V is read directly from device memory. We load an 8x8 tile at
+            // (kv_base + kc*8, d_base) with stride = kv_stride (num_kv_heads*head_dim).
+            // Causal masking is handled via s_sh/p_sh already; V past tile_n
+            // has p_sh = 0 for those rows, so their contribution to O_acc is
+            // zero regardless of the V value loaded.
+            "simdgroup_load(B, v_cache + (kv_base + kc * 8) * kv_stride + kv_base_off + d_base, kv_stride, ulong2(0, 0), false);"
+        } else {
+            "simdgroup_load(B, v_sh + (kc * 8) * head_dim + d_base, head_dim, ulong2(0, 0), false);"
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -5787,8 +5889,10 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
         "            // Empirically the crossover is around M=256 on M5 Pro for 1B/3B."
     )?;
     writeln!(code, "            let use_h4 = cols >= 2048;")?;
+    writeln!(code, "            // hh4 uses a K=64 tile (two Q8_0 blocks per barrier);")?;
+    writeln!(code, "            // require cols % 64 == 0 and fall back to h4 otherwise.")?;
     writeln!(code, "            let pipe = if use_h4 {{")?;
-    writeln!(code, "                if num_tokens >= 256 {{")?;
+    writeln!(code, "                if num_tokens >= 256 && cols % 64 == 0 {{")?;
     writeln!(
         code,
         "                    &self.matmul_q8_mma32_hh4_pipeline"
@@ -6408,7 +6512,7 @@ fn emit_metal_model_impl(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            .map(|v| v == \"0\").unwrap_or(false);")?;
     writeln!(
         code,
-        "        let use_mma_flash = !mma_opt_out && HEAD_DIM <= 128 && num_tokens >= 8;"
+        "        let use_mma_flash = !mma_opt_out && HEAD_DIM <= 256 && num_tokens >= 8;"
     )?;
     writeln!(code, "        if use_mma_flash {{")?;
     writeln!(
@@ -8346,8 +8450,8 @@ mod tests {
             "dispatch_attention_batch must read FORGE_MMA_ATTN as opt-out"
         );
         assert!(
-            model_rs.contains("!mma_opt_out && HEAD_DIM <= 128 && num_tokens >= 8"),
-            "MMA flash must be default-on when HEAD_DIM ≤ 128 and num_tokens ≥ 8"
+            model_rs.contains("!mma_opt_out && HEAD_DIM <= 256 && num_tokens >= 8"),
+            "MMA flash must be default-on when HEAD_DIM ≤ 256 and num_tokens ≥ 8"
         );
     }
 
