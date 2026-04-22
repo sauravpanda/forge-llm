@@ -2,6 +2,43 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.7.13] — 2026-04-22 — MPS attention for MHA models + GQA short-prompt fix
+
+Extends the MPS-materialized attention path from MQA/GQA to MHA (`num_kv_heads == num_attention_heads`) and fixes a latent crash on the GQA path at very short prefill prompts.
+
+### Performance (Apple M5 Pro, Phi-3.1-mini-4k-instruct Q8_0, MHA 32h/32kv)
+
+| Prompt length | MMA flash (prev default) | **MPS attn (v0.7.13)** | Δ |
+|---|---:|---:|---:|
+| 440 tokens | 1851 tok/s | 1475 tok/s | -20% (MMA still wins at short m) |
+| 1097 tokens | 1467 tok/s | 1496 tok/s | ≈ tied |
+| 1948 tokens | 1106 tok/s | **1646 tok/s** | **+49%** |
+| 3044 tokens | 804 tok/s | **1481 tok/s** | **+84%** |
+
+Crossover on Phi-3 is ~1000 tokens (higher than Llama-3.2-1B's ~500) because the per-kv-head MPS call loop runs 32× on Phi-3 vs 8× on Llama.
+
+### Fixed
+
+- **GQA short-prompt crash**: MPS's small-matrix GEMV kernel overflows its internal `vectorRowPadElements` bit field when K/V row stride is much larger than per-head column count. Fired at m ≤ 2 on Llama-3.2-1B and m ≤ 5 on Phi-3.1-mini. The generated `forward_prefill_batch` now falls back to `dispatch_attention_batch` (MMA flash) below `MPS_ATTN_MIN_M = 8`, which fixes the crash and keeps short-prefill fast.
+
+### Added
+
+- **`MPS_ATTN_MIN_M`** constant in generated Metal projects — codegen emits a runtime `if m >= MPS_ATTN_MIN_M { MPS } else { MMA flash }` branch inside the MPS GQA/MHA prefill block.
+- **`FORGE_NO_MPS_ATTN=1`** codegen env var — set before `forge compile` to disable the MPS-materialized attention path while keeping MPS matmul for QKV/O/FFN. Intended for A/B benchmarking MMA-flash vs materialized-MPS attention; not required for production use.
+
+### How
+
+The GQA scaffolding (`extract_q_to_f16_gqa`, `softmax_causal_scale_f16_gqa`, `gqa_out_reshape_f16_to_f32`) already parameterizes on `num_groups = num_heads / num_kv_heads`, so reducing to `num_groups = 1` covers the MHA case without new kernels. The gate change was `num_kv_heads < num_attention_heads` → `num_kv_heads <= num_attention_heads`.
+
+The pre-attention QKV prep (f16→f32 convert, optional bias, RoPE, copy_kv) is now emitted in its own encoder and shared between the MPS-attn path and the MMA-flash fallback, so the runtime branch only switches the attention op itself.
+
+### Correctness
+
+- Llama-3.2-1B GQA: short prompts (m = 1..7) no longer crash — previously `vectorRowPadElements will overflow its fc bit allocation`.
+- Phi-3.1-mini MHA: MPS and MMA flash variants produce byte-identical output on "The Eiffel Tower is located in" → "the city of Cairo, Egypt" (Phi-3 hallucination, but the same hallucination).
+- Gemma-1.1-2B MQA path unchanged (different code path, not touched).
+- All 71 Metal codegen tests pass.
+
 ## [0.7.12] — 2026-04-22 — CI cleanup for Rust 1.95
 
 Mechanical fixes for new clippy lints introduced in Rust 1.94/1.95 that broke the `-D warnings` CI job (and by extension the PyPI wheel publish workflow). No functional or performance changes.
