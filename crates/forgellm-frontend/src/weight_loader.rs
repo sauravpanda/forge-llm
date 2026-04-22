@@ -1752,11 +1752,10 @@ mod tests {
 
         let result = dequant_q4_k(&block, 256);
         // First 32 elements: d * sc * q - dmin * m = 2.0 * 3 * 5 - 1.0 * 2 = 28.0
-        for i in 0..32 {
+        for (i, &v) in result.iter().take(32).enumerate() {
             assert!(
-                (result[i] - 28.0).abs() < 1e-4,
-                "element {i}: expected 28.0, got {}",
-                result[i]
+                (v - 28.0).abs() < 1e-4,
+                "element {i}: expected 28.0, got {v}"
             );
         }
     }
@@ -1851,8 +1850,8 @@ mod tests {
         let d_f16: u16 = 0x3C00; // 1.0
         block[208..210].copy_from_slice(&d_f16.to_le_bytes());
         // scales at offset 192..208 (int8). Set all to 1.
-        for i in 192..208 {
-            block[i] = 1;
+        for b in block.iter_mut().take(208).skip(192) {
+            *b = 1;
         }
 
         let result = dequant_q6_k(&block, 256);
@@ -1901,8 +1900,8 @@ mod tests {
         let d_f16: u16 = 0x3C00; // 1.0
         block[208..210].copy_from_slice(&d_f16.to_le_bytes());
         // All scales = 1 (int8)
-        for i in 192..208 {
-            block[i] = 1;
+        for b in block.iter_mut().take(208).skip(192) {
+            *b = 1;
         }
         // ql[0] = 0x31 → low nibble = 1 (for q1), high nibble = 3 (for q3)
         block[0] = 0x31;
@@ -2032,8 +2031,8 @@ mod tests {
     fn dequant_q8_0_all_zeros() {
         // Zero scale means all dequantized values should be zero.
         let mut block = vec![0u8; 34]; // scale = 0, 32 arbitrary values
-        for i in 2..34 {
-            block[i] = 127; // max int8 value
+        for b in block.iter_mut().take(34).skip(2) {
+            *b = 127; // max int8 value
         }
 
         let result = dequant_q8_0(&block, 32);

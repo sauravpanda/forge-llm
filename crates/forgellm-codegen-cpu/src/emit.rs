@@ -4730,7 +4730,7 @@ mod tests {
         let values: Vec<f32> = (0..64)
             .map(|i| ((i * 7 + 3) as f32 * 0.1 - 3.0) * 0.5)
             .collect();
-        let mut quantized = vec![0i8; 64];
+        let mut quantized = [0i8; 64];
 
         // Quantize
         let mut max_abs = 0.0f32;

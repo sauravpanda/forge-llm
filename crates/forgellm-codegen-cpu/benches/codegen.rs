@@ -7,7 +7,7 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use forgellm_codegen_cpu::{generate, generate_project};
 use forgellm_frontend::{
     graph_builder,
-    ir::{Architecture, DType, ModelConfig},
+    ir::{Architecture, DType, HiddenActivation, ModelConfig},
 };
 use std::hint::black_box;
 
@@ -27,6 +27,7 @@ fn tiny_config() -> ModelConfig {
         dtype: DType::F32,
         sliding_window_size: None,
         qkv_bias: false,
+        hidden_activation: HiddenActivation::SiLU,
     }
 }
 
@@ -46,6 +47,7 @@ fn small_config() -> ModelConfig {
         dtype: DType::F32,
         sliding_window_size: None,
         qkv_bias: false,
+        hidden_activation: HiddenActivation::SiLU,
     }
 }
 

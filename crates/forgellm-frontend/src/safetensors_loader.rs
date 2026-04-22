@@ -167,21 +167,11 @@ pub fn infer_model_config(
     // and k_out_dim (if present). This handles both MHA and GQA correctly.
     let head_dim = infer_head_dim(q_out_dim, k_out_dim);
 
-    let num_attention_heads = if head_dim > 0 {
-        q_out_dim / head_dim
-    } else {
-        1
-    };
+    let num_attention_heads = q_out_dim.checked_div(head_dim).unwrap_or(1);
 
     // num_kv_heads from k_proj shape.
     let num_kv_heads = k_out_dim
-        .map(|k| {
-            if head_dim > 0 {
-                k / head_dim
-            } else {
-                num_attention_heads
-            }
-        })
+        .map(|k| k.checked_div(head_dim).unwrap_or(num_attention_heads))
         .unwrap_or(num_attention_heads);
 
     // intermediate_size from gate_proj or up_proj.

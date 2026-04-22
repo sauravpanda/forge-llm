@@ -2,6 +2,25 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.7.12] — 2026-04-22 — CI cleanup for Rust 1.95
+
+Mechanical fixes for new clippy lints introduced in Rust 1.94/1.95 that broke the `-D warnings` CI job (and by extension the PyPI wheel publish workflow). No functional or performance changes.
+
+### Fixed
+
+- `manual_is_multiple_of` → `.is_multiple_of()` (three sites in Metal codegen gates for MPS GQA/MQA).
+- `literal_empty_format` → inline variables in `writeln!` format strings (Metal MPS buffer sizing).
+- `manual_range_contains` → `RangeInclusive::contains` (Metal codegen test).
+- `needless_range_loop` → iterator-based loops (weight_loader K-quant round-trip tests).
+- `useless_vec` → stack array (emit.rs quantization round-trip test).
+- Bench `ModelConfig` literals missing `hidden_activation` field (benches/codegen.rs).
+- `manual_checked_ops` → `.checked_div(...).unwrap_or(...)` (safetensors loader head-count inference).
+
+### CI
+
+- `cargo clippy --workspace --exclude forgellm-python -- -D warnings` passes on Rust 1.95.
+- `cargo fmt --all -- --check` passes (one drift fix in Metal codegen carried over from v0.7.11).
+
 ## [0.7.11] — 2026-04-21 — MPS Attention for GQA Models
 
 Extends the MPS-materialized attention path from MQA only (v0.7.9) to any Q8_0 model with hidden ≥ 2048 and an integer-divisible `num_heads / num_kv_heads` ratio — in particular Llama-3.2-1B (32 heads / 8 KV heads, num_groups = 4).
