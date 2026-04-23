@@ -6,9 +6,9 @@
 
 ForgeLLM is a Rust-native ahead-of-time (AOT) ML compiler for language models (1M-7B parameters). It compiles GGUF models into optimized, self-contained binaries with native Metal GPU acceleration — no runtime interpreter, no Python dependencies, no dynamic dispatch.
 
-**Faster than llama.cpp** on Apple Silicon.
+**Faster than llama.cpp** on Apple Silicon — Metal and CPU.
 
-[Documentation](https://sauravpanda.github.io/forge-llm/) | [Crates.io](https://crates.io/crates/forgellm-frontend) | [forgellm.dev](https://forgellm.dev) | Blog: [How we beat llama.cpp](blog/beating-llama-cpp.md) · [MMA flash + fp16 KV + dispatch fusion](blog/mma-flash-and-decode.md)
+[Documentation](https://sauravpanda.github.io/forge-llm/) | [Crates.io](https://crates.io/crates/forgellm-frontend) | [forgellm.dev](https://forgellm.dev) | Blog: [How we beat llama.cpp](blog/beating-llama-cpp.md) · [MMA flash + fp16 KV + dispatch fusion](blog/mma-flash-and-decode.md) · [CPU batched prefill (9.5× on long prompts)](blog/cpu-batched-prefill.md)
 
 ## Performance
 
@@ -51,6 +51,19 @@ Apple M5 Pro, Q8_0. Numbers below use **v0.7.0 default attention**: MMA-accelera
 | Phi-3-mini (~3001 tok) | **480** | 278 | — | — |
 
 Gains grow with prompt length because attention is O(M²) and the MMA path replaces scalar simdgroup reductions with hardware 8×8×8 matrix multiplies. Short-prompt numbers are within noise because matmul dominates there (MMA-flash and legacy share the same Q/K/V/O projection kernels).
+
+### CPU Prefill (v0.8.2)
+
+Apple M5 Pro, Llama-3.2-1B-Instruct.  v0.8.0 introduced a **batched CPU prefill path** — QKV/O/gate/up/down projections now use `matmul_mat_q8_0_KxN` / `matmul_mat_q4_0_KxN` kernels that load each weight matrix from RAM once per forward pass instead of M times.  v0.8.1 added **Q-tiled flash attention** (`attention_flash_batch`) that amortizes K/V scans across `Q_TILE=16` queries per block.  v0.8.2 extended both to Q4_0.
+
+| Prompt | Q8_0 per-token (v0.7.x) | **Q8_0 batched (v0.8.1)** | Q4_0 per-token | **Q4_0 batched (v0.8.2)** |
+|-------:|------------------------:|--------------------------:|---------------:|--------------------------:|
+|   352  |   40 tok/s              | **191 tok/s** (4.7×)      |   44 tok/s     | **304 tok/s** (6.9×)      |
+|   902  |   31 tok/s              | **234 tok/s** (7.6×)      |   34 tok/s     | **266 tok/s** (7.9×)      |
+|  1603  |   24 tok/s              | **207 tok/s** (8.5×)      |   26 tok/s     | **238 tok/s** (9.2×)      |
+|  2502  |   19 tok/s              | **180 tok/s** (9.5×)      |    —           | **195 tok/s**             |
+
+Long-context CPU prefill is now in the 180–300 tok/s range on Apple Silicon — competitive with llama.cpp's CPU path, from pure Rust with no external BLAS dependency.  The batched path dispatches automatically when `prompt ≥ PREFILL_BATCH_THRESHOLD=8`; short prompts keep the stack-based per-token path for lower fixed cost.
 
 ### Deploy Size
 

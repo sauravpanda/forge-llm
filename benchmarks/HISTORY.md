@@ -3,6 +3,36 @@
 Performance tracking across versions. All benchmarks run with 64 tokens, 3 runs.
 System: Darwin arm64 18c (Apple M5 Pro).
 
+## CPU Prefill — Llama-3.2-1B-Instruct (v0.8.x batched prefill)
+
+CPU backend long-prompt prefill (tok/s).  Best of 3 runs, `--max-tokens 1 --quiet`.
+
+### Q8_0 (hidden=2048, 16 layers, GQA 32h/8kv, Q8_0 weights = 1.3 GB)
+
+| Prompt | v0.7.x per-token | v0.8.0 batched matmul | **v0.8.1 + batched attn** | Speedup vs v0.7.x |
+|-------:|-----------------:|----------------------:|--------------------------:|------------------:|
+|   352  |         40.2     |            129.5      |              **190.6**    | **4.7×**          |
+|   902  |         30.9     |             66.2      |              **234.2**    | **7.6×**          |
+|  1603  |         24.3     |             43.1      |              **207.4**    | **8.5×**          |
+|  2502  |         18.9     |             29.4      |              **180.0**    | **9.5×**          |
+
+### Q4_0 (Q4_0 weights = 700 MB, same architecture)
+
+| Prompt | Per-token  | **v0.8.2 batched**       | Speedup            |
+|-------:|-----------:|-------------------------:|-------------------:|
+|   352  |   43.8     |              **303.5**   | **6.9×**           |
+|   902  |   33.6     |              **265.6**   | **7.9×**           |
+|  1603  |   25.7     |              **237.5**   | **9.2×**           |
+|  2502  |     —      |              **194.8**   | —                  |
+
+### Key changes
+
+- **v0.8.0** — `matmul_mat_q8_0_KxN` batched matmul kernels, weight-outer / token-inner loop; each weight matrix loaded from RAM once per forward pass instead of M times.  Parallelized over n-blocks via rayon with disjoint output writes.
+- **v0.8.1** — `attention_flash_batch`: Q-tiled flash attention with `Q_TILE=16` queries per block, amortizing K/V reads ~16×.  Parallelized over heads.  Per-query online softmax state stack-allocated.
+- **v0.8.2** — `matmul_mat_q4_0_KxN` extension for Q4_0 models + dtype-aware `forward_prefill_batched`.
+
+Correctness: per-token and batched paths produce byte-identical output across all tested prompts (Llama-3.2-1B Q8_0/Q4_0, SmolLM2-135M Q4_0, Phi-3.1-mini Q8_0).  All 62 CPU codegen tests pass.
+
 ## SmolLM2-135M Q8_0 (hidden=576, 30 layers)
 
 | Version | Date | Interpreter | AOT | AOT vs Interp |

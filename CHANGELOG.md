@@ -2,6 +2,17 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.8.3] — 2026-04-23 — Docs: CPU prefill benchmarks + v0.8.x blog post
+
+No functional or performance changes.  Documentation release covering the v0.8.0 / v0.8.1 / v0.8.2 CPU prefill story.
+
+### Added
+
+- **`blog/cpu-batched-prefill.md`** — walkthrough of the v0.8.x CPU prefill restructure.  Covers the weight-outer / token-inner `matmul_mat_q8_0_KxN` kernel, the Q-tiled flash attention (`attention_flash_batch`), and the Q4_0 extension.  Includes the per-prompt-length tok/s table, the key learnings (inner kernel wasn't the bottleneck; `usize` round-trips for disjoint parallel writes), and what's next.
+- **README — "CPU Prefill (v0.8.2)" section** — Apple M5 Pro Llama-3.2-1B Q8_0 and Q4_0 prefill at 352 / 902 / 1603 / 2502 tokens with 4.7–9.5× speedups vs v0.7.x per-token.
+- **README header** — "Faster than llama.cpp on Apple Silicon — Metal and CPU" (was Metal-only); added link to the new CPU blog post.
+- **`benchmarks/HISTORY.md`** — new top-level "CPU Prefill — Llama-3.2-1B-Instruct" table covering Q8_0 and Q4_0 baselines + v0.8.x batched numbers.
+
 ## [0.8.2] — 2026-04-23 — Q4_0 batched prefill
 
 Extends the v0.8.0 / v0.8.1 CPU batched prefill path (batched matmul + Q-tiled flash attention) to Q4_0 models. Previously Q4_0 models fell through to the per-token `forward_prefill` stack path; now they use `forward_prefill_batched` with `matmul_mat_q4_0_KxN` kernels when prompts are ≥ `PREFILL_BATCH_THRESHOLD=8` tokens.
