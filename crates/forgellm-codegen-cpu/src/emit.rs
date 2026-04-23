@@ -4307,10 +4307,45 @@ fn emit_prefill_batched_function(
             "            m, base_pos, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM,"
         )?;
         writeln!(code, "        );")?;
-    } else {
+    } else if let Some(window) = config.sliding_window_size {
+        // SWA models (Mistral, Gemma-2, ...): use `attention_sliding` which
+        // limits each query's window to the last `window` K/V positions.
+        // Using plain `attention` here would be a correctness bug — the
+        // softmax would attend to the whole KV cache instead of the window.
         writeln!(
             code,
-            "        // Fallback: per-token attention (SWA / short-context models)"
+            "        // Fallback: per-token sliding-window attention (SWA models)"
+        )?;
+        writeln!(code, "        for r in 0..m {{")?;
+        writeln!(code, "            let pos = base_pos + r;")?;
+        writeln!(
+            code,
+            "            let q_row = &q_batch[r*{qk_size}..(r+1)*{qk_size}];"
+        )?;
+        writeln!(code, "            attention_sliding(")?;
+        writeln!(
+            code,
+            "                &mut attn_out_batch[r*{qk_size}..(r+1)*{qk_size}], q_row,"
+        )?;
+        writeln!(
+            code,
+            "                &cache.k[layer_idx][..(pos+1)*{kv_size}], &cache.v[layer_idx][..(pos+1)*{kv_size}],"
+        )?;
+        writeln!(
+            code,
+            "                &cache.k_scales[layer_idx][..pos+1], &cache.v_scales[layer_idx][..pos+1],"
+        )?;
+        writeln!(
+            code,
+            "                pos + 1, {window}, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM,"
+        )?;
+        writeln!(code, "            );")?;
+        writeln!(code, "        }}")?;
+    } else {
+        // Short-context non-SWA models (max_seq_len <= 512): plain attention.
+        writeln!(
+            code,
+            "        // Fallback: per-token standard attention (short-context, non-SWA)"
         )?;
         writeln!(code, "        for r in 0..m {{")?;
         writeln!(code, "            let pos = base_pos + r;")?;
@@ -5168,6 +5203,55 @@ mod tests {
         assert!(
             !forward_body.contains("        attention(\n"),
             "Mistral forward() should not call regular attention — only attention_sliding"
+        );
+    }
+
+    #[test]
+    fn q8_swa_batched_prefill_uses_attention_sliding() {
+        // Q8_0 + SWA model: the batched prefill path must fall back to
+        // `attention_sliding` (respecting the window), not plain
+        // `attention` which would attend to the full KV cache.
+        // Regression guard — this was wrong in v0.8.0-v0.8.3.
+        let config = ModelConfig {
+            architecture: Architecture::Mistral,
+            hidden_size: 64,
+            intermediate_size: 128,
+            num_layers: 1,
+            num_attention_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 16,
+            vocab_size: 256,
+            max_seq_len: 64, // <= 512 so use_flash_attention returns false
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            dtype: DType::Q8_0,
+            sliding_window_size: Some(32),
+            qkv_bias: false,
+            hidden_activation: HiddenActivation::SiLU,
+        };
+        let graph = graph_builder::build_graph(&config).unwrap();
+        let code = generate(&graph).unwrap();
+
+        // forward_prefill_batched must be emitted (Q8_0 path).
+        let batched_start = code
+            .find("pub fn forward_prefill_batched(")
+            .expect("forward_prefill_batched must be emitted for Q8_0");
+        // Take everything after the batched function start through end-of-file —
+        // the next top-level `pub fn` or end marks the function end; we just
+        // need to verify the fallback attention call inside it.
+        let batched_body = &code[batched_start..];
+        assert!(
+            batched_body.contains("attention_sliding("),
+            "forward_prefill_batched must call attention_sliding for SWA models"
+        );
+        // And must NOT call plain `attention(` as the fallback.
+        // (It's OK if plain `attention` is referenced elsewhere — e.g. inside
+        // a comment or in other unrelated blocks — but the per-token fallback
+        // loop in batched prefill must not use it on an SWA model.)
+        let fallback_marker = "// Fallback: per-token standard attention (short-context, non-SWA)";
+        assert!(
+            !batched_body.contains(fallback_marker),
+            "SWA model must not take the non-SWA fallback branch"
         );
     }
 

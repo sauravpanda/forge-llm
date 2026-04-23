@@ -2,6 +2,24 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.8.4] — 2026-04-23 — Fix: SWA correctness in CPU batched prefill
+
+### Fixed
+
+- **Correctness bug** on CPU batched prefill for Q8_0/Q4_0 SWA models (Mistral, Gemma-2 class): the non-flash fallback branch in `forward_prefill_batched` was calling plain `attention()` instead of `attention_sliding()`, so the softmax attended to the full KV cache instead of the configured sliding window.  On a Mistral Q8_0 model with `sliding_window_size = 4096` and a prompt ≥ 8 tokens, the generated output would diverge from the per-token `forward_prefill` path at long contexts.  Introduced in v0.8.0 (batched prefill landing), present in v0.8.1–v0.8.3.
+- **Dispatch now splits three ways** inside `forward_prefill_batched`:
+  - `use_flash_attention(config)` → `attention_flash_batch` (unchanged, v0.8.1)
+  - `config.sliding_window_size.is_some()` → per-token `attention_sliding(pos, WINDOW, ...)` loop
+  - Else (short-context non-SWA) → per-token `attention(pos, ...)` loop
+
+### Added
+
+- Codegen regression test `q8_swa_batched_prefill_uses_attention_sliding` — builds a Q8_0 Mistral config with `sliding_window_size = Some(32)`, verifies the generated `forward_prefill_batched` body contains `attention_sliding(` and does *not* use the non-SWA fallback marker.
+
+### Not covered (follow-up)
+
+- The SWA fallback is still per-token (no batched attention for SWA).  A `attention_sliding_batch` kernel would mirror `attention_flash_batch` but skip K/V blocks before `pos − window` — valuable for SWA models at long contexts but deferred until a test model is available locally.
+
 ## [0.8.3] — 2026-04-23 — Docs: CPU prefill benchmarks + v0.8.x blog post
 
 No functional or performance changes.  Documentation release covering the v0.8.0 / v0.8.1 / v0.8.2 CPU prefill story.
