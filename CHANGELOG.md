@@ -2,6 +2,36 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.8.2] — 2026-04-23 — Q4_0 batched prefill
+
+Extends the v0.8.0 / v0.8.1 CPU batched prefill path (batched matmul + Q-tiled flash attention) to Q4_0 models. Previously Q4_0 models fell through to the per-token `forward_prefill` stack path; now they use `forward_prefill_batched` with `matmul_mat_q4_0_KxN` kernels when prompts are ≥ `PREFILL_BATCH_THRESHOLD=8` tokens.
+
+### Performance (Apple M5 Pro, Llama-3.2-1B-Instruct Q4_0)
+
+| Prompt length | Per-token prefill | **v0.8.2 batched** | Speedup |
+|---:|---:|---:|---:|
+| 352 tokens | 43.8 tok/s | **303.5 tok/s** | **6.9×** |
+| 902 tokens | 33.6 tok/s | **265.6 tok/s** | **7.9×** |
+| 1603 tokens | 25.7 tok/s | **237.5 tok/s** | **9.2×** |
+
+Q4_0 actually runs *faster* than Q8_0 at the same prompt length because the per-row weight bytes are smaller (18 bytes per 32-element block vs 34), so memory bandwidth per forward pass drops proportionally.
+
+### Added
+
+- **`matmul_mat_q4_0_KxN`** shape-specialized batched Q4_0 matmul kernels, emitted for each unique `(K, N)` pair used by the forward pass. Parallels `matmul_mat_q8_0_KxN`: weight-outer, token-inner loop with the existing `dot8_q4_0_q8_0` / `dot4_q4_0_q8_0` sdot kernels (Q4_0 weight × Q8_0-quantized input). Parallelized over n-blocks via rayon with disjoint output writes.
+
+### Changed
+
+- **`forward_prefill_batched`** is now emitted for both Q8_0 and Q4_0 models (previously Q8_0 only).  Dtype-specific choices — matmul kernel name (`matmul_mat_q8_0_*` vs `matmul_mat_q4_0_*`), lm_head row bytes (34 vs 18), and lm_head dot helpers (`dot8_q8_0_q8_0` vs `dot8_q4_0_q8_0`) — are selected at codegen time based on `config.dtype`.
+- **`forward_prefill`** now dispatches to `forward_prefill_batched` when `is_q8 || is_q4 && seq_len >= PREFILL_BATCH_THRESHOLD` (was `is_q8` only).
+- **`attention_flash_batch`** (from v0.8.1) is reused unchanged — it operates on f32 Q + i8 K/V cache, so the weight dtype doesn't matter.
+
+### Correctness
+
+- Per-token and batched paths produce byte-identical output on tested Q4_0 prompts (Llama-3.2-1B Q4_0, SmolLM2-135M Q4_0).
+- 62/62 CPU codegen tests pass.
+- The per-token Q4_0 forward path is unchanged — still available for `seq_len < PREFILL_BATCH_THRESHOLD` and as the fallback for non-AArch64 targets.
+
 ## [0.8.1] — 2026-04-23 — CPU batched attention
 
 Follow-on to v0.8.0: adds `attention_flash_batch`, a Q-tiled flash-attention kernel that amortizes K/V scans across Q_TILE=16 query rows per block, parallelized over heads. Wired into `forward_prefill_batched` replacing the per-token `attention_flash` call loop.

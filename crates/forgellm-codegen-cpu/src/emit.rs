@@ -35,11 +35,12 @@ pub fn generate(graph: &Graph) -> Result<String, CodegenError> {
         emit_q4_0_kernel(&mut code)?;
         emit_q4_0_sdot_kernel(&mut code)?;
         emit_specialized_q4_matmul_functions(&mut code, config)?;
+        emit_specialized_q4_matmul_batched_functions(&mut code, config)?;
     }
     emit_specialized_matmul_functions(&mut code, config)?;
     emit_forward_function(&mut code, graph, config)?;
     emit_prefill_function(&mut code, config)?;
-    if config.dtype == DType::Q8_0 {
+    if config.dtype == DType::Q8_0 || config.dtype == DType::Q4_0 {
         emit_prefill_batched_function(&mut code, config)?;
         if use_flash_attention(config) {
             emit_flash_attention_batched_function(&mut code)?;
@@ -2677,6 +2678,166 @@ fn emit_specialized_q4_matmul_functions(
     Ok(())
 }
 
+/// Emit shape-specialized Q4_0 *batched* matmul functions:
+/// `matmul_mat_q4_0_KxN(output, m, input, weight)`.
+///
+/// Mirrors `emit_specialized_q8_matmul_batched_functions` but with
+/// `dot8_q4_0_q8_0` / `dot4_q4_0_q8_0` inner kernels and Q4_0 weight
+/// row byte size (`ceil(k/32) * 18`).  Input is still Q8_0-quantized
+/// (same `quantize_to_q8_0_blocks_into` helper) since the Q4_0 weight
+/// × Q8_0 input path is what the sdot kernels expect.
+fn emit_specialized_q4_matmul_batched_functions(
+    code: &mut String,
+    config: &ModelConfig,
+) -> Result<(), CodegenError> {
+    writeln!(
+        code,
+        "// --- Shape-specialized Q4_0 batched matmul functions (m>=1, weight is &[u8]) ---"
+    )?;
+    writeln!(code)?;
+
+    for &(k, n) in &q4_matmul_shapes(config) {
+        let weight_row_bytes = k.div_ceil(32) * 18;
+        let q8_row_bytes = k.div_ceil(32) * 34;
+        writeln!(
+            code,
+            "/// Q4_0 batched matmul: [m, {k}] x [{n}, {k}]^T -> [m, {n}] (row-major; weight raw Q4_0 bytes)"
+        )?;
+        writeln!(code, "#[cfg(target_arch = \"aarch64\")]")?;
+        writeln!(
+            code,
+            "fn matmul_mat_q4_0_{k}x{n}(output: &mut [f32], m: usize, input: &[f32], weight: &[u8]) {{"
+        )?;
+        writeln!(
+            code,
+            "    let mut input_q8 = vec![0u8; m * {q8_row_bytes}];"
+        )?;
+        writeln!(code, "    for r in 0..m {{")?;
+        writeln!(
+            code,
+            "        quantize_to_q8_0_blocks_into(&input[r*{k}..(r+1)*{k}], &mut input_q8[r*{q8_row_bytes}..(r+1)*{q8_row_bytes}]);"
+        )?;
+        writeln!(code, "    }}")?;
+
+        let n_chunks8 = n / 8;
+        let n_rem8 = n % 8;
+        let n_chunks4_tail = n_rem8 / 4;
+        let n_rem4 = n_rem8 % 4;
+        writeln!(
+            code,
+            "    // Parallel n-outer loop.  Disjoint output writes per n_block;"
+        )?;
+        writeln!(
+            code,
+            "    // pointer round-trips through usize to stay Send+Sync."
+        )?;
+        writeln!(code, "    let out_addr = output.as_mut_ptr() as usize;")?;
+        writeln!(code, "    let input_q8_ref: &[u8] = &input_q8;")?;
+        if n_chunks8 > 0 {
+            writeln!(
+                code,
+                "    (0..{n_chunks8}).into_par_iter().for_each(|n_block| {{"
+            )?;
+            writeln!(code, "        let j0 = n_block * 8;")?;
+            for i in 0..8 {
+                writeln!(
+                    code,
+                    "        let w{i} = &weight[(j0+{i})*{weight_row_bytes}..(j0+{ip1})*{weight_row_bytes}];",
+                    ip1 = i + 1
+                )?;
+            }
+            writeln!(code, "        for r in 0..m {{")?;
+            writeln!(
+                code,
+                "            let input_q = &input_q8_ref[r*{q8_row_bytes}..(r+1)*{q8_row_bytes}];"
+            )?;
+            writeln!(
+                code,
+                "            let (d0,d1,d2,d3,d4,d5,d6,d7) = dot8_q4_0_q8_0(input_q, w0, w1, w2, w3, w4, w5, w6, w7, {k});"
+            )?;
+            writeln!(code, "            unsafe {{")?;
+            writeln!(code, "                let base = r * {n} + j0;")?;
+            writeln!(
+                code,
+                "                let p = (out_addr as *mut f32).add(base);"
+            )?;
+            writeln!(code, "                *p.add(0) = d0;")?;
+            writeln!(code, "                *p.add(1) = d1;")?;
+            writeln!(code, "                *p.add(2) = d2;")?;
+            writeln!(code, "                *p.add(3) = d3;")?;
+            writeln!(code, "                *p.add(4) = d4;")?;
+            writeln!(code, "                *p.add(5) = d5;")?;
+            writeln!(code, "                *p.add(6) = d6;")?;
+            writeln!(code, "                *p.add(7) = d7;")?;
+            writeln!(code, "            }}")?;
+            writeln!(code, "        }}")?;
+            writeln!(code, "    }});")?;
+        }
+        // Tail handling (N % 8).
+        if n_chunks4_tail > 0 {
+            let tail_base = n_chunks8 * 8;
+            writeln!(code, "    // Scalar tail (N % 8 >= 4)")?;
+            writeln!(code, "    for r in 0..m {{")?;
+            writeln!(
+                code,
+                "        let input_q = &input_q8[r*{q8_row_bytes}..(r+1)*{q8_row_bytes}];"
+            )?;
+            for chunk_idx in 0..n_chunks4_tail {
+                let j0 = tail_base + chunk_idx * 4;
+                writeln!(code, "        {{")?;
+                writeln!(code, "            let (d0,d1,d2,d3) = dot4_q4_0_q8_0(input_q, &weight[({j0}+0)*{weight_row_bytes}..({j0}+1)*{weight_row_bytes}], &weight[({j0}+1)*{weight_row_bytes}..({j0}+2)*{weight_row_bytes}], &weight[({j0}+2)*{weight_row_bytes}..({j0}+3)*{weight_row_bytes}], &weight[({j0}+3)*{weight_row_bytes}..({j0}+4)*{weight_row_bytes}], {k});")?;
+                writeln!(code, "            output[r*{n} + {j0} + 0] = d0;")?;
+                writeln!(code, "            output[r*{n} + {j0} + 1] = d1;")?;
+                writeln!(code, "            output[r*{n} + {j0} + 2] = d2;")?;
+                writeln!(code, "            output[r*{n} + {j0} + 3] = d3;")?;
+                writeln!(code, "        }}")?;
+            }
+            writeln!(code, "    }}")?;
+        }
+        if n_rem4 > 0 {
+            let tail_base = n_chunks8 * 8 + n_chunks4_tail * 4;
+            writeln!(code, "    // Scalar tail (N % 4 remainder)")?;
+            writeln!(code, "    for r in 0..m {{")?;
+            writeln!(
+                code,
+                "        let input_q = &input_q8[r*{q8_row_bytes}..(r+1)*{q8_row_bytes}];"
+            )?;
+            for j in 0..n_rem4 {
+                let col = tail_base + j;
+                writeln!(code, "        output[r*{n} + {col}] = dot_q4_0_q8_0(input_q, &weight[{col}*{weight_row_bytes}..({col}+1)*{weight_row_bytes}], {k});")?;
+            }
+            writeln!(code, "    }}")?;
+        }
+        writeln!(code, "}}")?;
+        writeln!(code)?;
+
+        // Non-aarch64 fallback: loop per-token matmul_vec.
+        writeln!(code, "#[cfg(not(target_arch = \"aarch64\"))]")?;
+        writeln!(
+            code,
+            "fn matmul_mat_q4_0_{k}x{n}(output: &mut [f32], m: usize, input: &[f32], weight: &[u8]) {{"
+        )?;
+        writeln!(code, "    for r in 0..m {{")?;
+        writeln!(code, "        let mut out_row = [0.0f32; {n}];")?;
+        writeln!(
+            code,
+            "        let in_row: &[f32; {k}] = input[r*{k}..(r+1)*{k}].try_into().unwrap();"
+        )?;
+        writeln!(
+            code,
+            "        matmul_vec_q4_0_{k}x{n}(&mut out_row, in_row, weight);"
+        )?;
+        writeln!(
+            code,
+            "        output[r*{n}..(r+1)*{n}].copy_from_slice(&out_row);"
+        )?;
+        writeln!(code, "    }}")?;
+        writeln!(code, "}}")?;
+        writeln!(code)?;
+    }
+    Ok(())
+}
+
 fn emit_forward_function(
     code: &mut String,
     _graph: &Graph,
@@ -3392,9 +3553,9 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code)?;
     // Dispatch to the batched prefill path when the prompt is long enough
     // to amortize heap allocation + batched-matmul overhead.  Below the
-    // threshold, the per-token stack path has lower fixed cost.  Only
-    // emitted for Q8_0 (other dtypes fall through to per-token).
-    if is_q8 {
+    // threshold, the per-token stack path has lower fixed cost.  Emitted
+    // for Q8_0 and Q4_0 (f32 falls through to per-token).
+    if is_q8 || is_q4 {
         writeln!(
             code,
             "    // Long prompts: batched matmul path amortizes weight loads across M tokens."
@@ -3918,6 +4079,24 @@ fn emit_prefill_batched_function(
     let head_dim = config.head_dim;
     let qk_size = num_heads * head_dim;
     let kv_size = num_kv_heads * head_dim;
+    // Dtype-specific kernel name suffix + lm_head row byte size.
+    let (mm_kind, lm_row_bytes, lm_dot8, lm_dot, lm_scalar_dot) = match config.dtype {
+        DType::Q8_0 => (
+            "q8_0",
+            hidden.div_ceil(32) * 34,
+            "dot8_q8_0_q8_0",
+            "dot_q8_0_q8_0",
+            "dot_q8_0",
+        ),
+        DType::Q4_0 => (
+            "q4_0",
+            hidden.div_ceil(32) * 18,
+            "dot8_q4_0_q8_0",
+            "dot_q4_0_q8_0",
+            "dot_q4_0",
+        ),
+        _ => unreachable!("forward_prefill_batched only emitted for Q8_0 / Q4_0"),
+    };
 
     writeln!(code)?;
     writeln!(
@@ -4027,15 +4206,15 @@ fn emit_prefill_batched_function(
     )?;
     writeln!(
         code,
-        "        matmul_mat_q8_0_{hidden}x{qk_size}(&mut q_batch, m, &normed_batch, &lw.q_proj);"
+        "        matmul_mat_{mm_kind}_{hidden}x{qk_size}(&mut q_batch, m, &normed_batch, &lw.q_proj);"
     )?;
     writeln!(
         code,
-        "        matmul_mat_q8_0_{hidden}x{kv_size}(&mut k_batch, m, &normed_batch, &lw.k_proj);"
+        "        matmul_mat_{mm_kind}_{hidden}x{kv_size}(&mut k_batch, m, &normed_batch, &lw.k_proj);"
     )?;
     writeln!(
         code,
-        "        matmul_mat_q8_0_{hidden}x{kv_size}(&mut v_batch, m, &normed_batch, &lw.v_proj);"
+        "        matmul_mat_{mm_kind}_{hidden}x{kv_size}(&mut v_batch, m, &normed_batch, &lw.v_proj);"
     )?;
     writeln!(code)?;
 
@@ -4168,7 +4347,7 @@ fn emit_prefill_batched_function(
     )?;
     writeln!(
         code,
-        "        matmul_mat_q8_0_{qk_size}x{hidden}(&mut attn_proj_batch, m, &attn_out_batch, &lw.o_proj);"
+        "        matmul_mat_{mm_kind}_{qk_size}x{hidden}(&mut attn_proj_batch, m, &attn_out_batch, &lw.o_proj);"
     )?;
     writeln!(code, "        for r in 0..m {{")?;
     writeln!(
@@ -4193,11 +4372,11 @@ fn emit_prefill_batched_function(
     )?;
     writeln!(
         code,
-        "        matmul_mat_q8_0_{hidden}x{intermediate}(&mut gate_batch, m, &normed_batch, &lw.gate_proj);"
+        "        matmul_mat_{mm_kind}_{hidden}x{intermediate}(&mut gate_batch, m, &normed_batch, &lw.gate_proj);"
     )?;
     writeln!(
         code,
-        "        matmul_mat_q8_0_{hidden}x{intermediate}(&mut up_batch, m, &normed_batch, &lw.up_proj);"
+        "        matmul_mat_{mm_kind}_{hidden}x{intermediate}(&mut up_batch, m, &normed_batch, &lw.up_proj);"
     )?;
     writeln!(code, "        for r in 0..m {{")?;
     // Match architecture-dependent activation: existing forward_prefill uses silu_mul.
@@ -4209,7 +4388,7 @@ fn emit_prefill_batched_function(
     writeln!(code, "        // Batched down matmul + per-token residual")?;
     writeln!(
         code,
-        "        matmul_mat_q8_0_{intermediate}x{hidden}(&mut ffn_out_batch, m, &ffn_hidden_batch, &lw.down_proj);"
+        "        matmul_mat_{mm_kind}_{intermediate}x{hidden}(&mut ffn_out_batch, m, &ffn_hidden_batch, &lw.down_proj);"
     )?;
     writeln!(code, "        for r in 0..m {{")?;
     writeln!(
@@ -4220,8 +4399,9 @@ fn emit_prefill_batched_function(
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
-    // Final norm + lm_head on last token only.
-    let lm_row_bytes = hidden.div_ceil(32) * 34;
+    // Final norm + lm_head on last token only.  Dtype-specific kernels:
+    // Q8_0 uses dot8_q8_0_q8_0 / dot_q8_0_q8_0 on 34-byte rows;
+    // Q4_0 uses dot8_q4_0_q8_0 / dot_q4_0_q8_0 on 18-byte rows.
     writeln!(
         code,
         "    // Final rms_norm + lm_head on the last token (matches forward_prefill)"
@@ -4248,7 +4428,7 @@ fn emit_prefill_batched_function(
     writeln!(code, "                let r = base + c * 8;")?;
     writeln!(
         code,
-        "                let (d0,d1,d2,d3,d4,d5,d6,d7) = dot8_q8_0_q8_0(&normed_q8, &weights.lm_head[r*{lm_row_bytes}..(r+1)*{lm_row_bytes}], &weights.lm_head[(r+1)*{lm_row_bytes}..(r+2)*{lm_row_bytes}], &weights.lm_head[(r+2)*{lm_row_bytes}..(r+3)*{lm_row_bytes}], &weights.lm_head[(r+3)*{lm_row_bytes}..(r+4)*{lm_row_bytes}], &weights.lm_head[(r+4)*{lm_row_bytes}..(r+5)*{lm_row_bytes}], &weights.lm_head[(r+5)*{lm_row_bytes}..(r+6)*{lm_row_bytes}], &weights.lm_head[(r+6)*{lm_row_bytes}..(r+7)*{lm_row_bytes}], &weights.lm_head[(r+7)*{lm_row_bytes}..(r+8)*{lm_row_bytes}], {hidden});"
+        "                let (d0,d1,d2,d3,d4,d5,d6,d7) = {lm_dot8}(&normed_q8, &weights.lm_head[r*{lm_row_bytes}..(r+1)*{lm_row_bytes}], &weights.lm_head[(r+1)*{lm_row_bytes}..(r+2)*{lm_row_bytes}], &weights.lm_head[(r+2)*{lm_row_bytes}..(r+3)*{lm_row_bytes}], &weights.lm_head[(r+3)*{lm_row_bytes}..(r+4)*{lm_row_bytes}], &weights.lm_head[(r+4)*{lm_row_bytes}..(r+5)*{lm_row_bytes}], &weights.lm_head[(r+5)*{lm_row_bytes}..(r+6)*{lm_row_bytes}], &weights.lm_head[(r+6)*{lm_row_bytes}..(r+7)*{lm_row_bytes}], &weights.lm_head[(r+7)*{lm_row_bytes}..(r+8)*{lm_row_bytes}], {hidden});"
     )?;
     writeln!(code, "                out[c*8] = d0; out[c*8+1] = d1; out[c*8+2] = d2; out[c*8+3] = d3; out[c*8+4] = d4; out[c*8+5] = d5; out[c*8+6] = d6; out[c*8+7] = d7;")?;
     writeln!(code, "            }}")?;
@@ -4257,7 +4437,7 @@ fn emit_prefill_batched_function(
     writeln!(code, "                let j = base + i;")?;
     writeln!(
         code,
-        "                out[i] = dot_q8_0_q8_0(&normed_q8, &weights.lm_head[j*{lm_row_bytes}..(j+1)*{lm_row_bytes}], {hidden});"
+        "                out[i] = {lm_dot}(&normed_q8, &weights.lm_head[j*{lm_row_bytes}..(j+1)*{lm_row_bytes}], {hidden});"
     )?;
     writeln!(code, "            }}")?;
     writeln!(code, "        }}")?;
@@ -4266,7 +4446,7 @@ fn emit_prefill_batched_function(
     writeln!(code, "            let j = base + r;")?;
     writeln!(
         code,
-        "            out[r] = dot_q8_0(&normed[..], &weights.lm_head[j*{lm_row_bytes}..(j+1)*{lm_row_bytes}], {hidden});"
+        "            out[r] = {lm_scalar_dot}(&normed[..], &weights.lm_head[j*{lm_row_bytes}..(j+1)*{lm_row_bytes}], {hidden});"
     )?;
     writeln!(code, "        }}")?;
     writeln!(code, "    }});")?;
