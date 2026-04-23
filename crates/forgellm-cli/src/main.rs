@@ -1500,6 +1500,22 @@ fn cmd_bench(
         runs
     );
     println!();
+    // `forge bench` measures the interpreter — the generic Rust forward pass
+    // used by `forge run` / `forge chat` / `forge serve`.  AOT-compiled
+    // binaries (produced by `forge compile`) run the same math through
+    // shape-specialized SIMD kernels and are **typically 10–40× faster**
+    // on the same model.  Make that loud so users don't mistake these
+    // numbers for the AOT headline.
+    println!("Mode:   Interpreter (generic Rust path)");
+    println!("Note:   AOT-compiled binaries are 10–40× faster on this model.");
+    println!(
+        "        For AOT numbers: forge compile --target cpu  --model {model_path} --output /tmp/aot"
+    );
+    println!("                         cd /tmp/aot && cargo build --release");
+    println!(
+        "                         ./target/release/<name> weights.bin tokenizer.json <prompt>"
+    );
+    println!();
 
     let sampling_config = sampling::SamplingConfig::greedy();
     let mut prefill_times = Vec::with_capacity(runs);

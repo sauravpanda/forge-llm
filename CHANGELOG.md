@@ -2,6 +2,29 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.8.7] — 2026-04-23 — UX: `forge bench` clarifies interpreter vs AOT
+
+### Fixed
+
+- **`forge bench` was silently benchmarking the interpreter**, not the AOT-compiled binary.  On Llama-3.2-1B Q8_0 this reported ~10 tok/s prefill and ~14 tok/s generate — numbers that make ForgeLLM look slow, because they're the generic Rust forward pass, not the shape-specialized SIMD kernels that `forge compile` emits.  Users comparing ForgeLLM against llama.cpp or MLX with `forge bench` would see a wildly distorted picture.
+
+  Fixed by adding a loud banner to the output:
+
+  ```
+  Mode:   Interpreter (generic Rust path)
+  Note:   AOT-compiled binaries are 10–40× faster on this model.
+          For AOT numbers: forge compile --target cpu --model <model> --output /tmp/aot
+                           cd /tmp/aot && cargo build --release
+                           ./target/release/<name> weights.bin tokenizer.json <prompt>
+  ```
+
+  Printed before the per-run results so the context is unambiguous.  The actual numbers are unchanged.
+
+### Not changed
+
+- No kernel, codegen, or runtime semantics change.
+- Interpreter path itself is unchanged — this is purely a framing/UX fix to keep the default benchmark output from being read as "ForgeLLM is slow".
+
 ## [0.8.6] — 2026-04-23 — `FORGE_BATCHED_PREFILL` runtime toggle + blog addendum
 
 Small follow-up to the v0.8.x series.
