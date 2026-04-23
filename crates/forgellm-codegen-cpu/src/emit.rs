@@ -3730,7 +3730,19 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
             code,
             "    // Threshold 8 ≈ where the heap-alloc + quantize overhead is paid back."
         )?;
-        writeln!(code, "    if seq_len >= PREFILL_BATCH_THRESHOLD {{")?;
+        writeln!(
+            code,
+            "    // Set FORGE_BATCHED_PREFILL=0 at runtime to disable (A/B test vs per-token)."
+        )?;
+        writeln!(
+            code,
+            "    let batched_opt_out = std::env::var(\"FORGE_BATCHED_PREFILL\")"
+        )?;
+        writeln!(code, "        .map(|v| v == \"0\").unwrap_or(false);")?;
+        writeln!(
+            code,
+            "    if !batched_opt_out && seq_len >= PREFILL_BATCH_THRESHOLD {{"
+        )?;
         writeln!(
             code,
             "        return forward_prefill_batched(tokens, weights, cache);"

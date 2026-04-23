@@ -128,4 +128,12 @@ CPU is now in llama.cpp territory for long-context prefill.  Metal is still fast
 
 Next frontiers from here: **batched attention for SWA models** (currently falls back to per-token inside `forward_prefill_batched`), **CPU decode fusion** (decode is inherently per-token, but there's room to fuse rms_norm + matmul across the forward pass), and **Metal + CPU combined scheduling** for the absolute long-context wall.
 
-— the v0.8.2 release,  2026-04-23
+## Addendum — v0.8.4 / v0.8.5 / v0.8.6
+
+**v0.8.4** — correctness bugfix.  The batched prefill fallback was calling plain `attention()` instead of `attention_sliding()` for SWA models (Mistral, Gemma-2 class).  At contexts beyond the window, generated output diverged from the per-token `forward_prefill` path.  Fix routed SWA through `attention_sliding()` (per-token), added a regression test.  Present in v0.8.0–v0.8.3.
+
+**v0.8.5** — batched sliding-window attention.  Wrote `attention_sliding_batch` mirroring `attention_flash_batch`: same Q_TILE=16 online softmax, but bounds the outer K-block loop to the tile's combined valid K range `[max(0, q_tile_start_pos - window + 1), q_tile_end_pos]` so blocks outside the window aren't read at all.  Long-context SWA models now pay `window × M` work instead of `total_seq × M`.
+
+**v0.8.6** — added `FORGE_BATCHED_PREFILL=0` runtime env var to disable the batched path for A/B testing / debugging.  Verified: toggle swings Llama-3.2-1B Q8_0 at 352 tokens from 41 tok/s (per-token) to 324 tok/s (batched) — 8× live difference.
+
+— the v0.8.6 release,  2026-04-23

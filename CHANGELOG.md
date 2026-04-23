@@ -2,6 +2,20 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.8.6] — 2026-04-23 — `FORGE_BATCHED_PREFILL` runtime toggle + blog addendum
+
+Small follow-up to the v0.8.x series.
+
+### Added
+
+- **`FORGE_BATCHED_PREFILL` env var** — set `FORGE_BATCHED_PREFILL=0` before running a generated binary to force the per-token `forward_prefill` path even when the prompt is long enough to normally trigger `forward_prefill_batched`.  Useful for A/B testing the batched path against the baseline, debugging suspected regressions, or measuring the speedup on user workloads without recompiling.  Default (unset or `"1"` / anything else) keeps the batched path active.  Verified: on Llama-3.2-1B Q8_0 at 352 tokens, the toggle swings prefill from **41 tok/s** (per-token) to **324 tok/s** (batched).
+- **Blog addendum** in `blog/cpu-batched-prefill.md` covering the v0.8.4 SWA correctness fix, v0.8.5 `attention_sliding_batch`, and this v0.8.6 runtime toggle.
+
+### Not changed
+
+- Default behavior, codegen structure, and kernel semantics are unchanged from v0.8.5.
+- No performance or correctness change.
+
 ## [0.8.5] — 2026-04-23 — Batched sliding-window attention
 
 Completes the SWA (sliding-window attention) story on the CPU batched prefill path.  v0.8.4 fixed the correctness bug by routing SWA models to a per-token `attention_sliding` fallback; this release gives them the same Q-tiled batched treatment that v0.8.1 gave to flash-attention models.
