@@ -29,6 +29,7 @@ pub fn generate(graph: &Graph) -> Result<String, CodegenError> {
         emit_q8_0_kernel(&mut code)?;
         emit_q8_0_sdot_kernel(&mut code)?;
         emit_specialized_q8_matmul_functions(&mut code, config)?;
+        emit_specialized_q8_matmul_batched_functions(&mut code, config)?;
     }
     if config.dtype == DType::Q4_0 {
         emit_q4_0_kernel(&mut code)?;
@@ -38,6 +39,9 @@ pub fn generate(graph: &Graph) -> Result<String, CodegenError> {
     emit_specialized_matmul_functions(&mut code, config)?;
     emit_forward_function(&mut code, graph, config)?;
     emit_prefill_function(&mut code, config)?;
+    if config.dtype == DType::Q8_0 {
+        emit_prefill_batched_function(&mut code, config)?;
+    }
 
     Ok(code)
 }
@@ -139,6 +143,10 @@ fn emit_header(code: &mut String, config: &ModelConfig) -> Result<(), CodegenErr
     writeln!(
         code,
         "pub const FLASH_ATTN_BLOCK_SIZE: usize = 64;  // tile size for flash attention"
+    )?;
+    writeln!(
+        code,
+        "pub const PREFILL_BATCH_THRESHOLD: usize = 8;  // min prompt length for batched prefill path"
     )?;
     writeln!(code)?;
 
@@ -1668,6 +1676,216 @@ fn emit_specialized_q8_matmul_functions(
     Ok(())
 }
 
+/// Emit shape-specialized Q8_0 *batched* matmul functions:
+/// `matmul_mat_q8_0_KxN(output, m, input, weight)`.
+///
+/// Processes `m` input vectors against a single weight matrix in a
+/// weight-outer, token-inner loop so that each 8-row weight block stays hot
+/// in L1 across all `m` iterations — this amortizes weight bandwidth by a
+/// factor of `m`, which is the whole point of batched prefill on CPU.
+///
+/// Output layout is row-major `[m * N]` matching the single-token
+/// `matmul_vec_q8_0_KxN` output layout, so callers can index as
+/// `output[r * N + n]` for token `r`.
+///
+/// AArch64 path uses `dot8_q8_0_q8_0` (4-simdgroup-worth of sdot ILP).
+/// Non-AArch64 fallback loops the scalar `dot_q8_0` kernel.
+fn emit_specialized_q8_matmul_batched_functions(
+    code: &mut String,
+    config: &ModelConfig,
+) -> Result<(), CodegenError> {
+    writeln!(
+        code,
+        "// --- Shape-specialized Q8_0 batched matmul functions (m>=1, weight is &[u8]) ---"
+    )?;
+    writeln!(code)?;
+
+    for &(k, n) in &q8_matmul_shapes(config) {
+        let row_bytes = k.div_ceil(32) * 34;
+        writeln!(
+            code,
+            "/// Q8_0 batched matmul: [m, {k}] x [{n}, {k}]^T -> [m, {n}] (row-major; weight raw Q8_0 bytes)"
+        )?;
+        writeln!(code, "#[cfg(target_arch = \"aarch64\")]")?;
+        writeln!(
+            code,
+            "fn matmul_mat_q8_0_{k}x{n}(output: &mut [f32], m: usize, input: &[f32], weight: &[u8]) {{"
+        )?;
+        // Quantize all m inputs once.  Row-bytes is statically known, so we
+        // size the buffer as `m * row_bytes` and the inner slice is exact.
+        writeln!(code, "    let mut input_q8 = vec![0u8; m * {row_bytes}];")?;
+        writeln!(code, "    for r in 0..m {{")?;
+        writeln!(
+            code,
+            "        quantize_to_q8_0_blocks_into(&input[r*{k}..(r+1)*{k}], &mut input_q8[r*{row_bytes}..(r+1)*{row_bytes}]);"
+        )?;
+        writeln!(code, "    }}")?;
+        // Weight-outer n-chunks-of-8, token-inner: for each chunk, 8 weight
+        // rows stay hot in L1 during the full m loop → amortized bandwidth.
+        let n_chunks8 = n / 8;
+        let n_rem8 = n % 8;
+        let n_chunks4_tail = n_rem8 / 4;
+        let n_rem4 = n_rem8 % 4;
+        // Parallelize the n-outer loop via rayon.  Different `n_block`s write
+        // to disjoint [r*N + j0..j0+8] slices of output, so the reads/writes
+        // don't race.  We use a raw pointer + `Send` wrapper (usize carries
+        // the address safely across threads; each worker's writes are into
+        // proved-disjoint regions of the same buffer).
+        //
+        // Parallelization is unconditional: for short m (< ~8) the overhead
+        // may outweigh the win, and callers should use the per-token path
+        // then; this function is intended for batched prefill (m >= 8).
+        writeln!(
+            code,
+            "    // Parallel n-outer loop.  Different n_block values write to"
+        )?;
+        writeln!(
+            code,
+            "    // disjoint `output[r*N + j0..j0+8]` slices, so workers never"
+        )?;
+        writeln!(
+            code,
+            "    // alias.  Pass the output pointer across threads as a `usize`"
+        )?;
+        writeln!(
+            code,
+            "    // (Send+Sync) and reconstruct inside each worker — avoids"
+        )?;
+        writeln!(code, "    // the raw-pointer Send/Sync boilerplate.")?;
+        writeln!(code, "    let out_addr = output.as_mut_ptr() as usize;")?;
+        writeln!(code, "    let input_q8_ref: &[u8] = &input_q8;")?;
+        if n_chunks8 > 0 {
+            writeln!(
+                code,
+                "    (0..{n_chunks8}).into_par_iter().for_each(|n_block| {{"
+            )?;
+            writeln!(code, "        let j0 = n_block * 8;")?;
+            writeln!(
+                code,
+                "        let w0 = &weight[(j0+0)*{row_bytes}..(j0+1)*{row_bytes}];"
+            )?;
+            writeln!(
+                code,
+                "        let w1 = &weight[(j0+1)*{row_bytes}..(j0+2)*{row_bytes}];"
+            )?;
+            writeln!(
+                code,
+                "        let w2 = &weight[(j0+2)*{row_bytes}..(j0+3)*{row_bytes}];"
+            )?;
+            writeln!(
+                code,
+                "        let w3 = &weight[(j0+3)*{row_bytes}..(j0+4)*{row_bytes}];"
+            )?;
+            writeln!(
+                code,
+                "        let w4 = &weight[(j0+4)*{row_bytes}..(j0+5)*{row_bytes}];"
+            )?;
+            writeln!(
+                code,
+                "        let w5 = &weight[(j0+5)*{row_bytes}..(j0+6)*{row_bytes}];"
+            )?;
+            writeln!(
+                code,
+                "        let w6 = &weight[(j0+6)*{row_bytes}..(j0+7)*{row_bytes}];"
+            )?;
+            writeln!(
+                code,
+                "        let w7 = &weight[(j0+7)*{row_bytes}..(j0+8)*{row_bytes}];"
+            )?;
+            writeln!(code, "        for r in 0..m {{")?;
+            writeln!(
+                code,
+                "            let input_q = &input_q8_ref[r*{row_bytes}..(r+1)*{row_bytes}];"
+            )?;
+            writeln!(
+                code,
+                "            let (d0,d1,d2,d3,d4,d5,d6,d7) = dot8_q8_0_q8_0(input_q, w0, w1, w2, w3, w4, w5, w6, w7, {k});"
+            )?;
+            writeln!(code, "            unsafe {{")?;
+            writeln!(code, "                let base = r * {n} + j0;")?;
+            writeln!(
+                code,
+                "                let p = (out_addr as *mut f32).add(base);"
+            )?;
+            writeln!(code, "                *p.add(0) = d0;")?;
+            writeln!(code, "                *p.add(1) = d1;")?;
+            writeln!(code, "                *p.add(2) = d2;")?;
+            writeln!(code, "                *p.add(3) = d3;")?;
+            writeln!(code, "                *p.add(4) = d4;")?;
+            writeln!(code, "                *p.add(5) = d5;")?;
+            writeln!(code, "                *p.add(6) = d6;")?;
+            writeln!(code, "                *p.add(7) = d7;")?;
+            writeln!(code, "            }}")?;
+            writeln!(code, "        }}")?;
+            writeln!(code, "    }});")?;
+        }
+        // Tail columns N % 8 (scalar — typically zero for our model shapes).
+        // Use dot4 for 4-row chunk of tail, then scalar for the rest.
+        if n_chunks4_tail > 0 {
+            let tail_base = n_chunks8 * 8;
+            writeln!(code, "    // Scalar tail (N % 8 >= 4)")?;
+            writeln!(code, "    for r in 0..m {{")?;
+            writeln!(
+                code,
+                "        let input_q = &input_q8[r*{row_bytes}..(r+1)*{row_bytes}];"
+            )?;
+            for chunk_idx in 0..n_chunks4_tail {
+                let j0 = tail_base + chunk_idx * 4;
+                writeln!(code, "        {{")?;
+                writeln!(code, "            let (d0,d1,d2,d3) = dot4_q8_0_q8_0(input_q, &weight[({j0}+0)*{row_bytes}..({j0}+1)*{row_bytes}], &weight[({j0}+1)*{row_bytes}..({j0}+2)*{row_bytes}], &weight[({j0}+2)*{row_bytes}..({j0}+3)*{row_bytes}], &weight[({j0}+3)*{row_bytes}..({j0}+4)*{row_bytes}], {k});")?;
+                writeln!(code, "            output[r*{n} + {j0} + 0] = d0;")?;
+                writeln!(code, "            output[r*{n} + {j0} + 1] = d1;")?;
+                writeln!(code, "            output[r*{n} + {j0} + 2] = d2;")?;
+                writeln!(code, "            output[r*{n} + {j0} + 3] = d3;")?;
+                writeln!(code, "        }}")?;
+            }
+            writeln!(code, "    }}")?;
+        }
+        if n_rem4 > 0 {
+            let tail_base = n_chunks8 * 8 + n_chunks4_tail * 4;
+            writeln!(code, "    // Scalar tail (N % 4 remainder)")?;
+            writeln!(code, "    for r in 0..m {{")?;
+            writeln!(
+                code,
+                "        let input_q = &input_q8[r*{row_bytes}..(r+1)*{row_bytes}];"
+            )?;
+            for j in 0..n_rem4 {
+                let col = tail_base + j;
+                writeln!(code, "        output[r*{n} + {col}] = dot_q8_0_q8_0(input_q, &weight[{col}*{row_bytes}..({col}+1)*{row_bytes}], {k});")?;
+            }
+            writeln!(code, "    }}")?;
+        }
+        writeln!(code, "}}")?;
+        writeln!(code)?;
+
+        // Non-aarch64 fallback: loop the per-token matmul_vec (no batching
+        // benefit but keeps the signature portable).
+        writeln!(code, "#[cfg(not(target_arch = \"aarch64\"))]")?;
+        writeln!(
+            code,
+            "fn matmul_mat_q8_0_{k}x{n}(output: &mut [f32], m: usize, input: &[f32], weight: &[u8]) {{"
+        )?;
+        writeln!(code, "    for r in 0..m {{")?;
+        writeln!(code, "        let mut out_row = [0.0f32; {n}];")?;
+        writeln!(
+            code,
+            "        let in_row: &[f32; {k}] = input[r*{k}..(r+1)*{k}].try_into().unwrap();"
+        )?;
+        writeln!(
+            code,
+            "        matmul_vec_q8_0_{k}x{n}(&mut out_row, in_row, weight);"
+        )?;
+        writeln!(
+            code,
+            "        output[r*{n}..(r+1)*{n}].copy_from_slice(&out_row);"
+        )?;
+        writeln!(code, "    }}")?;
+        writeln!(code, "}}")?;
+        writeln!(code)?;
+    }
+    Ok(())
+}
+
 /// Emit the Q4_0 scalar dot-product helper (used as non-aarch64 fallback).
 /// Also emits `f16_bits_to_f32` if Q8_0 did not already.
 fn emit_q4_0_kernel(code: &mut String) -> Result<(), CodegenError> {
@@ -3001,6 +3219,27 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
     )?;
     writeln!(code, "    let seq_len = tokens.len();")?;
     writeln!(code)?;
+    // Dispatch to the batched prefill path when the prompt is long enough
+    // to amortize heap allocation + batched-matmul overhead.  Below the
+    // threshold, the per-token stack path has lower fixed cost.  Only
+    // emitted for Q8_0 (other dtypes fall through to per-token).
+    if is_q8 {
+        writeln!(
+            code,
+            "    // Long prompts: batched matmul path amortizes weight loads across M tokens."
+        )?;
+        writeln!(
+            code,
+            "    // Threshold 8 ≈ where the heap-alloc + quantize overhead is paid back."
+        )?;
+        writeln!(code, "    if seq_len >= PREFILL_BATCH_THRESHOLD {{")?;
+        writeln!(
+            code,
+            "        return forward_prefill_batched(tokens, weights, cache);"
+        )?;
+        writeln!(code, "    }}")?;
+        writeln!(code)?;
+    }
     writeln!(
         code,
         "    // Precompute RoPE frequencies once for the entire prefill pass"
@@ -3478,6 +3717,357 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "    cache.len += seq_len;")?;
     writeln!(code, "    last_logits")?;
     writeln!(code, "}}")?;
+
+    Ok(())
+}
+
+/// Emit `forward_prefill_batched` — processes all M prompt tokens with
+/// batched matmul for QKV/O/FFN projections and per-token activations
+/// (rms_norm, RoPE, attention, silu_mul, residual).  The key win is that
+/// each weight matrix is loaded from RAM once per forward pass, not M
+/// times, which is the bottleneck for long prompts on CPU.
+///
+/// Memory: allocates heap buffers sized `m * max_hidden_vector`.  For
+/// M=2000 on Llama-3.2-1B that's ~200 MB peak — acceptable for prefill,
+/// returned at end of call.
+///
+/// Layout: all batch buffers are row-major `[m][dim]`.  `matmul_mat_q8_0`
+/// reads row-major and writes row-major to preserve that contract.
+///
+/// Only emitted for Q8_0 models.  Q4_0 / f32 fall through to the per-token
+/// `forward_prefill` path.
+fn emit_prefill_batched_function(
+    code: &mut String,
+    config: &ModelConfig,
+) -> Result<(), CodegenError> {
+    let hidden = config.hidden_size;
+    let intermediate = config.intermediate_size;
+    let num_heads = config.num_attention_heads;
+    let num_kv_heads = config.num_kv_heads;
+    let head_dim = config.head_dim;
+    let qk_size = num_heads * head_dim;
+    let kv_size = num_kv_heads * head_dim;
+
+    writeln!(code)?;
+    writeln!(
+        code,
+        "/// Batched prefill: processes all M prompt tokens with batched matmul."
+    )?;
+    writeln!(
+        code,
+        "/// Each weight matrix is loaded from RAM once per forward pass (vs M times"
+    )?;
+    writeln!(
+        code,
+        "/// in per-token prefill), amortizing weight bandwidth by a factor of M."
+    )?;
+    writeln!(
+        code,
+        "pub fn forward_prefill_batched(tokens: &[u32], weights: &Weights, cache: &mut KVCache) -> Vec<f32> {{"
+    )?;
+    writeln!(code, "    let m = tokens.len();")?;
+    writeln!(code, "    let base_pos = cache.len;")?;
+    writeln!(
+        code,
+        "    let rope_freqs = rope_freqs(HEAD_DIM, ROPE_THETA);"
+    )?;
+    writeln!(code)?;
+
+    // Heap batch buffers.
+    writeln!(
+        code,
+        "    // Per-token state, row-major [m][dim].  Heap-allocated for M flexibility."
+    )?;
+    writeln!(
+        code,
+        "    let mut hidden_batch = vec![0.0f32; m * {hidden}];"
+    )?;
+    writeln!(
+        code,
+        "    let mut normed_batch = vec![0.0f32; m * {hidden}];"
+    )?;
+    writeln!(code, "    let mut q_batch = vec![0.0f32; m * {qk_size}];")?;
+    writeln!(code, "    let mut k_batch = vec![0.0f32; m * {kv_size}];")?;
+    writeln!(code, "    let mut v_batch = vec![0.0f32; m * {kv_size}];")?;
+    writeln!(
+        code,
+        "    let mut attn_out_batch = vec![0.0f32; m * {qk_size}];"
+    )?;
+    writeln!(
+        code,
+        "    let mut attn_proj_batch = vec![0.0f32; m * {hidden}];"
+    )?;
+    writeln!(
+        code,
+        "    let mut gate_batch = vec![0.0f32; m * {intermediate}];"
+    )?;
+    writeln!(
+        code,
+        "    let mut up_batch = vec![0.0f32; m * {intermediate}];"
+    )?;
+    writeln!(
+        code,
+        "    let mut ffn_hidden_batch = vec![0.0f32; m * {intermediate}];"
+    )?;
+    writeln!(
+        code,
+        "    let mut ffn_out_batch = vec![0.0f32; m * {hidden}];"
+    )?;
+    writeln!(code)?;
+
+    // Initial embedding lookup.
+    writeln!(
+        code,
+        "    // Embedding lookup: per-token (memory-bandwidth bound, can't batch)."
+    )?;
+    writeln!(
+        code,
+        "    for (r, &token_id) in tokens.iter().enumerate() {{"
+    )?;
+    writeln!(
+        code,
+        "        embedding(&mut hidden_batch[r*{hidden}..(r+1)*{hidden}], token_id, &weights.embed_tokens, HIDDEN_SIZE);"
+    )?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
+
+    // Main layer loop.
+    writeln!(code, "    for layer_idx in 0..NUM_LAYERS {{")?;
+    writeln!(code, "        let lw = &weights.layers[layer_idx];")?;
+    writeln!(code)?;
+
+    // Attention rms_norm (per-token).
+    writeln!(
+        code,
+        "        // Attention rms_norm (per-token, O(hidden) per token)"
+    )?;
+    writeln!(code, "        for r in 0..m {{")?;
+    writeln!(
+        code,
+        "            rms_norm(&mut normed_batch[r*{hidden}..(r+1)*{hidden}], &hidden_batch[r*{hidden}..(r+1)*{hidden}], &lw.attn_norm, RMS_NORM_EPS);"
+    )?;
+    writeln!(code, "        }}")?;
+    writeln!(code)?;
+
+    // Batched QKV matmul.
+    writeln!(
+        code,
+        "        // Batched QKV projections: weight loaded once, used for all m tokens"
+    )?;
+    writeln!(
+        code,
+        "        matmul_mat_q8_0_{hidden}x{qk_size}(&mut q_batch, m, &normed_batch, &lw.q_proj);"
+    )?;
+    writeln!(
+        code,
+        "        matmul_mat_q8_0_{hidden}x{kv_size}(&mut k_batch, m, &normed_batch, &lw.k_proj);"
+    )?;
+    writeln!(
+        code,
+        "        matmul_mat_q8_0_{hidden}x{kv_size}(&mut v_batch, m, &normed_batch, &lw.v_proj);"
+    )?;
+    writeln!(code)?;
+
+    // Per-token post-QKV: bias, RoPE, KV cache write, attention.
+    writeln!(
+        code,
+        "        // Per-token: optional QKV bias, RoPE, KV cache write, attention"
+    )?;
+    writeln!(code, "        let mut k_q = [0i8; {kv_size}];")?;
+    writeln!(code, "        let mut v_q = [0i8; {kv_size}];")?;
+    writeln!(code, "        for r in 0..m {{")?;
+    writeln!(code, "            let pos = base_pos + r;")?;
+    writeln!(
+        code,
+        "            let q_row = &mut q_batch[r*{qk_size}..(r+1)*{qk_size}];"
+    )?;
+    writeln!(
+        code,
+        "            let k_row = &mut k_batch[r*{kv_size}..(r+1)*{kv_size}];"
+    )?;
+    writeln!(
+        code,
+        "            let v_row = &mut v_batch[r*{kv_size}..(r+1)*{kv_size}];"
+    )?;
+    if config.qkv_bias {
+        writeln!(code, "            // QKV bias additions (Qwen2)")?;
+        writeln!(
+            code,
+            "            for i in 0..{qk_size} {{ q_row[i] += lw.q_bias[i]; }}"
+        )?;
+        writeln!(
+            code,
+            "            for i in 0..{kv_size} {{ k_row[i] += lw.k_bias[i]; }}"
+        )?;
+        writeln!(
+            code,
+            "            for i in 0..{kv_size} {{ v_row[i] += lw.v_bias[i]; }}"
+        )?;
+    }
+    writeln!(
+        code,
+        "            rope(q_row, pos, HEAD_DIM, NUM_HEADS, &rope_freqs);"
+    )?;
+    writeln!(
+        code,
+        "            rope(k_row, pos, HEAD_DIM, NUM_KV_HEADS, &rope_freqs);"
+    )?;
+    writeln!(
+        code,
+        "            cache.k_scales[layer_idx][pos] = quantize_kv(k_row, &mut k_q);"
+    )?;
+    writeln!(
+        code,
+        "            cache.k[layer_idx][pos*{kv_size}..(pos+1)*{kv_size}].copy_from_slice(&k_q);"
+    )?;
+    writeln!(
+        code,
+        "            cache.v_scales[layer_idx][pos] = quantize_kv(v_row, &mut v_q);"
+    )?;
+    writeln!(
+        code,
+        "            cache.v[layer_idx][pos*{kv_size}..(pos+1)*{kv_size}].copy_from_slice(&v_q);"
+    )?;
+    // Attention.
+    if use_flash_attention(config) {
+        writeln!(code, "            attention_flash(")?;
+    } else {
+        writeln!(code, "            attention(")?;
+    }
+    writeln!(
+        code,
+        "                &mut attn_out_batch[r*{qk_size}..(r+1)*{qk_size}], q_row,"
+    )?;
+    writeln!(
+        code,
+        "                &cache.k[layer_idx][..(pos+1)*{kv_size}], &cache.v[layer_idx][..(pos+1)*{kv_size}],"
+    )?;
+    writeln!(
+        code,
+        "                &cache.k_scales[layer_idx][..pos+1], &cache.v_scales[layer_idx][..pos+1],"
+    )?;
+    writeln!(
+        code,
+        "                pos + 1, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM,"
+    )?;
+    writeln!(code, "            );")?;
+    writeln!(code, "        }}")?;
+    writeln!(code)?;
+
+    // Batched O matmul.
+    writeln!(
+        code,
+        "        // Batched O projection + per-token residual add"
+    )?;
+    writeln!(
+        code,
+        "        matmul_mat_q8_0_{qk_size}x{hidden}(&mut attn_proj_batch, m, &attn_out_batch, &lw.o_proj);"
+    )?;
+    writeln!(code, "        for r in 0..m {{")?;
+    writeln!(
+        code,
+        "            residual_add(&mut hidden_batch[r*{hidden}..(r+1)*{hidden}], &attn_proj_batch[r*{hidden}..(r+1)*{hidden}]);"
+    )?;
+    writeln!(code, "        }}")?;
+    writeln!(code)?;
+
+    // FFN norm + batched gate/up + silu_mul + batched down + residual.
+    writeln!(code, "        // FFN rms_norm (per-token)")?;
+    writeln!(code, "        for r in 0..m {{")?;
+    writeln!(
+        code,
+        "            rms_norm(&mut normed_batch[r*{hidden}..(r+1)*{hidden}], &hidden_batch[r*{hidden}..(r+1)*{hidden}], &lw.ffn_norm, RMS_NORM_EPS);"
+    )?;
+    writeln!(code, "        }}")?;
+    writeln!(code)?;
+    writeln!(
+        code,
+        "        // Batched gate/up matmul + per-token silu_mul"
+    )?;
+    writeln!(
+        code,
+        "        matmul_mat_q8_0_{hidden}x{intermediate}(&mut gate_batch, m, &normed_batch, &lw.gate_proj);"
+    )?;
+    writeln!(
+        code,
+        "        matmul_mat_q8_0_{hidden}x{intermediate}(&mut up_batch, m, &normed_batch, &lw.up_proj);"
+    )?;
+    writeln!(code, "        for r in 0..m {{")?;
+    // Match architecture-dependent activation: existing forward_prefill uses silu_mul.
+    writeln!(
+        code,
+        "            silu_mul(&mut ffn_hidden_batch[r*{intermediate}..(r+1)*{intermediate}], &gate_batch[r*{intermediate}..(r+1)*{intermediate}], &up_batch[r*{intermediate}..(r+1)*{intermediate}]);"
+    )?;
+    writeln!(code, "        }}")?;
+    writeln!(code, "        // Batched down matmul + per-token residual")?;
+    writeln!(
+        code,
+        "        matmul_mat_q8_0_{intermediate}x{hidden}(&mut ffn_out_batch, m, &ffn_hidden_batch, &lw.down_proj);"
+    )?;
+    writeln!(code, "        for r in 0..m {{")?;
+    writeln!(
+        code,
+        "            residual_add(&mut hidden_batch[r*{hidden}..(r+1)*{hidden}], &ffn_out_batch[r*{hidden}..(r+1)*{hidden}]);"
+    )?;
+    writeln!(code, "        }}")?;
+    writeln!(code, "    }}")?;
+    writeln!(code)?;
+
+    // Final norm + lm_head on last token only.
+    let lm_row_bytes = hidden.div_ceil(32) * 34;
+    writeln!(
+        code,
+        "    // Final rms_norm + lm_head on the last token (matches forward_prefill)"
+    )?;
+    writeln!(code, "    let mut normed = [0.0f32; {hidden}];")?;
+    writeln!(
+        code,
+        "    rms_norm(&mut normed, &hidden_batch[(m-1)*{hidden}..m*{hidden}], &weights.final_norm, RMS_NORM_EPS);"
+    )?;
+    writeln!(code, "    let mut last_logits = vec![0.0f32; VOCAB_SIZE];")?;
+    writeln!(code, "    #[cfg(target_arch = \"aarch64\")]")?;
+    writeln!(
+        code,
+        "    let normed_q8 = quantize_to_q8_0_blocks(&normed[..]);"
+    )?;
+    writeln!(
+        code,
+        "    last_logits.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
+    )?;
+    writeln!(code, "        let base = chunk_idx * 256;")?;
+    writeln!(code, "        #[cfg(target_arch = \"aarch64\")] {{")?;
+    writeln!(code, "            let chunks8 = out.len() / 8;")?;
+    writeln!(code, "            for c in 0..chunks8 {{")?;
+    writeln!(code, "                let r = base + c * 8;")?;
+    writeln!(
+        code,
+        "                let (d0,d1,d2,d3,d4,d5,d6,d7) = dot8_q8_0_q8_0(&normed_q8, &weights.lm_head[r*{lm_row_bytes}..(r+1)*{lm_row_bytes}], &weights.lm_head[(r+1)*{lm_row_bytes}..(r+2)*{lm_row_bytes}], &weights.lm_head[(r+2)*{lm_row_bytes}..(r+3)*{lm_row_bytes}], &weights.lm_head[(r+3)*{lm_row_bytes}..(r+4)*{lm_row_bytes}], &weights.lm_head[(r+4)*{lm_row_bytes}..(r+5)*{lm_row_bytes}], &weights.lm_head[(r+5)*{lm_row_bytes}..(r+6)*{lm_row_bytes}], &weights.lm_head[(r+6)*{lm_row_bytes}..(r+7)*{lm_row_bytes}], &weights.lm_head[(r+7)*{lm_row_bytes}..(r+8)*{lm_row_bytes}], {hidden});"
+    )?;
+    writeln!(code, "                out[c*8] = d0; out[c*8+1] = d1; out[c*8+2] = d2; out[c*8+3] = d3; out[c*8+4] = d4; out[c*8+5] = d5; out[c*8+6] = d6; out[c*8+7] = d7;")?;
+    writeln!(code, "            }}")?;
+    writeln!(code, "            let tail8 = chunks8 * 8;")?;
+    writeln!(code, "            for i in tail8..out.len() {{")?;
+    writeln!(code, "                let j = base + i;")?;
+    writeln!(
+        code,
+        "                out[i] = dot_q8_0_q8_0(&normed_q8, &weights.lm_head[j*{lm_row_bytes}..(j+1)*{lm_row_bytes}], {hidden});"
+    )?;
+    writeln!(code, "            }}")?;
+    writeln!(code, "        }}")?;
+    writeln!(code, "        #[cfg(not(target_arch = \"aarch64\"))]")?;
+    writeln!(code, "        for r in 0..out.len() {{")?;
+    writeln!(code, "            let j = base + r;")?;
+    writeln!(
+        code,
+        "            out[r] = dot_q8_0(&normed[..], &weights.lm_head[j*{lm_row_bytes}..(j+1)*{lm_row_bytes}], {hidden});"
+    )?;
+    writeln!(code, "        }}")?;
+    writeln!(code, "    }});")?;
+    writeln!(code)?;
+    writeln!(code, "    cache.len += m;")?;
+    writeln!(code, "    last_logits")?;
+    writeln!(code, "}}")?;
+    writeln!(code)?;
 
     Ok(())
 }

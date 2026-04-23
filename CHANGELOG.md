@@ -2,6 +2,38 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.8.0] — 2026-04-22 — CPU batched prefill (closes #211)
+
+Major CPU backend win: prompt prefill is now batched over all M input tokens with weight-outer, token-inner matmul kernels, amortizing weight-bandwidth across the batch instead of re-reading the full weight matrix per token.  For Q8_0 models at prompts ≥ 8 tokens the generated `forward_prefill` now dispatches to a new batched path.
+
+### Performance (Apple M5 Pro, Llama-3.2-1B-Instruct Q8_0)
+
+| Prompt length | Per-token prefill | **Batched (v0.8.0)** | Speedup |
+|---:|---:|---:|---:|
+| 352 tokens | 40.2 tok/s | **129.5 tok/s** | **3.2×** |
+| 902 tokens | 30.9 tok/s | **66.2 tok/s** | **2.1×** |
+| 1603 tokens | 24.3 tok/s | **43.1 tok/s** | **1.8×** |
+| 2502 tokens | 18.9 tok/s | **29.4 tok/s** | **1.6×** |
+
+Speedup decays with prompt length as the O(M²) per-token attention path starts to dominate — that's the next optimization target, but the matmul win lifts CPU prefill out of the 20-40 tok/s range that was making CPU deployments impractical for ≥ 500-token prompts.
+
+### Added
+
+- **`matmul_mat_q8_0_KxN`** shape-specialized batched Q8_0 matmul kernels (emitted for each unique `(K, N)` pair used by the forward pass). Weight-outer, token-inner loop keeps each 8-row weight block hot in L1 across all M iterations — the whole point of batched prefill. Uses the existing `dot8_q8_0_q8_0` inline-asm sdot kernel; parallelized over n-blocks via rayon with disjoint `output[r*N + j0..j0+8]` writes.
+- **`forward_prefill_batched`** — new public function emitted for Q8_0 models. Heap-allocates `m × dim` batch buffers for each inter-layer tensor (hidden, normed, q/k/v, attn_out, gate/up, ffn_hidden, ffn_out), batches QKV/O/gate/up/down matmul, keeps rms_norm, RoPE, K/V cache writes, attention, silu_mul, and residual_add per-token within the layer loop. Final norm + lm_head run on the last token only (matches existing behavior).
+- **`PREFILL_BATCH_THRESHOLD = 8`** const in generated CPU projects — `forward_prefill` dispatches to `forward_prefill_batched` above this threshold, keeps the stack-based per-token path below it (lower fixed cost for short prompts).
+
+### Correctness
+
+- Per-token and batched paths produce byte-identical output across tested prompt lengths (7–2502 tokens on Llama-3.2-1B).
+- 62/62 CPU codegen tests pass.
+- 53/53 runtime tests pass.
+
+### Not covered
+
+- Q4_0 and f32 models fall through to the existing per-token path — batched `matmul_mat_q4_0` and batched f32 matmul can be added later if needed. Q8_0 covers all GGUF models we currently ship support for, which makes this a practical pragma-default win.
+- Attention remains per-token (the `attention_flash` kernel is already tiled with O(FLASH_ATTN_BLOCK_SIZE) memory). At very long prompts (≥ 2K tokens) attention's O(M²) cost starts to dominate the saved matmul bandwidth — batched attention is the next frontier.
+
 ## [0.7.13] — 2026-04-22 — MPS attention for MHA models + GQA short-prompt fix
 
 Extends the MPS-materialized attention path from MQA/GQA to MHA (`num_kv_heads == num_attention_heads`) and fixes a latent crash on the GQA path at very short prefill prompts.
