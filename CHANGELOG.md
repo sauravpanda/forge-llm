@@ -2,6 +2,36 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.8.1] — 2026-04-23 — CPU batched attention
+
+Follow-on to v0.8.0: adds `attention_flash_batch`, a Q-tiled flash-attention kernel that amortizes K/V scans across Q_TILE=16 query rows per block, parallelized over heads. Wired into `forward_prefill_batched` replacing the per-token `attention_flash` call loop.
+
+### Performance (Apple M5 Pro, Llama-3.2-1B-Instruct Q8_0)
+
+| Prompt | v0.7.x | v0.8.0 matmul | **v0.8.1 + attn** | Total vs v0.7.x |
+|---:|---:|---:|---:|---:|
+| 352 tokens | 40.2 tok/s | 129.5 | **190.6** | **4.7×** |
+| 902 tokens | 30.9 tok/s | 66.2 | **234.2** | **7.6×** |
+| 1603 tokens | 24.3 tok/s | 43.1 | **207.4** | **8.5×** |
+| 2502 tokens | 18.9 tok/s | 29.4 | **180.0** | **9.5×** |
+
+At longer prompts the prefill is now 180–230 tok/s (vs 19–31 on v0.7.x), which is the range llama.cpp-class runtimes deliver for the same model — matched from pure-Rust Q8_0 with the standard flash softmax recurrence and a GQA-aware K/V layout.  Throughput actually *peaks in the middle* (902–1603) because at short m the per-token setup cost dominates and at very long m the absolute O(M²) work starts to compete with matmul.
+
+### Added
+
+- **`attention_flash_batch`** — Q-tiled batched flash-attention kernel. Algorithm: for each head (parallel via rayon), tile queries into Q_TILE=16 chunks; for each chunk, stream K/V in `FLASH_ATTN_BLOCK_SIZE=64` blocks, compute Q_TILE × block_len scores, apply causal mask per-query, update per-query online softmax state, accumulate P·V. Emitted for Q8_0 models where `use_flash_attention` is true (max_seq_len > 512 and no sliding window).
+- **Scope**: K/V each loaded once per (head, Q_TILE), so bandwidth drops by ~Q_TILE (16×) relative to per-token attention. Per-query online softmax state is stack-allocated (16 × HEAD_DIM × f32 ≤ 16 KB) — no heap allocations inside the kernel.
+
+### Changed
+
+- **`forward_prefill_batched`** now calls `attention_flash_batch` once per layer instead of looping `attention_flash` per-token. Per-token RoPE + K/V cache writes still happen first in the existing loop so the full sequence's K/V is available by the time batched attention runs.
+- SWA / short-context models (where `use_flash_attention` returns false) keep the per-token `attention` fallback inside `forward_prefill_batched`.
+
+### Correctness
+
+- Per-token and batched paths produce byte-identical output on tested prompts (7–2502 tokens, Llama-3.2-1B Q8_0).
+- 62/62 CPU codegen tests pass.
+
 ## [0.8.0] — 2026-04-22 — CPU batched prefill (closes #211)
 
 Major CPU backend win: prompt prefill is now batched over all M input tokens with weight-outer, token-inner matmul kernels, amortizing weight-bandwidth across the batch instead of re-reading the full weight matrix per token.  For Q8_0 models at prompts ≥ 8 tokens the generated `forward_prefill` now dispatches to a new batched path.

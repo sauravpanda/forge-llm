@@ -41,6 +41,9 @@ pub fn generate(graph: &Graph) -> Result<String, CodegenError> {
     emit_prefill_function(&mut code, config)?;
     if config.dtype == DType::Q8_0 {
         emit_prefill_batched_function(&mut code, config)?;
+        if use_flash_attention(config) {
+            emit_flash_attention_batched_function(&mut code)?;
+        }
     }
 
     Ok(code)
@@ -656,6 +659,174 @@ pub fn attention_flash(output: &mut [f32], q: &[f32], k_cache: &[i8], v_cache: &
         let inv_l = 1.0 / l_i;
         for d in 0..head_dim { output[qo+d] = acc[d] * inv_l; }
     }
+}
+
+"#,
+    );
+    Ok(())
+}
+
+/// Emit `attention_flash_batch` — Q-tiled flash attention that amortizes
+/// K/V scans across Q_TILE query rows.  Used by `forward_prefill_batched`
+/// to replace the per-token `attention_flash` call loop.
+///
+/// Algorithm per (head, Q_TILE):
+///   - Stream K/V in blocks of FLASH_ATTN_BLOCK_SIZE.
+///   - For each block, compute (Q_TILE × block_len) scores, apply causal
+///     mask per-query, update per-query online softmax state, accumulate
+///     P·V into per-query output accumulators.
+///
+/// Bandwidth win: each K/V position is loaded once per Q_TILE queries
+/// instead of once per query → factor ~Q_TILE (16) reduction in K/V
+/// re-read bandwidth vs per-token attention_flash.
+///
+/// Parallelism: heads are independent, parallelized via rayon with
+/// disjoint output writes (per-head output offsets don't overlap).
+fn emit_flash_attention_batched_function(code: &mut String) -> Result<(), CodegenError> {
+    code.push_str(
+        r#"
+/// Batched flash attention for prefill: Q-tiled online softmax over M queries.
+///
+/// Q_TILE is fixed at 16 — the sweet spot where per-Q-tile state (scores +
+/// accumulators) fits comfortably in L1 alongside the K/V block.  For
+/// HEAD_DIM=64 the per-tile state is ~4 KB scores + ~4 KB acc + ~4 KB K/V
+/// block = ~12 KB, well within M5 Pro's 128 KB L1.
+///
+/// Causal mask: query row `q_tile_start + qi` (global position
+/// `base_pos + q_tile_start + qi`) attends to K/V positions up to and
+/// including that global position.
+///
+/// Output layout: `[m * num_heads * head_dim]` row-major, matching the
+/// concatenated per-token `attention_flash` outputs.
+#[inline]
+pub fn attention_flash_batch(
+    output: &mut [f32], q_batch: &[f32],
+    k_cache: &[i8], v_cache: &[i8],
+    k_scales: &[f32], v_scales: &[f32],
+    m: usize, base_pos: usize,
+    num_heads: usize, num_kv_heads: usize, head_dim: usize,
+) {
+    const Q_TILE: usize = 16;
+    let gsize = num_heads / num_kv_heads;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let kv_stride = num_kv_heads * head_dim;
+
+    // Parallel over heads: each head's work is independent, and per-head
+    // output writes to disjoint [r * num_heads * head_dim + h * head_dim ..
+    // .. + head_dim] slices.  Use a `usize` round-trip for the raw output
+    // pointer to dodge the Send/Sync dance on *mut f32.
+    let out_addr = output.as_mut_ptr() as usize;
+    let out_stride = num_heads * head_dim;
+
+    (0..num_heads).into_par_iter().for_each(|h| {
+        let kv_h = h / gsize;
+        let qo = h * head_dim;
+
+        // Process queries in tiles of Q_TILE.
+        let mut q_tile_start = 0usize;
+        while q_tile_start < m {
+            let q_tile_len = Q_TILE.min(m - q_tile_start);
+            let max_q_pos = base_pos + q_tile_start + q_tile_len - 1;
+
+            // Per-query online softmax state for this tile.  All stack-
+            // allocated: 16 queries × HEAD_DIM × 4 bytes = ≤ 16 KB.
+            let mut m_state = [f32::NEG_INFINITY; Q_TILE];
+            let mut l_state = [0.0f32; Q_TILE];
+            let mut acc = [[0.0f32; HEAD_DIM]; Q_TILE];
+
+            // Stream K/V blocks.  Only need blocks that overlap [0, max_q_pos].
+            let mut block_start = 0usize;
+            while block_start <= max_q_pos {
+                let block_end = (block_start + FLASH_ATTN_BLOCK_SIZE).min(max_q_pos + 1);
+                let block_len = block_end - block_start;
+
+                // Score buffer: [Q_TILE][FLASH_ATTN_BLOCK_SIZE]
+                let mut scores = [[0.0f32; FLASH_ATTN_BLOCK_SIZE]; Q_TILE];
+
+                // Phase 1: compute Q_TILE × block_len scores.
+                // Outer bi: load K[t] once, dot with q_tile_len Q rows.
+                for bi in 0..block_len {
+                    let t = block_start + bi;
+                    let ko = t * kv_stride + kv_h * head_dim;
+                    let k_row = &k_cache[ko..ko + head_dim];
+                    let k_scale = k_scales[t];
+                    for qi in 0..q_tile_len {
+                        let r = q_tile_start + qi;
+                        let q_row = &q_batch[r * out_stride + qo..r * out_stride + qo + head_dim];
+                        scores[qi][bi] = dot_f32_i8(q_row, k_row, head_dim, k_scale) * scale;
+                    }
+                }
+
+                // Phase 2: causal mask + per-query online softmax update.
+                for qi in 0..q_tile_len {
+                    let q_pos = base_pos + q_tile_start + qi;
+                    // Valid K positions for this query in this block:
+                    // [block_start, min(block_end, q_pos + 1))
+                    let valid_end = (q_pos + 1).saturating_sub(block_start).min(block_len);
+                    if valid_end == 0 {
+                        // Entire block is beyond this query's causal window.
+                        for bi in 0..block_len { scores[qi][bi] = 0.0; }
+                        continue;
+                    }
+
+                    let mut m_block = f32::NEG_INFINITY;
+                    for bi in 0..valid_end {
+                        if scores[qi][bi] > m_block { m_block = scores[qi][bi]; }
+                    }
+                    let m_prev = m_state[qi];
+                    let m_new = m_prev.max(m_block);
+                    m_state[qi] = m_new;
+                    let exp_scale = (m_prev - m_new).exp();
+                    l_state[qi] *= exp_scale;
+                    for d in 0..head_dim { acc[qi][d] *= exp_scale; }
+
+                    let mut l_block = 0.0f32;
+                    for bi in 0..valid_end {
+                        let e = (scores[qi][bi] - m_new).exp();
+                        scores[qi][bi] = e;
+                        l_block += e;
+                    }
+                    // Zero out causally-masked positions so phase 3 doesn't add them.
+                    for bi in valid_end..block_len {
+                        scores[qi][bi] = 0.0;
+                    }
+                    l_state[qi] += l_block;
+                }
+
+                // Phase 3: accumulate P·V.  Outer d, inner (bi, qi) gives
+                // good reuse of the V-element load across the Q_TILE queries.
+                for bi in 0..block_len {
+                    let t = block_start + bi;
+                    let vo = t * kv_stride + kv_h * head_dim;
+                    let v_scale = v_scales[t];
+                    for d in 0..head_dim {
+                        let v_val = v_cache[vo + d] as f32 * v_scale;
+                        for qi in 0..q_tile_len {
+                            acc[qi][d] += scores[qi][bi] * v_val;
+                        }
+                    }
+                }
+
+                block_start = block_end;
+            }
+
+            // Phase 4: normalize and write outputs for this Q tile.
+            // Different (h, qi) pairs write to disjoint output slices, so
+            // the unsafe raw-pointer write is sound across workers.
+            for qi in 0..q_tile_len {
+                let r = q_tile_start + qi;
+                let inv_l = 1.0 / l_state[qi];
+                unsafe {
+                    let p = (out_addr as *mut f32).add(r * out_stride + qo);
+                    for d in 0..head_dim {
+                        *p.add(d) = acc[qi][d] * inv_l;
+                    }
+                }
+            }
+
+            q_tile_start += q_tile_len;
+        }
+    });
 }
 
 "#,
@@ -3868,10 +4039,12 @@ fn emit_prefill_batched_function(
     )?;
     writeln!(code)?;
 
-    // Per-token post-QKV: bias, RoPE, KV cache write, attention.
+    // Per-token: bias (optional), RoPE, KV cache write.  Attention is
+    // batched after this loop so each K/V position is loaded once per
+    // Q_TILE queries instead of once per query.
     writeln!(
         code,
-        "        // Per-token: optional QKV bias, RoPE, KV cache write, attention"
+        "        // Per-token: optional QKV bias, RoPE, KV cache write (attention is batched below)"
     )?;
     writeln!(code, "        let mut k_q = [0i8; {kv_size}];")?;
     writeln!(code, "        let mut v_q = [0i8; {kv_size}];")?;
@@ -3928,30 +4101,64 @@ fn emit_prefill_batched_function(
         code,
         "            cache.v[layer_idx][pos*{kv_size}..(pos+1)*{kv_size}].copy_from_slice(&v_q);"
     )?;
-    // Attention.
-    if use_flash_attention(config) {
-        writeln!(code, "            attention_flash(")?;
-    } else {
-        writeln!(code, "            attention(")?;
-    }
-    writeln!(
-        code,
-        "                &mut attn_out_batch[r*{qk_size}..(r+1)*{qk_size}], q_row,"
-    )?;
-    writeln!(
-        code,
-        "                &cache.k[layer_idx][..(pos+1)*{kv_size}], &cache.v[layer_idx][..(pos+1)*{kv_size}],"
-    )?;
-    writeln!(
-        code,
-        "                &cache.k_scales[layer_idx][..pos+1], &cache.v_scales[layer_idx][..pos+1],"
-    )?;
-    writeln!(
-        code,
-        "                pos + 1, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM,"
-    )?;
-    writeln!(code, "            );")?;
     writeln!(code, "        }}")?;
+    writeln!(code)?;
+
+    // Batched attention over all M queries.  Uses attention_flash_batch
+    // for flash-attention-eligible models; falls back to a per-token
+    // `attention` loop otherwise (SWA / very short contexts).
+    if use_flash_attention(config) {
+        writeln!(
+            code,
+            "        // Batched flash attention: K/V amortized across Q_TILE queries per block"
+        )?;
+        writeln!(code, "        let total_seq = base_pos + m;")?;
+        writeln!(code, "        attention_flash_batch(")?;
+        writeln!(code, "            &mut attn_out_batch, &q_batch,")?;
+        writeln!(
+            code,
+            "            &cache.k[layer_idx][..total_seq*{kv_size}], &cache.v[layer_idx][..total_seq*{kv_size}],"
+        )?;
+        writeln!(
+            code,
+            "            &cache.k_scales[layer_idx][..total_seq], &cache.v_scales[layer_idx][..total_seq],"
+        )?;
+        writeln!(
+            code,
+            "            m, base_pos, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM,"
+        )?;
+        writeln!(code, "        );")?;
+    } else {
+        writeln!(
+            code,
+            "        // Fallback: per-token attention (SWA / short-context models)"
+        )?;
+        writeln!(code, "        for r in 0..m {{")?;
+        writeln!(code, "            let pos = base_pos + r;")?;
+        writeln!(
+            code,
+            "            let q_row = &q_batch[r*{qk_size}..(r+1)*{qk_size}];"
+        )?;
+        writeln!(code, "            attention(")?;
+        writeln!(
+            code,
+            "                &mut attn_out_batch[r*{qk_size}..(r+1)*{qk_size}], q_row,"
+        )?;
+        writeln!(
+            code,
+            "                &cache.k[layer_idx][..(pos+1)*{kv_size}], &cache.v[layer_idx][..(pos+1)*{kv_size}],"
+        )?;
+        writeln!(
+            code,
+            "                &cache.k_scales[layer_idx][..pos+1], &cache.v_scales[layer_idx][..pos+1],"
+        )?;
+        writeln!(
+            code,
+            "                pos + 1, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM,"
+        )?;
+        writeln!(code, "            );")?;
+        writeln!(code, "        }}")?;
+    }
     writeln!(code)?;
 
     // Batched O matmul.
