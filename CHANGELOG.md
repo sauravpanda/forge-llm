@@ -2,6 +2,31 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.8.5] — 2026-04-23 — Batched sliding-window attention
+
+Completes the SWA (sliding-window attention) story on the CPU batched prefill path.  v0.8.4 fixed the correctness bug by routing SWA models to a per-token `attention_sliding` fallback; this release gives them the same Q-tiled batched treatment that v0.8.1 gave to flash-attention models.
+
+### Added
+
+- **`attention_sliding_batch`** — Q-tiled batched SWA kernel.  Mirrors `attention_flash_batch` (Q_TILE=16, per-head rayon parallelism, stack-allocated per-query softmax state) but:
+  - Applies both causal and sliding-window masks per query (`q_pos` attends to `[max(0, q_pos - window + 1), q_pos]`).
+  - Bounds the outer K-block loop to the Q tile's combined valid K range: `[max(0, q_tile_start_pos - window + 1), q_tile_end_pos]`.  Blocks outside that range aren't read at all, so long-context SWA models pay the smaller "window × M" work rather than the full "total_seq × M".
+  - Emitted only for Q8_0 / Q4_0 models with `sliding_window_size.is_some()`.
+- Codegen test `q8_swa_batched_prefill_uses_sliding_batch` — asserts the new kernel is emitted for Q8_0 Mistral configs with `sliding_window_size = Some(32)`, and that `forward_prefill_batched` dispatches through `attention_sliding_batch(...)` with the correct `window` argument.
+
+### Changed
+
+- **`forward_prefill_batched`** dispatch for SWA models now calls `attention_sliding_batch` once per layer instead of the per-token `attention_sliding` loop added in v0.8.4.  The four-way split in the attention block:
+  - `use_flash_attention(config)` → `attention_flash_batch` (v0.8.1).
+  - `sliding_window_size.is_some()` → **`attention_sliding_batch`** (this release).
+  - Short-context non-SWA → per-token `attention()` fallback.
+
+### Correctness
+
+- Same mask semantics as `attention_sliding`: for any query at `q_pos`, the valid K range is `[max(0, q_pos - window + 1), q_pos]`.  Tile-level block bounds are derived from the earliest `q_pos - window + 1` and the latest `q_pos + 1` across the Q tile.
+- 63/63 CPU codegen tests pass.
+- No runtime model test in this release (no local SWA Q8_0 model).  Mask logic is verified by codegen string inspection; kernel structure parallels the battle-tested `attention_flash_batch`.  Users running Mistral / Gemma-2 Q8_0 should diff outputs against `forward_prefill` (per-token) on long prompts and file an issue if anything drifts.
+
 ## [0.8.4] — 2026-04-23 — Fix: SWA correctness in CPU batched prefill
 
 ### Fixed

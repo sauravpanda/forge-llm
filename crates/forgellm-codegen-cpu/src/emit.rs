@@ -45,6 +45,9 @@ pub fn generate(graph: &Graph) -> Result<String, CodegenError> {
         if use_flash_attention(config) {
             emit_flash_attention_batched_function(&mut code)?;
         }
+        if config.sliding_window_size.is_some() {
+            emit_sliding_attention_batched_function(&mut code)?;
+        }
     }
 
     Ok(code)
@@ -817,6 +820,169 @@ pub fn attention_flash_batch(
             for qi in 0..q_tile_len {
                 let r = q_tile_start + qi;
                 let inv_l = 1.0 / l_state[qi];
+                unsafe {
+                    let p = (out_addr as *mut f32).add(r * out_stride + qo);
+                    for d in 0..head_dim {
+                        *p.add(d) = acc[qi][d] * inv_l;
+                    }
+                }
+            }
+
+            q_tile_start += q_tile_len;
+        }
+    });
+}
+
+"#,
+    );
+    Ok(())
+}
+
+/// Emit `attention_sliding_batch` — batched SWA attention.  Mirrors
+/// `attention_flash_batch` but applies both the causal mask AND a
+/// sliding-window mask: query at global position `q_pos` attends only
+/// to K/V positions `[max(0, q_pos - window + 1), q_pos]`.
+///
+/// Bandwidth compared to the per-token `attention_sliding` fallback in
+/// `forward_prefill_batched`: K/V loaded once per `(head, Q_TILE)` pair
+/// instead of once per query → ~Q_TILE (16) reduction.
+///
+/// The outer K-block loop is bounded: for a Q tile `[q_tile_start,
+/// q_tile_end)`, the earliest K position any query in the tile might
+/// need is `max(0, q_tile_start - window + 1)` (from the earliest query
+/// in the tile) and the latest is `q_tile_end - 1` (from the latest
+/// query).  Blocks outside that range are skipped entirely.
+fn emit_sliding_attention_batched_function(code: &mut String) -> Result<(), CodegenError> {
+    code.push_str(
+        r#"
+/// Batched sliding-window attention for prefill: Q-tiled online softmax.
+///
+/// Per-query valid K range: `[max(0, q_pos - window + 1), q_pos]`
+/// where `q_pos = base_pos + q_tile_start + qi`.  Mask logic runs per
+/// query inside phase 2 (causal_end + window_start checks).
+///
+/// Output layout: `[m * num_heads * head_dim]` row-major, matching the
+/// concatenated per-token `attention_sliding` outputs.
+#[inline]
+pub fn attention_sliding_batch(
+    output: &mut [f32], q_batch: &[f32],
+    k_cache: &[i8], v_cache: &[i8],
+    k_scales: &[f32], v_scales: &[f32],
+    m: usize, base_pos: usize, window: usize,
+    num_heads: usize, num_kv_heads: usize, head_dim: usize,
+) {
+    const Q_TILE: usize = 16;
+    let gsize = num_heads / num_kv_heads;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let kv_stride = num_kv_heads * head_dim;
+
+    let out_addr = output.as_mut_ptr() as usize;
+    let out_stride = num_heads * head_dim;
+
+    (0..num_heads).into_par_iter().for_each(|h| {
+        let kv_h = h / gsize;
+        let qo = h * head_dim;
+
+        let mut q_tile_start = 0usize;
+        while q_tile_start < m {
+            let q_tile_len = Q_TILE.min(m - q_tile_start);
+            // Earliest query in tile attends from max(0, q_tile_start_pos - window + 1);
+            // latest query attends up to (inclusive) q_tile_end_pos.
+            let q_tile_start_pos = base_pos + q_tile_start;
+            let q_tile_end_pos = base_pos + q_tile_start + q_tile_len - 1;
+            let tile_min_k = q_tile_start_pos.saturating_sub(window - 1);
+            let tile_max_k = q_tile_end_pos; // inclusive
+
+            let mut m_state = [f32::NEG_INFINITY; Q_TILE];
+            let mut l_state = [0.0f32; Q_TILE];
+            let mut acc = [[0.0f32; HEAD_DIM]; Q_TILE];
+
+            // Bound the outer block loop to [tile_min_k, tile_max_k + 1).
+            let mut block_start = (tile_min_k / FLASH_ATTN_BLOCK_SIZE) * FLASH_ATTN_BLOCK_SIZE;
+            while block_start <= tile_max_k {
+                let block_end = (block_start + FLASH_ATTN_BLOCK_SIZE).min(tile_max_k + 1);
+                let block_len = block_end - block_start;
+
+                let mut scores = [[0.0f32; FLASH_ATTN_BLOCK_SIZE]; Q_TILE];
+
+                // Phase 1: Q × K^T.  Load K[t] once, dot with all queries.
+                // We compute raw scores for every bi; masking happens in phase 2.
+                for bi in 0..block_len {
+                    let t = block_start + bi;
+                    let ko = t * kv_stride + kv_h * head_dim;
+                    let k_row = &k_cache[ko..ko + head_dim];
+                    let k_scale = k_scales[t];
+                    for qi in 0..q_tile_len {
+                        let r = q_tile_start + qi;
+                        let q_row = &q_batch[r * out_stride + qo..r * out_stride + qo + head_dim];
+                        scores[qi][bi] = dot_f32_i8(q_row, k_row, head_dim, k_scale) * scale;
+                    }
+                }
+
+                // Phase 2: causal + window mask + per-query online softmax update.
+                for qi in 0..q_tile_len {
+                    let q_pos = base_pos + q_tile_start + qi;
+                    // Valid K positions for this query in this block:
+                    //   [max(block_start, q_pos - window + 1), min(block_end, q_pos + 1))
+                    let win_start = q_pos.saturating_sub(window - 1);
+                    let valid_lo = win_start.max(block_start).saturating_sub(block_start);
+                    let valid_hi = (q_pos + 1).saturating_sub(block_start).min(block_len);
+                    if valid_lo >= valid_hi {
+                        // No valid K positions in this block for this query.
+                        for bi in 0..block_len { scores[qi][bi] = 0.0; }
+                        continue;
+                    }
+
+                    // Zero out (pre-softmax) the masked positions.
+                    for bi in 0..valid_lo { scores[qi][bi] = f32::NEG_INFINITY; }
+                    for bi in valid_hi..block_len { scores[qi][bi] = f32::NEG_INFINITY; }
+
+                    let mut m_block = f32::NEG_INFINITY;
+                    for bi in valid_lo..valid_hi {
+                        if scores[qi][bi] > m_block { m_block = scores[qi][bi]; }
+                    }
+                    let m_prev = m_state[qi];
+                    let m_new = m_prev.max(m_block);
+                    m_state[qi] = m_new;
+                    let exp_scale = (m_prev - m_new).exp();
+                    l_state[qi] *= exp_scale;
+                    for d in 0..head_dim { acc[qi][d] *= exp_scale; }
+
+                    let mut l_block = 0.0f32;
+                    for bi in valid_lo..valid_hi {
+                        let e = (scores[qi][bi] - m_new).exp();
+                        scores[qi][bi] = e;
+                        l_block += e;
+                    }
+                    // Zero out masked scores (for phase 3 P·V accumulate).
+                    for bi in 0..valid_lo { scores[qi][bi] = 0.0; }
+                    for bi in valid_hi..block_len { scores[qi][bi] = 0.0; }
+                    l_state[qi] += l_block;
+                }
+
+                // Phase 3: P · V.
+                for bi in 0..block_len {
+                    let t = block_start + bi;
+                    let vo = t * kv_stride + kv_h * head_dim;
+                    let v_scale = v_scales[t];
+                    for d in 0..head_dim {
+                        let v_val = v_cache[vo + d] as f32 * v_scale;
+                        for qi in 0..q_tile_len {
+                            acc[qi][d] += scores[qi][bi] * v_val;
+                        }
+                    }
+                }
+
+                block_start = block_end;
+            }
+
+            // Phase 4: normalize and write outputs for this Q tile.
+            for qi in 0..q_tile_len {
+                let r = q_tile_start + qi;
+                // l_state[qi] is 0 only if the query had no valid K positions
+                // at all — shouldn't happen in practice (every query sees itself),
+                // but guard to avoid divide-by-zero producing NaN outputs.
+                let inv_l = if l_state[qi] > 0.0 { 1.0 / l_state[qi] } else { 0.0 };
                 unsafe {
                     let p = (out_addr as *mut f32).add(r * out_stride + qo);
                     for d in 0..head_dim {
@@ -4308,39 +4474,32 @@ fn emit_prefill_batched_function(
         )?;
         writeln!(code, "        );")?;
     } else if let Some(window) = config.sliding_window_size {
-        // SWA models (Mistral, Gemma-2, ...): use `attention_sliding` which
-        // limits each query's window to the last `window` K/V positions.
-        // Using plain `attention` here would be a correctness bug — the
-        // softmax would attend to the whole KV cache instead of the window.
+        // SWA models (Mistral, Gemma-2, ...): batched sliding-window attention.
+        // `attention_sliding_batch` applies both causal and window masks and
+        // bounds the outer K-block loop to the tile's combined valid K range.
+        // Each K/V position is loaded once per (head, Q_TILE) pair instead of
+        // once per query — ~Q_TILE bandwidth reduction vs the per-token
+        // `attention_sliding` fallback that would otherwise run here.
         writeln!(
             code,
-            "        // Fallback: per-token sliding-window attention (SWA models)"
+            "        // Batched sliding-window attention (SWA model)"
         )?;
-        writeln!(code, "        for r in 0..m {{")?;
-        writeln!(code, "            let pos = base_pos + r;")?;
+        writeln!(code, "        let total_seq = base_pos + m;")?;
+        writeln!(code, "        attention_sliding_batch(")?;
+        writeln!(code, "            &mut attn_out_batch, &q_batch,")?;
         writeln!(
             code,
-            "            let q_row = &q_batch[r*{qk_size}..(r+1)*{qk_size}];"
-        )?;
-        writeln!(code, "            attention_sliding(")?;
-        writeln!(
-            code,
-            "                &mut attn_out_batch[r*{qk_size}..(r+1)*{qk_size}], q_row,"
+            "            &cache.k[layer_idx][..total_seq*{kv_size}], &cache.v[layer_idx][..total_seq*{kv_size}],"
         )?;
         writeln!(
             code,
-            "                &cache.k[layer_idx][..(pos+1)*{kv_size}], &cache.v[layer_idx][..(pos+1)*{kv_size}],"
+            "            &cache.k_scales[layer_idx][..total_seq], &cache.v_scales[layer_idx][..total_seq],"
         )?;
         writeln!(
             code,
-            "                &cache.k_scales[layer_idx][..pos+1], &cache.v_scales[layer_idx][..pos+1],"
+            "            m, base_pos, {window}, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM,"
         )?;
-        writeln!(
-            code,
-            "                pos + 1, {window}, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM,"
-        )?;
-        writeln!(code, "            );")?;
-        writeln!(code, "        }}")?;
+        writeln!(code, "        );")?;
     } else {
         // Short-context non-SWA models (max_seq_len <= 512): plain attention.
         writeln!(
@@ -5207,11 +5366,11 @@ mod tests {
     }
 
     #[test]
-    fn q8_swa_batched_prefill_uses_attention_sliding() {
-        // Q8_0 + SWA model: the batched prefill path must fall back to
-        // `attention_sliding` (respecting the window), not plain
-        // `attention` which would attend to the full KV cache.
-        // Regression guard — this was wrong in v0.8.0-v0.8.3.
+    fn q8_swa_batched_prefill_uses_sliding_batch() {
+        // Q8_0 + SWA model: the batched prefill path must call
+        // attention_sliding_batch (v0.8.5) — not plain attention()
+        // (v0.8.0-v0.8.3 correctness bug) and not the per-token
+        // attention_sliding() fallback (v0.8.4 stop-gap).
         let config = ModelConfig {
             architecture: Architecture::Mistral,
             hidden_size: 64,
@@ -5232,26 +5391,33 @@ mod tests {
         let graph = graph_builder::build_graph(&config).unwrap();
         let code = generate(&graph).unwrap();
 
+        // attention_sliding_batch kernel must be emitted.
+        assert!(
+            code.contains("pub fn attention_sliding_batch("),
+            "SWA Q8_0 models must emit attention_sliding_batch kernel"
+        );
+
         // forward_prefill_batched must be emitted (Q8_0 path).
         let batched_start = code
             .find("pub fn forward_prefill_batched(")
             .expect("forward_prefill_batched must be emitted for Q8_0");
-        // Take everything after the batched function start through end-of-file —
-        // the next top-level `pub fn` or end marks the function end; we just
-        // need to verify the fallback attention call inside it.
         let batched_body = &code[batched_start..];
+
+        // Must call the batched sliding kernel, not the per-token fallback.
         assert!(
-            batched_body.contains("attention_sliding("),
-            "forward_prefill_batched must call attention_sliding for SWA models"
+            batched_body.contains("attention_sliding_batch("),
+            "forward_prefill_batched must call attention_sliding_batch for SWA models"
         );
-        // And must NOT call plain `attention(` as the fallback.
-        // (It's OK if plain `attention` is referenced elsewhere — e.g. inside
-        // a comment or in other unrelated blocks — but the per-token fallback
-        // loop in batched prefill must not use it on an SWA model.)
+        // Must NOT take the non-SWA fallback branch.
         let fallback_marker = "// Fallback: per-token standard attention (short-context, non-SWA)";
         assert!(
             !batched_body.contains(fallback_marker),
             "SWA model must not take the non-SWA fallback branch"
+        );
+        // The window size must be passed through to the kernel call.
+        assert!(
+            batched_body.contains("m, base_pos, 32,"),
+            "window size must be passed as the third runtime arg"
         );
     }
 
