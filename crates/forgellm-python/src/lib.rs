@@ -127,6 +127,7 @@ fn config_from_gguf(path: &str) -> anyhow::Result<ModelConfig> {
         dtype: DType::F16,
         sliding_window_size,
         qkv_bias,
+        hidden_activation: HiddenActivation::SiLU,
     })
 }
 

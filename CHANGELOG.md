@@ -2,6 +2,24 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.8.8] — 2026-04-23 — Docs: v0.8.5 SWA kernel validated on Phi-3
+
+### Changed
+
+- **`attention_sliding_batch` is no longer "unvalidated"**.  v0.8.5 shipped without a live SWA model test because no local Q8_0 SWA model was available at release time.  Validated on **Phi-3.1-mini-4k-instruct Q8_0** (`phi3.attention.sliding_window: 2047`):
+
+  | Prompt | Per-token `attention_sliding` | **`attention_sliding_batch`** | Speedup |
+  |-------:|------------------------------:|------------------------------:|--------:|
+  |   442  |                          13.7 |                      **96.7** | **7.1×** |
+  |  1099  |                           9.6 |                      **78.4** | **8.2×** |
+  |  1950  |                           5.8 |                      **67.4** | **11.6×** |
+
+  Both paths produce coherent output; batched path ramps in the same shape as the flash-attention batched path from v0.8.1 (peak in the middle, sustained at long contexts).  `FORGE_BATCHED_PREFILL=0` continues to be the A/B toggle.
+
+### Not changed
+
+- No kernel, codegen, or runtime change.  This release updates the v0.8.5 entry's correctness caveat and nothing else.
+
 ## [0.8.7] — 2026-04-23 — UX: `forge bench` clarifies interpreter vs AOT
 
 ### Fixed
@@ -62,7 +80,7 @@ Completes the SWA (sliding-window attention) story on the CPU batched prefill pa
 
 - Same mask semantics as `attention_sliding`: for any query at `q_pos`, the valid K range is `[max(0, q_pos - window + 1), q_pos]`.  Tile-level block bounds are derived from the earliest `q_pos - window + 1` and the latest `q_pos + 1` across the Q tile.
 - 63/63 CPU codegen tests pass.
-- No runtime model test in this release (no local SWA Q8_0 model).  Mask logic is verified by codegen string inspection; kernel structure parallels the battle-tested `attention_flash_batch`.  Users running Mistral / Gemma-2 Q8_0 should diff outputs against `forward_prefill` (per-token) on long prompts and file an issue if anything drifts.
+- Validated in v0.8.8 on Phi-3.1-mini-4k-instruct Q8_0 (sliding_window=2047): 7.1–11.6× speedup over per-token `attention_sliding`, both paths produce coherent output.  See the v0.8.8 entry for numbers.
 
 ## [0.8.4] — 2026-04-23 — Fix: SWA correctness in CPU batched prefill
 
