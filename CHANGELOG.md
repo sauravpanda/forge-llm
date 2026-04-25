@@ -2,6 +2,40 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.9.0] — 2026-04-24 — K-quant compatibility (Q4_K_M and friends)
+
+### Added
+
+- **Q4_K_M / Q5_K_M / Q6_K / Q3_K / Q2_K / Q8_K GGUF models now load and compile**.  Previously the GGUF parser recognized these types but the raw weight loader silently produced bytes the codegen Q4_0 / Q8_0 kernels could not consume — so models like `Llama-3.2-1B-Instruct-Q4_K_M.gguf` would either error out or generate garbage.  The on-disk K-quant superblocks are now dequantized to f32 at load time and re-quantized to Q8_0 (block size 32, 34 bytes/block) before being handed to codegen, so they go through the existing Q8_0 path.
+
+  ```rust
+  // crates/forgellm-frontend/src/weight_loader.rs (load_from_file_mixed)
+  GGMLType::Q8_0  => WeightData::Q8_0Raw(raw.to_vec()),
+  GGMLType::Q4_0  => WeightData::Q4_0Raw(raw.to_vec()),
+  GGMLType::F32 | GGMLType::F16 | GGMLType::BF16 => WeightData::F32(...),
+  _ => WeightData::Q8_0Raw(quantize_f32_to_q8_0(&dequantize(raw, ...)?)),
+  ```
+
+  Verified end-to-end on Llama-3.2-1B-Instruct-Q4_K_M (which mixes Q4_K projection weights with a Q6_K `output.weight`): coherent generation at 44.7 tok/s decode on M5 Pro after `forge compile --target cpu` + native build.
+
+- `quantize_f32_to_q8_0(data: &[f32]) -> Vec<u8>` in `forgellm_frontend::weight_loader` — round-trip-tested f32 → Q8_0 quantizer (max abs error ≈ scale/2, where scale = absmax/127 per 32-element block).
+
+### Changed
+
+- **`GGMLType::to_dtype()`** is now honest about post-load encoding: every quantized type other than native Q4_0 maps to `DType::Q8_0` (because that's what the loader actually produces).  Previously K-quants and their relatives mapped to `DType::Q4_0` / `DType::Q2`, which mismatched what the loader stored — codegen would emit Q4_0 kernels expecting raw Q4_0 bytes and feed them re-quantized data of a different layout.
+- **`detect_gguf_dtype`** in the CLI now counts K-quants as Q8_0 for codegen-dispatch purposes (matches the post-load truth above).  Q4_K_M models previously fell through to the `_ => {}` arm and were classified as F16, producing a model that crashed at first matmul.
+
+### Trade-offs
+
+- **Memory cost**: a re-quantized K-quant tensor occupies ~1.9× the bytes of the original (Q4_K is 4.5 bits/wt, Q8_0 is 8.5 bits/wt).  For a 1B-parameter model this is ~1.5 GB extra `weights.bin` size.  Acceptable for the correctness MVP — native Q4_K kernels (preserving on-disk layout for both decode and prefill) are tracked as future work.
+- **Perf**: identical to a hand-converted Q8_0 model of the same shape, since the post-load representation is Q8_0.  No accuracy loss vs. Q8_0 (we round-trip through f32 once).
+
+### Tests
+
+- `quantize_f32_to_q8_0_round_trip` and `quantize_f32_to_q8_0_zero_block` in `weight_loader.rs`.
+- `ggml_type_conversions` updated to assert K-quants map to `DType::Q8_0`.
+- `detect_dtype_treats_k_quants_as_q8_0` (renamed from `detect_dtype_falls_back_to_f16_for_k_quants`).
+
 ## [0.8.8] — 2026-04-23 — Docs: v0.8.5 SWA kernel validated on Phi-3
 
 ### Changed

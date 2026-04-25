@@ -111,13 +111,22 @@ pub fn load_from_file_mixed(
         let raw = &mmap[start..end];
         let hf_name = gguf_name_to_hf(&tensor_info.name);
 
-        let weight_data = if tensor_info.ggml_type == crate::gguf::GGMLType::Q8_0 {
-            WeightData::Q8_0Raw(raw.to_vec())
-        } else if tensor_info.ggml_type == crate::gguf::GGMLType::Q4_0 {
-            WeightData::Q4_0Raw(raw.to_vec())
-        } else {
-            let f32_data = dequantize(raw, tensor_info.ggml_type, numel)?;
-            WeightData::F32(f32_data)
+        let weight_data = match tensor_info.ggml_type {
+            GGMLType::Q8_0 => WeightData::Q8_0Raw(raw.to_vec()),
+            GGMLType::Q4_0 => WeightData::Q4_0Raw(raw.to_vec()),
+            // Dense / non-quantized: dequant to f32 and store dense.
+            GGMLType::F32 | GGMLType::F16 | GGMLType::BF16 => {
+                let f32_data = dequantize(raw, tensor_info.ggml_type, numel)?;
+                WeightData::F32(f32_data)
+            }
+            // Quantized formats without native ForgeLLM kernels (K-quants and
+            // friends). Dequantize to f32, then re-quantize to Q8_0 so they go
+            // through the existing Q8_0 code path. Costs ~2× weight memory vs.
+            // the source format; native K-quant kernels are future work.
+            _ => {
+                let f32_data = dequantize(raw, tensor_info.ggml_type, numel)?;
+                WeightData::Q8_0Raw(quantize_f32_to_q8_0(&f32_data))
+            }
         };
 
         tensors.insert(hf_name, weight_data);
@@ -1224,6 +1233,50 @@ fn f32_to_f16(x: f32) -> u16 {
     ((sign << 15) | (h_exp << 10) | h_mant) as u16
 }
 
+/// Quantize an f32 slice to Q8_0 raw bytes.
+///
+/// Q8_0 block layout (32 elements → 34 bytes):
+/// - 2 bytes: f16 scale (absmax / 127)
+/// - 32 bytes: int8 quantized values
+///
+/// Used to repack K-quant tensors (Q4_K, Q5_K, Q6_K, ...) into the Q8_0
+/// format that ForgeLLM's CPU kernels consume natively. Trades ~2× weight
+/// memory vs. native K-quant for full kernel compatibility — native K-quant
+/// kernels are a separate (future) work item.
+pub fn quantize_f32_to_q8_0(data: &[f32]) -> Vec<u8> {
+    let num_blocks = data.len().div_ceil(32);
+    let mut out = vec![0u8; num_blocks * 34];
+
+    for blk in 0..num_blocks {
+        let base = blk * 32;
+        let end = (base + 32).min(data.len());
+        let block = &data[base..end];
+
+        let mut amax = 0.0f32;
+        for &v in block {
+            let a = v.abs();
+            if a > amax {
+                amax = a;
+            }
+        }
+        let scale = if amax == 0.0 { 0.0 } else { amax / 127.0 };
+        let inv_scale = if scale != 0.0 { 1.0 / scale } else { 0.0 };
+
+        let ob = blk * 34;
+        let scale_bits = f32_to_f16(scale);
+        out[ob] = scale_bits as u8;
+        out[ob + 1] = (scale_bits >> 8) as u8;
+
+        for (j, &v) in block.iter().enumerate() {
+            let q = (v * inv_scale).round().clamp(-127.0, 127.0) as i8;
+            out[ob + 2 + j] = q as u8;
+        }
+        // Tail elements (when data.len() is not a multiple of 32) are zero-filled.
+    }
+
+    out
+}
+
 /// Quantize an f32 slice to Q4_0 raw bytes.
 ///
 /// Q4_0 block layout (32 elements → 18 bytes):
@@ -1308,6 +1361,34 @@ mod tests {
         assert!(f16_to_f32(0x7E00).is_nan());
         // -0.0 = 0x8000
         assert_eq!(f16_to_f32(0x8000), -0.0);
+    }
+
+    #[test]
+    fn quantize_f32_to_q8_0_round_trip() {
+        // Smooth ramp across two blocks, including negatives and zeros.
+        let values: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) * 0.05).collect();
+        let q8_bytes = quantize_f32_to_q8_0(&values);
+        assert_eq!(q8_bytes.len(), 2 * 34);
+
+        let recovered = dequant_q8_0(&q8_bytes, values.len());
+        assert_eq!(recovered.len(), values.len());
+
+        // Per-block scale = absmax/127 → max abs error ≤ scale/2.
+        // Worst-case absmax in this ramp is ~1.55, so error bound ~0.013.
+        for (orig, got) in values.iter().zip(recovered.iter()) {
+            let err = (orig - got).abs();
+            assert!(err < 0.02, "round-trip error too large: {orig} → {got}");
+        }
+    }
+
+    #[test]
+    fn quantize_f32_to_q8_0_zero_block() {
+        let values = vec![0.0f32; 32];
+        let q8_bytes = quantize_f32_to_q8_0(&values);
+        let recovered = dequant_q8_0(&q8_bytes, values.len());
+        for v in recovered {
+            assert_eq!(v, 0.0);
+        }
     }
 
     #[test]

@@ -416,7 +416,28 @@ fn detect_gguf_dtype(gguf_file: &gguf::GGUFFile) -> forgellm_frontend::ir::DType
             GGMLType::Q4_0 => q4_count += 1,
             GGMLType::F16 | GGMLType::BF16 => f16_count += 1,
             GGMLType::F32 => f32_count += 1,
-            _ => {} // K-quants and others fall through to F16 fallback
+            // K-quants and other quantized formats are re-quantized to Q8_0 on load
+            // by weight_loader, so for codegen-dtype purposes count them as Q8_0.
+            GGMLType::Q4_1
+            | GGMLType::Q5_0
+            | GGMLType::Q5_1
+            | GGMLType::Q8_1
+            | GGMLType::Q2K
+            | GGMLType::Q3K
+            | GGMLType::Q4K
+            | GGMLType::Q5K
+            | GGMLType::Q6K
+            | GGMLType::Q8K
+            | GGMLType::IQ2XXS
+            | GGMLType::IQ2XS
+            | GGMLType::IQ2S
+            | GGMLType::IQ3XXS
+            | GGMLType::IQ3S
+            | GGMLType::IQ1S
+            | GGMLType::IQ1M
+            | GGMLType::IQ4NL
+            | GGMLType::IQ4XS => q8_count += 1,
+            _ => {}
         }
     }
 
@@ -2326,14 +2347,17 @@ mod tests {
     }
 
     #[test]
-    fn detect_dtype_falls_back_to_f16_for_k_quants() {
-        // K-quants are not yet handled by codegen — fall back to F16.
+    fn detect_dtype_treats_k_quants_as_q8_0() {
+        // K-quants are re-quantized to Q8_0 on load (weight_loader::load_tensor_raw),
+        // so detect_gguf_dtype reports Q8_0 — codegen emits the Q8_0 path that
+        // matches what the loader actually produces.
         let gguf = make_gguf_with_types(&[
             ("blk.0.attn_q.weight", GGMLType::Q4K),
             ("blk.0.attn_k.weight", GGMLType::Q4K),
             ("blk.0.attn_v.weight", GGMLType::Q4K),
+            ("output.weight", GGMLType::Q6K),
         ]);
-        assert_eq!(detect_gguf_dtype(&gguf), DType::F16);
+        assert_eq!(detect_gguf_dtype(&gguf), DType::Q8_0);
     }
 
     #[test]

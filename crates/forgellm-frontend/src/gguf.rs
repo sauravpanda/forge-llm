@@ -155,20 +155,39 @@ impl GGMLType {
     }
 
     /// Convert GGML type to our IR DType.
-    /// Some quantized types map to the closest supported format.
+    ///
+    /// Reflects the *post-load* dtype the rest of ForgeLLM sees, not the
+    /// on-disk encoding.  Q4_0/Q8_0 are kept as raw bytes by the weight
+    /// loader; everything else quantized goes through dequant → requant to
+    /// Q8_0 so the existing Q8_0 codegen path handles it.  Dense f-types
+    /// (F32/F16/BF16) stay dense.
     pub fn to_dtype(self) -> DType {
         match self {
             GGMLType::F32 => DType::F32,
             GGMLType::F16 => DType::F16,
             GGMLType::BF16 => DType::BF16,
-            GGMLType::Q4_0 | GGMLType::Q4_1 | GGMLType::Q4K | GGMLType::IQ4NL | GGMLType::IQ4XS => {
-                DType::Q4_0
-            }
-            GGMLType::Q8_0 | GGMLType::Q8_1 | GGMLType::Q8K => DType::Q8_0,
-            GGMLType::Q5_0 | GGMLType::Q5_1 | GGMLType::Q5K | GGMLType::Q6K => DType::Q8_0,
-            GGMLType::Q2K | GGMLType::IQ2XXS | GGMLType::IQ2XS | GGMLType::IQ2S => DType::Q2,
-            GGMLType::Q3K | GGMLType::IQ3XXS | GGMLType::IQ3S => DType::Q4_0,
-            GGMLType::IQ1S | GGMLType::IQ1M => DType::Q2,
+            GGMLType::Q4_0 => DType::Q4_0,
+            // Everything else quantized → Q8_0 post-load (re-quantized by weight_loader).
+            GGMLType::Q8_0
+            | GGMLType::Q8_1
+            | GGMLType::Q8K
+            | GGMLType::Q4_1
+            | GGMLType::Q4K
+            | GGMLType::IQ4NL
+            | GGMLType::IQ4XS
+            | GGMLType::Q5_0
+            | GGMLType::Q5_1
+            | GGMLType::Q5K
+            | GGMLType::Q6K
+            | GGMLType::Q2K
+            | GGMLType::Q3K
+            | GGMLType::IQ2XXS
+            | GGMLType::IQ2XS
+            | GGMLType::IQ2S
+            | GGMLType::IQ3XXS
+            | GGMLType::IQ3S
+            | GGMLType::IQ1S
+            | GGMLType::IQ1M => DType::Q8_0,
             GGMLType::I8 | GGMLType::I16 | GGMLType::I32 => DType::I32,
             GGMLType::I64 | GGMLType::F64 => DType::I64,
         }
@@ -674,7 +693,13 @@ mod tests {
         assert_eq!(GGMLType::BF16.to_dtype(), DType::BF16);
         assert_eq!(GGMLType::Q4_0.to_dtype(), DType::Q4_0);
         assert_eq!(GGMLType::Q8_0.to_dtype(), DType::Q8_0);
-        assert_eq!(GGMLType::Q2K.to_dtype(), DType::Q2);
+        // K-quants are re-quantized to Q8_0 on load (see weight_loader::load_tensor_raw),
+        // so they are reported as Q8_0 to the rest of the compiler.
+        assert_eq!(GGMLType::Q4K.to_dtype(), DType::Q8_0);
+        assert_eq!(GGMLType::Q5K.to_dtype(), DType::Q8_0);
+        assert_eq!(GGMLType::Q6K.to_dtype(), DType::Q8_0);
+        assert_eq!(GGMLType::Q3K.to_dtype(), DType::Q8_0);
+        assert_eq!(GGMLType::Q2K.to_dtype(), DType::Q8_0);
     }
 
     #[test]
