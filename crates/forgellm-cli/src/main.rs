@@ -2066,6 +2066,9 @@ fn cmd_export_weights_impl(
                 Some(WeightData::Q4_0Raw(b)) => {
                     data.extend_from_slice(b);
                 }
+                Some(WeightData::Q4_KRaw(b)) => {
+                    data.extend_from_slice(b);
+                }
                 None => {
                     // lm_head fallback: use embed_tokens (same as lm_head in tied-weight models)
                     if name == "lm_head.weight" {
@@ -2094,6 +2097,9 @@ fn cmd_export_weights_impl(
                                 data.extend_from_slice(b);
                             }
                             Some(WeightData::Q4_0Raw(b)) => {
+                                data.extend_from_slice(b);
+                            }
+                            Some(WeightData::Q4_KRaw(b)) => {
                                 data.extend_from_slice(b);
                             }
                             None => bail!("neither lm_head nor embed_tokens found"),
@@ -2125,6 +2131,9 @@ fn cmd_export_weights_impl(
                 }
                 Some(WeightData::Q4_0Raw(_)) => {
                     bail!("Q4_0 embed_tokens: dequantization not yet implemented for export");
+                }
+                Some(WeightData::Q4_KRaw(_)) => {
+                    bail!("Q4_K embed_tokens: dequantization not yet implemented for export");
                 }
                 None => bail!("embed_tokens weight not found: {name}"),
             }

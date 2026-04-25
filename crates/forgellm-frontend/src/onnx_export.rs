@@ -152,7 +152,7 @@ fn dtype_to_onnx(dtype: DType) -> i32 {
         DType::I64 => ONNX_INT64,
         // Quantized types — map to float32 (weights are dequantized on export)
         DType::F8E4M3 | DType::F8E5M2 => ONNX_FLOAT16,
-        DType::Q8_0 | DType::Q4_0 | DType::Q4_1 | DType::Q2 | DType::NF4 => ONNX_FLOAT,
+        DType::Q8_0 | DType::Q4_0 | DType::Q4_1 | DType::Q4_K | DType::Q2 | DType::NF4 => ONNX_FLOAT,
     }
 }
 

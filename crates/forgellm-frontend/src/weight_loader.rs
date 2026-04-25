@@ -18,6 +18,8 @@ pub enum WeightData {
     Q8_0Raw(Vec<u8>),
     /// Raw Q4_0 bytes: N_blocks * 18 bytes each block = [2 bytes f16 scale][16 bytes 4-bit pairs].
     Q4_0Raw(Vec<u8>),
+    /// Raw Q4_K bytes: N_blocks * 144 bytes each super-block of 256 elements.
+    Q4_KRaw(Vec<u8>),
 }
 
 /// Model weights with mixed storage: Q8_0 kept as raw bytes, others as f32.
@@ -51,6 +53,14 @@ impl ModelWeightsRaw {
         }
     }
 
+    /// Get a Q4_K raw byte tensor by name.
+    pub fn get_q4k_raw(&self, name: &str) -> Option<&[u8]> {
+        match self.tensors.get(name) {
+            Some(WeightData::Q4_KRaw(v)) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+
     /// Number of loaded tensors.
     pub fn len(&self) -> usize {
         self.tensors.len()
@@ -69,6 +79,7 @@ impl ModelWeightsRaw {
                 WeightData::F32(f) => f.len() * 4,
                 WeightData::Q8_0Raw(b) => b.len(),
                 WeightData::Q4_0Raw(b) => b.len(),
+                WeightData::Q4_KRaw(b) => b.len(),
             })
             .sum()
     }
@@ -536,6 +547,7 @@ fn weight_elem_count(w: &WeightData) -> usize {
         WeightData::F32(v) => v.len(),
         WeightData::Q8_0Raw(b) => b.len() / 34 * 32,
         WeightData::Q4_0Raw(b) => b.len() / 18 * 32,
+        WeightData::Q4_KRaw(b) => b.len() / 144 * 256,
     }
 }
 
@@ -576,6 +588,19 @@ fn split_weight_three(
                 WeightData::Q4_0Raw(b[b1 + b2..].to_vec()),
             )
         }
+        WeightData::Q4_KRaw(b) => {
+            assert!(n1.is_multiple_of(256) && n2.is_multiple_of(256) && n3.is_multiple_of(256),
+                "Q4_K three-way split requires each part to be a multiple of 256; got {n1}, {n2}, {n3}");
+            let b1 = n1 / 256 * 144;
+            let b2 = n2 / 256 * 144;
+            let b3 = n3 / 256 * 144;
+            assert_eq!(b.len(), b1 + b2 + b3);
+            (
+                WeightData::Q4_KRaw(b[0..b1].to_vec()),
+                WeightData::Q4_KRaw(b[b1..b1 + b2].to_vec()),
+                WeightData::Q4_KRaw(b[b1 + b2..].to_vec()),
+            )
+        }
     }
 }
 
@@ -604,6 +629,17 @@ fn split_weight_two(w: &WeightData, n1: usize, n2: usize) -> (WeightData, Weight
             (
                 WeightData::Q4_0Raw(b[0..b1].to_vec()),
                 WeightData::Q4_0Raw(b[b1..].to_vec()),
+            )
+        }
+        WeightData::Q4_KRaw(b) => {
+            assert!(n1.is_multiple_of(256) && n2.is_multiple_of(256),
+                "Q4_K two-way split requires each part to be a multiple of 256; got {n1}, {n2}");
+            let b1 = n1 / 256 * 144;
+            let b2 = n2 / 256 * 144;
+            assert_eq!(b.len(), b1 + b2);
+            (
+                WeightData::Q4_KRaw(b[0..b1].to_vec()),
+                WeightData::Q4_KRaw(b[b1..].to_vec()),
             )
         }
     }

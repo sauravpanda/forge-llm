@@ -30,6 +30,8 @@ pub enum DType {
     Q4_0,
     /// 4-bit quantized (with scale + min)
     Q4_1,
+    /// 4-bit K-quant — 256-element super-block, per-sub-block 6-bit scale + 6-bit min.
+    Q4_K,
     /// 2-bit quantized
     Q2,
     /// 4-bit NormalFloat (for QLoRA)
@@ -47,7 +49,7 @@ impl DType {
             DType::F8E4M3 | DType::F8E5M2 | DType::Q8_0 => 1,
             DType::I64 => 8,
             // Quantized types: return 1 as a placeholder; actual size depends on block size
-            DType::Q4_0 | DType::Q4_1 | DType::NF4 => 1,
+            DType::Q4_0 | DType::Q4_1 | DType::Q4_K | DType::NF4 => 1,
             DType::Q2 => 1,
         }
     }
@@ -55,7 +57,7 @@ impl DType {
     pub fn is_quantized(&self) -> bool {
         matches!(
             self,
-            DType::Q8_0 | DType::Q4_0 | DType::Q4_1 | DType::Q2 | DType::NF4
+            DType::Q8_0 | DType::Q4_0 | DType::Q4_1 | DType::Q4_K | DType::Q2 | DType::NF4
         )
     }
 
@@ -78,6 +80,7 @@ impl fmt::Display for DType {
             DType::Q8_0 => write!(f, "q8_0"),
             DType::Q4_0 => write!(f, "q4_0"),
             DType::Q4_1 => write!(f, "q4_1"),
+            DType::Q4_K => write!(f, "q4_k"),
             DType::Q2 => write!(f, "q2"),
             DType::NF4 => write!(f, "nf4"),
             DType::I32 => write!(f, "i32"),
