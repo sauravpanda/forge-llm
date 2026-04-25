@@ -1338,6 +1338,234 @@ pub fn quantize_f32_to_q4_0(data: &[f32]) -> Vec<u8> {
     out
 }
 
+/// Quantize an f32 slice to Q4_K raw bytes.
+///
+/// Q4_K block layout (256 elements → 144 bytes):
+///   [0..2]    d: f16 super-block scale
+///   [2..4]    dmin: f16 super-block min
+///   [4..16]   12 bytes packing 8 sub-block (6-bit scale, 6-bit min) pairs
+///   [16..144] 128 bytes packing 256 × 4-bit unsigned weights
+///
+/// Algorithm: split each 256-element block into 8 sub-blocks of 32 elements.
+/// Per sub-block j, compute `(min_j, max_j)` and derive
+/// `sub_scale_j = (max_j - min_j) / 15` plus offset `min_j`.  The super-block
+/// scales `d` and `dmin` are chosen so the per-sub-block 6-bit values fit:
+///   d = max(sub_scale_j) / 63          (all sub_scale_j ≥ 0)
+///   dmin = max(|min_j|) / 63, with the sign carried on dmin itself.
+///
+/// This is a simple affine quantizer — coarser than GGML's iterative
+/// `make_qkx2_quants` but adequate for re-packing Q6_K / Q5_K / etc. that
+/// have already been dequantized once.  Used by the loader when presenting
+/// a mixed Q4_K_M GGUF to the Q4_K code path.
+pub fn quantize_f32_to_q4_k(data: &[f32]) -> Vec<u8> {
+    const BLOCK: usize = 256;
+    const BYTES: usize = 144;
+    const SUB: usize = 32;
+
+    let num_sb = data.len().div_ceil(BLOCK);
+    let mut out = vec![0u8; num_sb * BYTES];
+
+    for sb in 0..num_sb {
+        let base = sb * BLOCK;
+        let end = (base + BLOCK).min(data.len());
+        let block = &data[base..end];
+        let mut padded = [0.0f32; BLOCK];
+        padded[..block.len()].copy_from_slice(block);
+
+        // Per sub-block: (min, scale, q4_values).
+        let mut sub_scales_f = [0.0f32; 8];
+        let mut sub_mins_f = [0.0f32; 8];
+        let mut sub_q: [[u8; SUB]; 8] = [[0; SUB]; 8];
+        for j in 0..8 {
+            let s0 = j * SUB;
+            let sub = &padded[s0..s0 + SUB];
+            let mut mn = f32::INFINITY;
+            let mut mx = f32::NEG_INFINITY;
+            for &v in sub {
+                if v < mn {
+                    mn = v;
+                }
+                if v > mx {
+                    mx = v;
+                }
+            }
+            let scale = (mx - mn) / 15.0;
+            let inv_scale = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+            sub_scales_f[j] = scale;
+            sub_mins_f[j] = mn;
+            for (i, &v) in sub.iter().enumerate() {
+                let q = ((v - mn) * inv_scale).round().clamp(0.0, 15.0) as u8;
+                sub_q[j][i] = q;
+            }
+        }
+
+        // Super-block scales.  d carries sub_scale magnitudes; dmin carries
+        // sub_min magnitudes (signed — keep the max-magnitude min's sign).
+        let max_scale = sub_scales_f
+            .iter()
+            .fold(0.0f32, |a, &b| if b > a { b } else { a });
+        let d = if max_scale > 0.0 { max_scale / 63.0 } else { 0.0 };
+        let inv_d = if d > 0.0 { 1.0 / d } else { 0.0 };
+
+        // For dmin, pick the min_j with largest magnitude, preserve sign.
+        let mut max_mag_min = 0.0f32;
+        let mut sign_ref = 0.0f32;
+        for &m in &sub_mins_f {
+            if m.abs() > max_mag_min {
+                max_mag_min = m.abs();
+                sign_ref = m;
+            }
+        }
+        // Dequant: w[i] = d * sub_scale[j] * q[i] - dmin * sub_min[j]
+        // We want -dmin * sub_min[j] = min_j  ⟹  dmin * sub_min[j] = -min_j
+        // With sub_min ≥ 0, choose dmin = -sign(min_j-with-max-mag) * mag / 63.
+        let dmin = if max_mag_min > 0.0 {
+            -sign_ref.signum() * (max_mag_min / 63.0)
+        } else {
+            0.0
+        };
+        let inv_dmin = if dmin.abs() > 0.0 { 1.0 / dmin } else { 0.0 };
+
+        // 6-bit per-sub-block scale and min.
+        let mut sub_scale_q = [0u8; 8];
+        let mut sub_min_q = [0u8; 8];
+        for j in 0..8 {
+            sub_scale_q[j] = (sub_scales_f[j] * inv_d).round().clamp(0.0, 63.0) as u8;
+            // sub_min[j] * dmin = -min_j  ⟹  sub_min[j] = -min_j / dmin
+            let smq = (-sub_mins_f[j] * inv_dmin).round().clamp(0.0, 63.0) as u8;
+            sub_min_q[j] = smq;
+        }
+
+        // Write super-block header.
+        let ob = sb * BYTES;
+        let d_bits = f32_to_f16(d);
+        let dmin_bits = f32_to_f16(dmin);
+        out[ob] = d_bits as u8;
+        out[ob + 1] = (d_bits >> 8) as u8;
+        out[ob + 2] = dmin_bits as u8;
+        out[ob + 3] = (dmin_bits >> 8) as u8;
+
+        // Pack scales/mins — inverse of get_scale_min_k4.
+        for i in 0..4 {
+            out[ob + 4 + i] = (sub_scale_q[i] & 63) | ((sub_scale_q[i + 4] >> 4) & 0x3) << 6;
+            out[ob + 8 + i] = (sub_min_q[i] & 63) | ((sub_min_q[i + 4] >> 4) & 0x3) << 6;
+            out[ob + 12 + i] = (sub_scale_q[i + 4] & 0x0F) | ((sub_min_q[i + 4] & 0x0F) << 4);
+        }
+
+        // Pack qs: 128 bytes, 4 chunks of 32 bytes.  Each byte holds two
+        // nibbles: the low nibble belongs to sub-block 2*chunk, the high
+        // nibble to sub-block 2*chunk+1.
+        for c in 0..4 {
+            for i in 0..32 {
+                let lo = sub_q[2 * c][i] & 0x0F;
+                let hi = sub_q[2 * c + 1][i] & 0x0F;
+                out[ob + 16 + c * 32 + i] = lo | (hi << 4);
+            }
+        }
+    }
+
+    out
+}
+
+/// Scalar dot product of a Q4_K-quantized weight row and a Q8_0-quantized
+/// input row, both of length `k`.
+///
+/// `k` must be a multiple of 256 (Q4_K super-block size).  A single super-
+/// block of Q4_K weights (144 bytes) pairs with eight Q8_0 input blocks
+/// (8 × 34 = 272 bytes), each covering 32 of the super-block's 256 elements.
+///
+/// Reference implementation — no SIMD.  Used by unit tests and as the
+/// baseline that the generated-code Q4_K kernel must match within a small
+/// floating-point tolerance.
+///
+/// Layout:
+/// - `a_q4k`: [f16 d, f16 dmin, 12B scales, 128B qs] × num_superblocks.
+/// - `a_q8`: [f16 scale, 32B i8] × num_q8_blocks.
+///
+/// The dequant formula (per 32-element sub-block j):
+///     w[i] = d * sub_scale_j * q[i] - dmin * sub_min_j
+/// where `q[i]` is the 4-bit unsigned weight value and (sub_scale_j,
+/// sub_min_j) are 6-bit values unpacked from the 12-byte scales blob via
+/// `get_scale_min_k4`.
+pub fn dot_q4_k_q8_0(weight_q4k: &[u8], input_q8: &[u8], k: usize) -> f32 {
+    const Q4K_BLOCK: usize = 256;
+    const Q4K_BYTES: usize = 144;
+    const Q8_BYTES: usize = 34;
+    assert!(
+        k.is_multiple_of(Q4K_BLOCK),
+        "Q4_K dot requires k multiple of 256, got {k}"
+    );
+
+    let num_sb = k / Q4K_BLOCK;
+    let mut acc = 0.0f32;
+
+    for sb in 0..num_sb {
+        let wb = sb * Q4K_BYTES;
+        let d_bits = u16::from_le_bytes([weight_q4k[wb], weight_q4k[wb + 1]]);
+        let dmin_bits = u16::from_le_bytes([weight_q4k[wb + 2], weight_q4k[wb + 3]]);
+        let d = f16_to_f32(d_bits);
+        let dmin = f16_to_f32(dmin_bits);
+        let scales = &weight_q4k[wb + 4..wb + 16];
+        let qs = &weight_q4k[wb + 16..wb + 144];
+
+        // Eight 32-element Q8_0 input blocks back the 256 Q4_K weights.
+        let x_block_base = sb * 8 * Q8_BYTES;
+
+        // Process four 64-element chunks (two sub-blocks per chunk), matching
+        // the GGML reference.  chunk*64 .. chunk*64+32 uses low nibbles
+        // (sub-block 2*chunk); chunk*64+32 .. chunk*64+64 uses high nibbles
+        // (sub-block 2*chunk+1).  Both nibble pairs share the same 32-byte
+        // qs slice `qs[chunk*32 .. chunk*32+32]`.
+        for chunk in 0..4 {
+            let is = chunk * 2;
+            let (sc1, m1) = get_scale_min_k4(is, scales);
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+            let d1_w = d * sc1 as f32;
+            let m1_w = dmin * m1 as f32;
+            let d2_w = d * sc2 as f32;
+            let m2_w = dmin * m2 as f32;
+
+            let qs_chunk = &qs[chunk * 32..(chunk + 1) * 32];
+
+            // Low-nibble sub-block.
+            let x1_off = x_block_base + is * Q8_BYTES;
+            let x1_scale = f16_to_f32(u16::from_le_bytes([
+                input_q8[x1_off],
+                input_q8[x1_off + 1],
+            ]));
+            let x1_i8 = &input_q8[x1_off + 2..x1_off + 34];
+            let mut dot1 = 0i32;
+            let mut sum1 = 0i32;
+            for i in 0..32 {
+                let q4 = (qs_chunk[i] & 0x0F) as i32;
+                let xi = x1_i8[i] as i8 as i32;
+                dot1 += xi * q4;
+                sum1 += xi;
+            }
+            acc += x1_scale * (d1_w * dot1 as f32 - m1_w * sum1 as f32);
+
+            // High-nibble sub-block.
+            let x2_off = x_block_base + (is + 1) * Q8_BYTES;
+            let x2_scale = f16_to_f32(u16::from_le_bytes([
+                input_q8[x2_off],
+                input_q8[x2_off + 1],
+            ]));
+            let x2_i8 = &input_q8[x2_off + 2..x2_off + 34];
+            let mut dot2 = 0i32;
+            let mut sum2 = 0i32;
+            for i in 0..32 {
+                let q4 = (qs_chunk[i] >> 4) as i32;
+                let xi = x2_i8[i] as i8 as i32;
+                dot2 += xi * q4;
+                sum2 += xi;
+            }
+            acc += x2_scale * (d2_w * dot2 as f32 - m2_w * sum2 as f32);
+        }
+    }
+
+    acc
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1364,6 +1592,154 @@ mod tests {
         assert!(f16_to_f32(0x7E00).is_nan());
         // -0.0 = 0x8000
         assert_eq!(f16_to_f32(0x8000), -0.0);
+    }
+
+    /// Build a Q4_K super-block (144 bytes) with user-chosen parameters.
+    /// Returns a vec of exactly 144 bytes.
+    /// - `d`, `dmin`: super-block scales (f16-converted internally).
+    /// - `sub_scales[i]`, `sub_mins[i]`: 6-bit scale/min for sub-block i (0..8).
+    /// - `qs_low_bytes[c][i]`, `qs_high_bytes[c][i]`: low/high nibbles for
+    ///   chunk `c` (0..4), element `i` (0..32).  Only the low 4 bits matter.
+    fn build_q4k_superblock(
+        d: f32,
+        dmin: f32,
+        sub_scales: [u8; 8],
+        sub_mins: [u8; 8],
+        qs_lo: &[[u8; 32]; 4],
+        qs_hi: &[[u8; 32]; 4],
+    ) -> Vec<u8> {
+        let mut out = vec![0u8; 144];
+        let d_bits = f32_to_f16(d);
+        let dmin_bits = f32_to_f16(dmin);
+        out[0] = d_bits as u8;
+        out[1] = (d_bits >> 8) as u8;
+        out[2] = dmin_bits as u8;
+        out[3] = (dmin_bits >> 8) as u8;
+        // Scales layout — inverse of get_scale_min_k4:
+        //   scales[0..3] = low 6 bits of sub_scale[0..3]  ∪ top 2 bits of sub_scale[4..7]
+        //   scales[4..7] = low 6 bits of sub_min[0..3]    ∪ top 2 bits of sub_min[4..7]
+        //   scales[8..11] = (sub_scale[4..7] & 0x0F) | ((sub_min[4..7] & 0x0F) << 4)
+        for i in 0..4 {
+            let sc_lo = sub_scales[i] & 63;
+            let sc_hi_top = (sub_scales[i + 4] >> 4) & 0x3;
+            out[4 + i] = sc_lo | (sc_hi_top << 6);
+        }
+        for i in 0..4 {
+            let m_lo = sub_mins[i] & 63;
+            let m_hi_top = (sub_mins[i + 4] >> 4) & 0x3;
+            out[8 + i] = m_lo | (m_hi_top << 6);
+        }
+        for i in 0..4 {
+            let sc_lo4 = sub_scales[i + 4] & 0x0F;
+            let m_lo4 = sub_mins[i + 4] & 0x0F;
+            out[12 + i] = sc_lo4 | (m_lo4 << 4);
+        }
+        // qs: 128 bytes, 32 bytes per chunk.
+        for c in 0..4 {
+            for i in 0..32 {
+                let lo = qs_lo[c][i] & 0x0F;
+                let hi = qs_hi[c][i] & 0x0F;
+                out[16 + c * 32 + i] = lo | (hi << 4);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn dot_q4_k_q8_0_matches_f32_reference_uniform_block() {
+        // Build a super-block where dequant(w[i]) = 4.0 for every element:
+        //   d = 1.0, dmin = 0.0, all sub_scales = 1, all sub_mins = 0,
+        //   all q4 = 4 (low AND high nibbles).
+        let q4k = build_q4k_superblock(
+            1.0,
+            0.0,
+            [1u8; 8],
+            [0u8; 8],
+            &[[4u8; 32]; 4],
+            &[[4u8; 32]; 4],
+        );
+        let deq = dequant_q4_k(&q4k, 256);
+        for (i, v) in deq.iter().enumerate() {
+            assert!((v - 4.0).abs() < 1e-5, "elem {i}: {v}");
+        }
+
+        // Input: all 2.0.  f32 dot = 256 × 2.0 × 4.0 = 2048.
+        let input_f32: Vec<f32> = vec![2.0; 256];
+        let input_q8 = quantize_f32_to_q8_0(&input_f32);
+        let expected: f32 = deq.iter().zip(&input_f32).map(|(w, x)| w * x).sum();
+        let got = dot_q4_k_q8_0(&q4k, &input_q8, 256);
+        let rel_err = ((got - expected) / expected).abs();
+        assert!(rel_err < 0.01, "got={got} expected={expected}");
+    }
+
+    #[test]
+    fn dot_q4_k_q8_0_matches_f32_reference_varied_block() {
+        // Varied per-sub-block scales/mins and non-uniform qs.
+        let sub_scales = [3u8, 5, 7, 2, 10, 4, 6, 8];
+        let sub_mins = [1u8, 2, 3, 1, 2, 1, 1, 2];
+        // qs_lo[c][i] spans 0..=15 in a pattern; qs_hi similarly.
+        let qs_lo: [[u8; 32]; 4] = std::array::from_fn(|c| {
+            std::array::from_fn(|i| ((c * 4 + i / 8) % 16) as u8)
+        });
+        let qs_hi: [[u8; 32]; 4] = std::array::from_fn(|c| {
+            std::array::from_fn(|i| ((c * 2 + i % 16) % 16) as u8)
+        });
+        let q4k = build_q4k_superblock(0.03, 0.01, sub_scales, sub_mins, &qs_lo, &qs_hi);
+        let deq = dequant_q4_k(&q4k, 256);
+
+        // Mixed-sign input: small-amplitude cosine-like values.
+        let input_f32: Vec<f32> = (0..256)
+            .map(|i| ((i as f32 * 0.1).sin() * 0.5))
+            .collect();
+        let input_q8 = quantize_f32_to_q8_0(&input_f32);
+
+        let expected: f32 = deq.iter().zip(&input_f32).map(|(w, x)| w * x).sum();
+        let got = dot_q4_k_q8_0(&q4k, &input_q8, 256);
+
+        // Q8_0 quantization of the *input* has ~0.4% max relative error per
+        // block; combined with the Q4_K weights this propagates to ~1% worst
+        // case.  Allow 2% relative tolerance.
+        let abs_err = (got - expected).abs();
+        let ref_mag = expected.abs().max(1e-6);
+        assert!(
+            abs_err / ref_mag < 0.02,
+            "got={got} expected={expected} rel_err={}",
+            abs_err / ref_mag
+        );
+    }
+
+    #[test]
+    fn quantize_f32_to_q4_k_round_trip_smooth() {
+        // 512-element smooth ramp: two super-blocks' worth.
+        let values: Vec<f32> = (0..512).map(|i| (i as f32 - 256.0) * 0.005).collect();
+        let q4k = quantize_f32_to_q4_k(&values);
+        assert_eq!(q4k.len(), 2 * 144);
+        let recovered = dequant_q4_k(&q4k, values.len());
+
+        // Per-sub-block max error ≤ scale/2 ≈ (max-min)/30 per sub-block.
+        // Max amplitude span over 32 elements is ≈ 0.155, so max error ≈ 0.006.
+        // Add some slack for the super-block packing quantization of scales
+        // (6-bit scales lose up to 1/63 ≈ 1.6% relative).
+        let max_err = values
+            .iter()
+            .zip(&recovered)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_err < 0.05,
+            "Q4_K round-trip max error too large: {max_err}"
+        );
+    }
+
+    #[test]
+    fn quantize_f32_to_q4_k_round_trip_zero_block() {
+        // All-zero input should dequant back to zero (or at least near-zero).
+        let values = vec![0.0f32; 256];
+        let q4k = quantize_f32_to_q4_k(&values);
+        let recovered = dequant_q4_k(&q4k, 256);
+        for v in recovered {
+            assert!(v.abs() < 1e-3, "zero block dequanted to {v}");
+        }
     }
 
     #[test]
