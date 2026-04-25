@@ -135,6 +135,7 @@ impl HFConfig {
             rms_norm_eps: norm_eps as f32,
             rope_theta: self.rope_theta.unwrap_or(10000.0) as f32,
             dtype,
+            lm_head_dtype: None,
             sliding_window_size,
             qkv_bias,
             hidden_activation,

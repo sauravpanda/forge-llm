@@ -223,6 +223,7 @@ pub fn infer_model_config(
         rms_norm_eps: 1e-5,
         rope_theta: 10000.0,
         dtype,
+        lm_head_dtype: None,
         sliding_window_size: None,
         qkv_bias,
         hidden_activation: crate::ir::HiddenActivation::SiLU,

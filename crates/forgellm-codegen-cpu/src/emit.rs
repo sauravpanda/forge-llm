@@ -25,15 +25,27 @@ pub fn generate(graph: &Graph) -> Result<String, CodegenError> {
 
     emit_header(&mut code, config)?;
     emit_kernel_functions(&mut code, config)?;
-    if config.dtype == DType::Q8_0 {
+    // lm_head may use a different dtype than projections (e.g. Q4_K_M GGUF →
+    // Q4_0 projections + Q8_0 output).  Emit each kernel family whenever either
+    // projections or lm_head needs it.
+    let lm_dtype = config.lm_head_dtype.unwrap_or(config.dtype);
+    let needs_q8 = config.dtype == DType::Q8_0 || lm_dtype == DType::Q8_0;
+    let needs_q4 = config.dtype == DType::Q4_0 || lm_dtype == DType::Q4_0;
+    if needs_q8 {
         emit_q8_0_kernel(&mut code)?;
         emit_q8_0_sdot_kernel(&mut code)?;
+    }
+    if config.dtype == DType::Q8_0 {
         emit_specialized_q8_matmul_functions(&mut code, config)?;
         emit_specialized_q8_matmul_batched_functions(&mut code, config)?;
     }
-    if config.dtype == DType::Q4_0 {
+    if needs_q4 {
         emit_q4_0_kernel(&mut code)?;
-        emit_q4_0_sdot_kernel(&mut code)?;
+        // If the Q8_0 kernel family was already emitted, its shared helpers
+        // (quantize_to_q8_0_blocks, f32_to_f16_bits) will clash.  Skip them.
+        emit_q4_0_sdot_kernel(&mut code, /* skip_shared_helpers= */ needs_q8)?;
+    }
+    if config.dtype == DType::Q4_0 {
         emit_specialized_q4_matmul_functions(&mut code, config)?;
         emit_specialized_q4_matmul_batched_functions(&mut code, config)?;
     }
@@ -2298,9 +2310,10 @@ fn dot_q4_0(input: &[f32], weight_row: &[u8], k: usize) -> f32 {
 /// - `dot_q4_0_q8_0()` — single-row Q4_0 × Q8_0 sdot kernel
 /// - `dot4_q4_0_q8_0()` — 4-row batch variant
 /// - `dot8_q4_0_q8_0()` — 8-row batch variant
-fn emit_q4_0_sdot_kernel(code: &mut String) -> Result<(), CodegenError> {
-    code.push_str(
-        r#"
+fn emit_q4_0_sdot_kernel(code: &mut String, skip_shared_helpers: bool) -> Result<(), CodegenError> {
+    if !skip_shared_helpers {
+        code.push_str(
+            r#"
 // --- Q4_0 × Q8_0 int8 dot product via AArch64 sdot (inline asm, stable Rust) ---
 // Input is quantized to Q8_0 once per matmul call; each Q4_0 weight block is
 // unpacked from 4-bit to int8 in-register using NEON (vand/ushr/sub), then
@@ -2365,6 +2378,13 @@ fn f32_to_f16_bits(x: f32) -> u16 {
     else if exp_f16 >= 31  { sign | 0x7C00 }
     else                   { sign | ((exp_f16 as u16) << 10) | mantissa }
 }
+"#,
+        );
+    }
+    code.push_str(
+        r#"
+
+// --- Q4_0 × Q8_0 kernel (assumes Q8_0 quantization helpers already emitted) ---
 
 /// Single-row Q4_0 × Q8_0 dot product via AArch64 sdot instruction.
 ///
@@ -3020,13 +3040,19 @@ fn emit_forward_function(
 
     let is_q8 = config.dtype == DType::Q8_0;
     let is_q4 = config.dtype == DType::Q4_0;
+    // lm_head may use a different storage dtype than projections — Q4_K_M GGUF
+    // files, for instance, store projections as Q4_K (→ Q4_0 post-load) but
+    // `output.weight` as Q6_K (→ Q8_0).  Generate the correct kernel for each.
+    let lm_dtype = config.lm_head_dtype.unwrap_or(config.dtype);
+    let lm_is_q8 = lm_dtype == DType::Q8_0;
+    let lm_is_q4 = lm_dtype == DType::Q4_0;
     // Projection weight type: raw bytes for quantized models, f32 otherwise
     let proj_type = if is_q8 || is_q4 {
         "Vec<u8>"
     } else {
         "Vec<f32>"
     };
-    let lm_head_type = if is_q8 || is_q4 {
+    let lm_head_type = if lm_is_q8 || lm_is_q4 {
         "Vec<u8>"
     } else {
         "Vec<f32>"
@@ -3529,7 +3555,7 @@ fn emit_forward_function(
         "    // Uses larger chunks (256) to amortize Rayon overhead"
     )?;
     writeln!(code, "    let mut logits = vec![0.0f32; VOCAB_SIZE];")?;
-    if is_q8 {
+    if lm_is_q8 {
         let lm_row_bytes = hidden.div_ceil(32) * 34;
         writeln!(code, "    #[cfg(target_arch = \"aarch64\")]")?;
         writeln!(
@@ -3581,7 +3607,7 @@ fn emit_forward_function(
         )?;
         writeln!(code, "        }}")?;
         writeln!(code, "    }});")?;
-    } else if is_q4 {
+    } else if lm_is_q4 {
         let lm_row_bytes = hidden.div_ceil(32) * 18;
         writeln!(code, "    #[cfg(target_arch = \"aarch64\")]")?;
         writeln!(
@@ -3700,6 +3726,10 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
 
     let is_q8 = config.dtype == DType::Q8_0;
     let is_q4 = config.dtype == DType::Q4_0;
+    // lm_head may use a different dtype than projections (see emit_forward_function).
+    let lm_dtype = config.lm_head_dtype.unwrap_or(config.dtype);
+    let lm_is_q8 = lm_dtype == DType::Q8_0;
+    let lm_is_q4 = lm_dtype == DType::Q4_0;
 
     writeln!(code)?;
     writeln!(code, "/// Process a prompt sequence and fill the KV cache.")?;
@@ -4054,7 +4084,7 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "            rms_norm(&mut normed, &hidden_state, &weights.final_norm, RMS_NORM_EPS);"
     )?;
-    if is_q8 {
+    if lm_is_q8 {
         let lm_row_bytes = hidden.div_ceil(32) * 34;
         writeln!(code, "            #[cfg(target_arch = \"aarch64\")]")?;
         writeln!(
@@ -4115,7 +4145,7 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
         )?;
         writeln!(code, "                }}")?;
         writeln!(code, "            }});")?;
-    } else if is_q4 {
+    } else if lm_is_q4 {
         let lm_row_bytes = hidden.div_ceil(32) * 18;
         writeln!(code, "            #[cfg(target_arch = \"aarch64\")]")?;
         writeln!(
@@ -4257,23 +4287,28 @@ fn emit_prefill_batched_function(
     let head_dim = config.head_dim;
     let qk_size = num_heads * head_dim;
     let kv_size = num_kv_heads * head_dim;
-    // Dtype-specific kernel name suffix + lm_head row byte size.
-    let (mm_kind, lm_row_bytes, lm_dot8, lm_dot, lm_scalar_dot) = match config.dtype {
+    // Projection dispatch — `matmul_mat_{mm_kind}_KxN` for per-layer weights.
+    let mm_kind = match config.dtype {
+        DType::Q8_0 => "q8_0",
+        DType::Q4_0 => "q4_0",
+        _ => unreachable!("forward_prefill_batched only emitted for Q8_0 / Q4_0"),
+    };
+    // lm_head dispatch — may differ from projections (e.g. Q4_K_M → Q4_0 proj + Q8_0 lm_head).
+    let lm_dtype = config.lm_head_dtype.unwrap_or(config.dtype);
+    let (lm_row_bytes, lm_dot8, lm_dot, lm_scalar_dot) = match lm_dtype {
         DType::Q8_0 => (
-            "q8_0",
             hidden.div_ceil(32) * 34,
             "dot8_q8_0_q8_0",
             "dot_q8_0_q8_0",
             "dot_q8_0",
         ),
         DType::Q4_0 => (
-            "q4_0",
             hidden.div_ceil(32) * 18,
             "dot8_q4_0_q8_0",
             "dot_q4_0_q8_0",
             "dot_q4_0",
         ),
-        _ => unreachable!("forward_prefill_batched only emitted for Q8_0 / Q4_0"),
+        _ => unreachable!("forward_prefill_batched lm_head only supports Q8_0 / Q4_0"),
     };
 
     writeln!(code)?;
@@ -4684,6 +4719,7 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             dtype: DType::F16,
+            lm_head_dtype: None,
             sliding_window_size: None,
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,
@@ -4780,6 +4816,7 @@ mod tests {
     fn q8_matmul_does_not_use_cblas() {
         let config = ModelConfig {
             dtype: DType::Q8_0,
+            lm_head_dtype: None,
             ..tiny_config()
         };
         let graph = graph_builder::build_graph(&config).unwrap();
@@ -4816,6 +4853,7 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             dtype: DType::F16,
+            lm_head_dtype: None,
             sliding_window_size: None,
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,
@@ -4844,6 +4882,7 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             dtype: DType::BF16,
+            lm_head_dtype: None,
             sliding_window_size: None,
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,
@@ -4996,6 +5035,7 @@ mod tests {
             rms_norm_eps: 1e-6,
             rope_theta: 1e6,
             dtype: DType::F16,
+            lm_head_dtype: None,
             sliding_window_size: None,
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,
@@ -5041,6 +5081,7 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             dtype: DType::F16,
+            lm_head_dtype: None,
             sliding_window_size: None,
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,
@@ -5119,6 +5160,7 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             dtype: DType::Q8_0,
+            lm_head_dtype: None,
             sliding_window_size: None,
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,
@@ -5248,6 +5290,7 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 1_000_000.0,
             dtype: DType::F16,
+            lm_head_dtype: None,
             sliding_window_size: None,
             qkv_bias: true,
             hidden_activation: HiddenActivation::SiLU,
@@ -5339,6 +5382,7 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             dtype: DType::F16,
+            lm_head_dtype: None,
             sliding_window_size: Some(64),
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,
@@ -5396,6 +5440,7 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             dtype: DType::Q8_0,
+            lm_head_dtype: None,
             sliding_window_size: Some(32),
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,
@@ -5475,6 +5520,7 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             dtype: DType::Q4_0,
+            lm_head_dtype: None,
             sliding_window_size: None,
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,
@@ -5651,6 +5697,7 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             dtype: DType::F16,
+            lm_head_dtype: None,
             sliding_window_size: None,
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,
@@ -6053,6 +6100,7 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             dtype: DType::F16,
+            lm_head_dtype: None,
             sliding_window_size: None,
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,
@@ -6115,6 +6163,7 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             dtype: DType::F16,
+            lm_head_dtype: None,
             sliding_window_size: None,
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,

@@ -167,7 +167,12 @@ impl GGMLType {
             GGMLType::F16 => DType::F16,
             GGMLType::BF16 => DType::BF16,
             GGMLType::Q4_0 => DType::Q4_0,
-            // Everything else quantized → Q8_0 post-load (re-quantized by weight_loader).
+            // Everything else quantized → Q8_0 post-load (re-quantized by
+            // weight_loader).  K-quants all go to Q8_0 even for Q4_K to keep
+            // Q4_K_M files (which mix Q4_K projections with Q6_K outputs) on a
+            // single uniform codegen path.  Native Q4_K kernels would require
+            // per-tensor dispatch, which is scaffolded in v0.9.1 via
+            // `ModelConfig::lm_head_dtype` but not yet plumbed for projections.
             GGMLType::Q8_0
             | GGMLType::Q8_1
             | GGMLType::Q8K
@@ -693,8 +698,8 @@ mod tests {
         assert_eq!(GGMLType::BF16.to_dtype(), DType::BF16);
         assert_eq!(GGMLType::Q4_0.to_dtype(), DType::Q4_0);
         assert_eq!(GGMLType::Q8_0.to_dtype(), DType::Q8_0);
-        // K-quants are re-quantized to Q8_0 on load (see weight_loader::load_tensor_raw),
-        // so they are reported as Q8_0 to the rest of the compiler.
+        // K-quants are all re-quantized to Q8_0 on load so mixed Q4_K_M files
+        // (Q4_K projections + Q6_K output) share a uniform codegen path.
         assert_eq!(GGMLType::Q4K.to_dtype(), DType::Q8_0);
         assert_eq!(GGMLType::Q5K.to_dtype(), DType::Q8_0);
         assert_eq!(GGMLType::Q6K.to_dtype(), DType::Q8_0);

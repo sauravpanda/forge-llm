@@ -416,15 +416,18 @@ fn detect_gguf_dtype(gguf_file: &gguf::GGUFFile) -> forgellm_frontend::ir::DType
             GGMLType::Q4_0 => q4_count += 1,
             GGMLType::F16 | GGMLType::BF16 => f16_count += 1,
             GGMLType::F32 => f32_count += 1,
-            // K-quants and other quantized formats are re-quantized to Q8_0 on load
-            // by weight_loader, so for codegen-dtype purposes count them as Q8_0.
+            // All K-quants and other non-native quantized formats are
+            // re-quantized to Q8_0 on load, so count them as Q8_0 for
+            // codegen-dispatch purposes.  (See weight_loader::load_from_file_mixed.)
             GGMLType::Q4_1
+            | GGMLType::Q4K
+            | GGMLType::IQ4NL
+            | GGMLType::IQ4XS
             | GGMLType::Q5_0
             | GGMLType::Q5_1
             | GGMLType::Q8_1
             | GGMLType::Q2K
             | GGMLType::Q3K
-            | GGMLType::Q4K
             | GGMLType::Q5K
             | GGMLType::Q6K
             | GGMLType::Q8K
@@ -434,9 +437,7 @@ fn detect_gguf_dtype(gguf_file: &gguf::GGUFFile) -> forgellm_frontend::ir::DType
             | GGMLType::IQ3XXS
             | GGMLType::IQ3S
             | GGMLType::IQ1S
-            | GGMLType::IQ1M
-            | GGMLType::IQ4NL
-            | GGMLType::IQ4XS => q8_count += 1,
+            | GGMLType::IQ1M => q8_count += 1,
             _ => {}
         }
     }
@@ -455,6 +456,32 @@ fn detect_gguf_dtype(gguf_file: &gguf::GGUFFile) -> forgellm_frontend::ir::DType
         DType::F32
     } else {
         DType::F16
+    }
+}
+
+/// Detect the storage dtype for the lm_head / output projection specifically.
+///
+/// Q4_K_M models store most projection weights as Q4_K but keep
+/// `output.weight` in a higher-precision format (typically Q6_K).  We want
+/// the generated codegen to use a corresponding higher-precision kernel for
+/// the logits projection even when the majority-dtype for per-layer
+/// projections is a lower-precision quantization.
+///
+/// Returns `None` if no output tensor is found or if its type matches the
+/// overall model dtype (caller defaults to `config.dtype`).
+fn detect_gguf_lm_head_dtype(
+    gguf_file: &gguf::GGUFFile,
+    proj_dtype: forgellm_frontend::ir::DType,
+) -> Option<forgellm_frontend::ir::DType> {
+    let lm_tensor = gguf_file
+        .tensors
+        .iter()
+        .find(|t| t.name == "output.weight" || t.name == "lm_head.weight")?;
+    let lm_dtype = lm_tensor.ggml_type.to_dtype();
+    if lm_dtype == proj_dtype {
+        None
+    } else {
+        Some(lm_dtype)
     }
 }
 
@@ -551,6 +578,7 @@ fn load_model_config(model_path: &str) -> Result<ModelConfig> {
         };
 
         let dtype = detect_gguf_dtype(&gguf_file);
+        let lm_head_dtype = detect_gguf_lm_head_dtype(&gguf_file, dtype);
 
         Ok(ModelConfig {
             architecture,
@@ -565,6 +593,7 @@ fn load_model_config(model_path: &str) -> Result<ModelConfig> {
             rms_norm_eps,
             rope_theta,
             dtype,
+            lm_head_dtype,
             sliding_window_size,
             qkv_bias,
             hidden_activation,
@@ -2347,17 +2376,22 @@ mod tests {
     }
 
     #[test]
-    fn detect_dtype_treats_k_quants_as_q8_0() {
-        // K-quants are re-quantized to Q8_0 on load (weight_loader::load_tensor_raw),
-        // so detect_gguf_dtype reports Q8_0 — codegen emits the Q8_0 path that
-        // matches what the loader actually produces.
+    fn detect_dtype_k_quants_classified_as_q8_0() {
+        // K-quants (including Q4_K) are re-quantized to Q8_0 on load so that
+        // mixed Q4_K_M files share a uniform codegen path.  lm_head dtype is
+        // extracted separately but matches the projection dtype after requant.
         let gguf = make_gguf_with_types(&[
             ("blk.0.attn_q.weight", GGMLType::Q4K),
             ("blk.0.attn_k.weight", GGMLType::Q4K),
-            ("blk.0.attn_v.weight", GGMLType::Q4K),
+            ("blk.0.ffn_down.weight", GGMLType::Q6K),
             ("output.weight", GGMLType::Q6K),
         ]);
         assert_eq!(detect_gguf_dtype(&gguf), DType::Q8_0);
+        // Q6K lm_head also resolves to Q8_0, same as projections — no split.
+        assert_eq!(
+            detect_gguf_lm_head_dtype(&gguf, DType::Q8_0),
+            None
+        );
     }
 
     #[test]

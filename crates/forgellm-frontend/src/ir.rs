@@ -338,6 +338,12 @@ pub struct ModelConfig {
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
     pub dtype: DType,
+    /// Storage dtype for the lm_head / output projection.  `None` means it
+    /// matches `dtype`.  GGUF Q4_K_M models typically store projection weights
+    /// at a lower precision than `output.weight`, so the codegen dispatches a
+    /// higher-precision kernel for the logits matmul.
+    #[serde(default)]
+    pub lm_head_dtype: Option<DType>,
     /// Sliding window attention size. `None` means full attention (Llama).
     /// `Some(n)` means each token only attends to the last `n` tokens (Mistral SWA).
     #[serde(default)]
@@ -659,6 +665,7 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             dtype: DType::F16,
+            lm_head_dtype: None,
             sliding_window_size: None,
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,
@@ -686,6 +693,7 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             dtype: DType::F16,
+            lm_head_dtype: None,
             sliding_window_size: Some(4096),
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,
@@ -713,6 +721,7 @@ mod tests {
             rms_norm_eps: 1e-6,
             rope_theta: 1_000_000.0,
             dtype: DType::BF16,
+            lm_head_dtype: None,
             sliding_window_size: None,
             qkv_bias: true,
             hidden_activation: HiddenActivation::SiLU,
@@ -738,6 +747,7 @@ mod tests {
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
             dtype: DType::F16,
+            lm_head_dtype: None,
             sliding_window_size: None,
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,

@@ -2,6 +2,70 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.9.1] — 2026-04-24 — Infra: per-tensor lm_head dtype dispatch
+
+Infrastructure release.  No user-visible perf or correctness change on any
+currently-supported model; existing Q4_K_M GGUFs compile and run identically
+to v0.9.0 (all K-quants → Q8_0 uniform codegen path, ~44–47 tok/s decode on
+Llama-3.2-1B Q4_K_M).  The machinery added here is the prerequisite for
+native Q4_K / Q6_K decode kernels in a follow-up release.
+
+### Added
+
+- **`ModelConfig::lm_head_dtype: Option<DType>`** — explicit per-tensor storage
+  dtype for the output / logits projection, defaulting to `config.dtype` when
+  `None`.  Serde-defaulted so existing serialized configs keep parsing.
+- **`detect_gguf_lm_head_dtype(gguf, proj_dtype)`** in the CLI — inspects the
+  `output.weight` / `lm_head.weight` tensor (if present) and returns a split
+  dtype when it differs from projections.  For tied-embedding models (no
+  `output.weight` tensor) returns `None`, keeping lm_head in sync with
+  projections.
+
+### Changed
+
+- **`emit.rs` codegen** now derives a `lm_dtype = config.lm_head_dtype.unwrap_or(config.dtype)`
+  and dispatches the lm_head matmul independently of the projection dispatch.
+  All three logits-projection sites (`forward()`, `forward_prefill()`,
+  `forward_prefill_batched()`) honour this split.  `lm_head_type` in the
+  generated `struct Weights` and `lmh_bytes` in `generate_main` likewise use
+  `lm_dtype`, so the weight file layout matches the emitted kernel.
+- **`generate()` in `emit.rs`** now emits each quantized-kernel family
+  (Q4_0 / Q8_0) whenever *either* projections or lm_head need it.
+  `emit_q4_0_sdot_kernel` gained a `skip_shared_helpers` flag so the
+  `quantize_to_q8_0_blocks` / `f32_to_f16_bits` helpers are emitted once even
+  when both kernel families are in play.
+
+### Explicitly not changed
+
+- **Weight loader** (`load_from_file_mixed`): all K-quants still re-quantize
+  to Q8_0.  Q4_K_M files (which commonly mix Q4_K projections with Q6_K
+  `ffn_down` / `output.weight`) remain on a single uniform codegen path, so
+  kernels never encounter mixed byte layouts within a layer.
+- **Weights binary size / decode tok/s**: identical to v0.9.0 for every
+  model-dtype combination supported today.
+
+### Rationale
+
+An earlier iteration of this release routed `GGMLType::Q4K → DType::Q4_0`
+directly in the loader, expecting ~45% smaller weights and a 1.5× decode
+speedup.  That path is **not** safe with current codegen, because Q4_K_M
+files mix Q4_K with Q6_K at the tensor granularity — e.g. Llama-3.2-1B
+Q4_K_M stores `ffn_down` as Q6_K while `ffn_gate` / `ffn_up` are Q4_K —
+and the uniform-dtype per-layer codegen would emit Q4_0 kernels for the
+Q6_K bytes (which live as 34-byte Q8_0 blocks after requant), producing
+NaNs at the first matmul.  Making that work correctly requires per-tensor
+dispatch across *all* projection kernels, which is the v0.9.2+ roadmap.
+v0.9.1 ships the lm_head half of that refactor (single-site, well-scoped),
+leaving the per-projection-kind dispatch for when the native Q4_K / Q6_K
+kernels are ready to slot in.
+
+### Tests
+
+- `ggml_type_conversions` updated: Q4K stays at DType::Q8_0 (matches loader).
+- `detect_dtype_k_quants_classified_as_q8_0` renamed + updated.
+- All 63 CPU codegen tests pass.  End-to-end Llama-3.2-1B-Q4_K_M compile
+  verified: coherent generation at 47.7 tok/s decode (unchanged from v0.9.0).
+
 ## [0.9.0] — 2026-04-24 — K-quant compatibility (Q4_K_M and friends)
 
 ### Added

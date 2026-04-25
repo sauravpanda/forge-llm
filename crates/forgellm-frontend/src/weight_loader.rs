@@ -120,9 +120,12 @@ pub fn load_from_file_mixed(
                 WeightData::F32(f32_data)
             }
             // Quantized formats without native ForgeLLM kernels (K-quants and
-            // friends). Dequantize to f32, then re-quantize to Q8_0 so they go
-            // through the existing Q8_0 code path. Costs ~2× weight memory vs.
-            // the source format; native K-quant kernels are future work.
+            // friends).  Dequantize → re-quantize to Q8_0 to feed the existing
+            // Q8_0 code path.  Uniform target is required so mixed Q4_K_M files
+            // (Q4_K + Q6_K per layer) end up with byte-compatible projections
+            // and can share a single codegen kernel family.  Native Q4_K /
+            // Q6_K kernels with per-tensor dispatch are tracked for a future
+            // release (see v0.9.1 lm_head_dtype plumbing for the scaffolding).
             _ => {
                 let f32_data = dequantize(raw, tensor_info.ggml_type, numel)?;
                 WeightData::Q8_0Raw(quantize_f32_to_q8_0(&f32_data))
