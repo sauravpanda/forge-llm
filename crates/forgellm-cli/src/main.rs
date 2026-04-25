@@ -397,6 +397,7 @@ fn detect_gguf_dtype(gguf_file: &gguf::GGUFFile) -> forgellm_frontend::ir::DType
 
     let mut q8_count = 0usize;
     let mut q4_count = 0usize;
+    let mut q4k_count = 0usize;
     let mut f16_count = 0usize;
     let mut f32_count = 0usize;
 
@@ -414,13 +415,17 @@ fn detect_gguf_dtype(gguf_file: &gguf::GGUFFile) -> forgellm_frontend::ir::DType
         match tensor.ggml_type {
             GGMLType::Q8_0 => q8_count += 1,
             GGMLType::Q4_0 => q4_count += 1,
+            // Q4_K projections drive a Q4_K-target compile when in the
+            // majority — Q5_K / Q6_K tensors in the same file are
+            // requantized to Q4_K on load.
+            GGMLType::Q4K => q4k_count += 1,
             GGMLType::F16 | GGMLType::BF16 => f16_count += 1,
             GGMLType::F32 => f32_count += 1,
-            // All K-quants and other non-native quantized formats are
-            // re-quantized to Q8_0 on load, so count them as Q8_0 for
-            // codegen-dispatch purposes.  (See weight_loader::load_from_file_mixed.)
+            // Other quantized formats are re-quantized to Q8_0 (or to Q4_K
+            // when the target is Q4_K).  Count them as Q8_0 for the dispatch
+            // decision — they only "win" the dtype vote in a non-K-quant
+            // model that's mostly Q5_0 / Q6_K / etc.
             GGMLType::Q4_1
-            | GGMLType::Q4K
             | GGMLType::IQ4NL
             | GGMLType::IQ4XS
             | GGMLType::Q5_0
@@ -442,13 +447,18 @@ fn detect_gguf_dtype(gguf_file: &gguf::GGUFFile) -> forgellm_frontend::ir::DType
         }
     }
 
-    let total = q8_count + q4_count + f16_count + f32_count;
+    let total = q8_count + q4_count + q4k_count + f16_count + f32_count;
     if total == 0 {
         return DType::F16;
     }
 
     // Pick the type that accounts for the majority of projection weights.
-    if q8_count > total / 2 {
+    // Q4_K wins the vote for Q4_K_M files where the majority are Q4_K and the
+    // remainder are higher-precision K-quants (Q5_K / Q6_K) — those get
+    // requantized to Q4_K so the whole model sits on the Q4_K kernel path.
+    if q4k_count > total / 2 {
+        DType::Q4_K
+    } else if q8_count > total / 2 {
         DType::Q8_0
     } else if q4_count > total / 2 {
         DType::Q4_0
@@ -2011,25 +2021,34 @@ fn cmd_export_weights_impl(
     lora_path: Option<&str>,
 ) -> Result<()> {
     use forgellm_frontend::ir::DType;
-    use forgellm_frontend::weight_loader::{load_from_file_mixed, WeightData};
+    use forgellm_frontend::weight_loader::{load_from_file_mixed_with_target, WeightData};
 
     eprintln!("Loading model from {model_path}...");
     let config = load_model_config(model_path)?;
 
     let is_q8 = config.dtype == DType::Q8_0;
     let is_q4 = config.dtype == DType::Q4_0;
+    let is_q4k = config.dtype == DType::Q4_K;
 
-    if is_q8 || is_q4 {
-        let quant_label = if is_q8 { "Q8_0" } else { "Q4_0" };
+    if is_q8 || is_q4 || is_q4k {
+        let quant_label = match config.dtype {
+            DType::Q8_0 => "Q8_0",
+            DType::Q4_0 => "Q4_0",
+            DType::Q4_K => "Q4_K",
+            _ => "?",
+        };
         if lora_path.is_some() {
             eprintln!(
                 "Warning: LoRA merging is not supported for {quant_label} quantized models. \
                  The LoRA adapter will be ignored."
             );
         }
-        // Quantized: keep projection weights as raw bytes, dequantize norm/embed to f32
+        // Quantized: keep projection weights as raw bytes, dequantize norm/embed to f32.
+        // Pass the projection dtype to the loader so K-quants get requanted to the right
+        // uniform target (Q8_0 by default, Q4_K when projections are majority-Q4_K).
         let (_gguf_file, weights) =
-            load_from_file_mixed(model_path).with_context(|| "failed to load weights")?;
+            load_from_file_mixed_with_target(model_path, Some(config.dtype))
+                .with_context(|| "failed to load weights")?;
 
         eprintln!(
             "Model: {} | {} layers | {} tensors | {:.1} MB ({quant_label} raw)",
@@ -2132,8 +2151,11 @@ fn cmd_export_weights_impl(
                 Some(WeightData::Q4_0Raw(_)) => {
                     bail!("Q4_0 embed_tokens: dequantization not yet implemented for export");
                 }
-                Some(WeightData::Q4_KRaw(_)) => {
-                    bail!("Q4_K embed_tokens: dequantization not yet implemented for export");
+                Some(WeightData::Q4_KRaw(b)) => {
+                    let f32s = forgellm_frontend::weight_loader::dequantize_q4_k_to_f32(b, numel);
+                    for val in f32s {
+                        data.extend_from_slice(&val.to_le_bytes());
+                    }
                 }
                 None => bail!("embed_tokens weight not found: {name}"),
             }
@@ -2385,21 +2407,22 @@ mod tests {
     }
 
     #[test]
-    fn detect_dtype_k_quants_classified_as_q8_0() {
-        // K-quants (including Q4_K) are re-quantized to Q8_0 on load so that
-        // mixed Q4_K_M files share a uniform codegen path.  lm_head dtype is
-        // extracted separately but matches the projection dtype after requant.
+    fn detect_dtype_q4_k_majority_classified_as_q4_k() {
+        // Majority-Q4_K projections → Q4_K target.  Higher-precision Q6_K
+        // projections in the same file are requantized to Q4_K on load.
+        // The Q6_K output.weight is dispatched separately via lm_head_dtype.
         let gguf = make_gguf_with_types(&[
             ("blk.0.attn_q.weight", GGMLType::Q4K),
             ("blk.0.attn_k.weight", GGMLType::Q4K),
             ("blk.0.ffn_down.weight", GGMLType::Q6K),
             ("output.weight", GGMLType::Q6K),
         ]);
-        assert_eq!(detect_gguf_dtype(&gguf), DType::Q8_0);
-        // Q6K lm_head also resolves to Q8_0, same as projections — no split.
+        assert_eq!(detect_gguf_dtype(&gguf), DType::Q4_K);
+        // Q6_K output → Q8_0 post-load (higher precision than Q4_K), so the
+        // lm_head split kicks in: projections Q4_K, lm_head Q8_0.
         assert_eq!(
-            detect_gguf_lm_head_dtype(&gguf, DType::Q8_0),
-            None
+            detect_gguf_lm_head_dtype(&gguf, DType::Q4_K),
+            Some(DType::Q8_0)
         );
     }
 

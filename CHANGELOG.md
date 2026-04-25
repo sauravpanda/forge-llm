@@ -2,6 +2,82 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.9.2] — 2026-04-25 — Native Q4_K storage + scalar kernel
+
+End-to-end native Q4_K compile path: `Q4_K_M` GGUFs now compile to a binary
+where projection weights stay as Q4_K super-blocks (144 bytes per 256
+elements) instead of being requantized to Q8_0.  Llama-3.2-1B-Q4_K_M
+weights.bin drops **2364 MB → 1746 MB (-26%)** on disk and in memory.
+
+### Added
+
+- **`DType::Q4_K`** in the IR + **`WeightData::Q4_KRaw(Vec<u8>)`** + a
+  `get_q4k_raw` accessor.  Q4_K storage is now a first-class dtype.
+- **Scalar `dot_q4_k_q8_0` reference kernel** (`emit_q4_k_kernel`) — emits
+  `get_scale_min_k4` + the per-super-block dequant-and-dot loop into the
+  generated `model.rs`.  Operates on Q4_K weight × Q8_0-quantized input.
+- **`emit_specialized_q4_k_matmul_functions`** — shape-specialized
+  `matmul_vec_q4_k_KxN` per projection shape, parallelised over output
+  rows via rayon when the weight tensor exceeds 1 MB.
+- **`load_from_file_mixed_with_target(path, Some(DType::Q4_K))`** — loader
+  routing that keeps Q4_K tensors raw and re-quantizes other K-quants
+  (Q5_K / Q6_K / Q5_0 / etc.) to Q4_K via `quantize_f32_to_q4_k`.  For
+  Q4_K_M files the Q6_K `ffn_down` / `attn_v` per-layer tensors land on
+  the Q4_K kernel path alongside the natively-Q4_K projections.
+- **`quantize_f32_to_q4_k`** in `forgellm_frontend::weight_loader` — simple
+  affine quantizer (per-32-element sub-block (min, max) → 6-bit scale/min;
+  super-block d / dmin = absmax/63, signed).  Round-trip max error ≤ 0.05
+  on smooth ramps.  Coarser than ggml's iterative `make_qkx2_quants`.
+- **`detect_gguf_dtype`** now recognizes a Q4_K-majority projection set
+  and returns `DType::Q4_K`; lm_head still reports `DType::Q8_0` for the
+  Q6_K output tensor via `detect_gguf_lm_head_dtype` (per-tensor split
+  shipped in v0.9.1 carries the load).
+- **Codegen dispatch**: `is_q4k` branches added to `forward()` and
+  `forward_prefill()` for q/k/v projections, o_proj, gate/up, down, and
+  lm_head.  `generate_main` / `generate_main_embedded` compute Q4_K row
+  byte sizes (144 bytes per 256 elements) for the binary loader.
+- **Unit tests** (`weight_loader`):
+  - `dot_q4_k_q8_0_matches_f32_reference_uniform_block` and
+    `_varied_block` — verify the kernel matches the f32-dequant reference
+    within 1% on synthetic super-blocks.
+  - `quantize_f32_to_q4_k_round_trip_smooth` and `_zero_block` — round-trip
+    bounds on the new quantizer.
+
+### Validated
+
+- Compile path: `forge compile --target cpu` on
+  `Llama-3.2-1B-Instruct-Q4_K_M.gguf` (mixed Q4_K + Q6_K) succeeds and
+  emits Q4_K kernels.
+- Run path: generated binary loads, runs, and produces coherent output:
+  `> Q: What is 2+2? A: 4 B: The answer to ...` (correct first token).
+- Binary size: 1746 MB vs 2364 MB on v0.9.1 (-26%).
+
+### Known limitations (tracked for v0.9.3+)
+
+- **Decode tok/s regresses against the Q8_0 path** on AArch64.  v0.9.1
+  Q8_0 hits 47.7 tok/s on Llama-3.2-1B-Q4_K_M decode; v0.9.2 Q4_K hits
+  ~26.6 tok/s.  The bandwidth saving from reading 144 bytes/superblock
+  instead of 272 is real, but the scalar Rust loop is no match for the
+  NEON `sdot`-based Q4_0/Q8_0 kernels.  A NEON Q4_K implementation
+  (vand/ushr nibble unpack + sdot, per-sub-block scale FMA) is the next
+  step.  Set `forge compile` against a Q8_0 GGUF for now if decode
+  throughput matters more than binary size.
+- **Output quality is slightly noisier** than the Q8_0 path on the same
+  GGUF — `quantize_f32_to_q4_k` uses naive per-sub-block (min, max)
+  rounding rather than ggml's iterative `make_qkx2_quants`.  Coherent on
+  short prompts; long generations hallucinate more.  Replacing the
+  quantizer with the iterative variant is a separate follow-up.
+- **No batched prefill** for Q4_K yet (`forward_prefill_batched` only
+  emitted for Q8_0 / Q4_0).  Q4_K models use the per-token prefill path,
+  which is fine at short contexts but loses to the v0.8.x batched
+  matmul wins at long ones.
+
+### Not changed
+
+- Q8_0-target compiles (the default and recommended path for production
+  decode throughput) are byte-for-byte identical to v0.9.1.
+- Q4_0-target compiles unchanged.
+
 ## [0.9.1] — 2026-04-24 — Infra: per-tensor lm_head dtype dispatch
 
 Infrastructure release.  No user-visible perf or correctness change on any

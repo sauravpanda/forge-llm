@@ -90,19 +90,44 @@ impl ModelWeightsRaw {
     }
 }
 
-/// Load all tensors from a GGUF file with mixed storage:
-/// - Q8_0 tensors are kept as raw bytes (`WeightData::Q8_0Raw`)
-/// - Q4_0 tensors are kept as raw bytes (`WeightData::Q4_0Raw`)
-/// - All other tensor types are dequantized to f32 (`WeightData::F32`)
+/// Load all tensors from a GGUF file with mixed storage.  See
+/// `load_from_file_mixed_with_target` for the full behaviour; this entry
+/// point selects the default Q8_0 routing for non-native K-quants.
 pub fn load_from_file_mixed(
     path: impl AsRef<std::path::Path>,
 ) -> Result<(crate::gguf::GGUFFile, ModelWeightsRaw), WeightLoadError> {
+    load_from_file_mixed_with_target(path, None)
+}
+
+/// Load all tensors from a GGUF file with mixed storage and an optional
+/// target dtype hint.
+///
+/// Native paths (always):
+/// - Q8_0 tensors are kept as raw bytes (`WeightData::Q8_0Raw`).
+/// - Q4_0 tensors are kept as raw bytes (`WeightData::Q4_0Raw`).
+/// - F32 / F16 / BF16 are dequantized to f32 (`WeightData::F32`).
+///
+/// Other quantized formats are re-quantized to a single uniform target so
+/// the codegen sees a consistent layout per projection tensor:
+/// - `target_dtype = None` or `Some(DType::Q8_0)` (default): dequant → Q8_0
+///   for everything else.  Mixed Q4_K_M files (Q4_K + Q6_K per layer) all
+///   land on the Q8_0 code path.
+/// - `target_dtype = Some(DType::Q4_K)`: Q4_K stays raw (`Q4_KRaw`); other
+///   K-quants (Q5_K, Q6_K, Q5_0/1, ...) dequant → Q4_K via
+///   `quantize_f32_to_q4_k` so the whole model fits the Q4_K kernel.
+pub fn load_from_file_mixed_with_target(
+    path: impl AsRef<std::path::Path>,
+    target_dtype: Option<crate::ir::DType>,
+) -> Result<(crate::gguf::GGUFFile, ModelWeightsRaw), WeightLoadError> {
+    use crate::ir::DType;
     let file = std::fs::File::open(path.as_ref())?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
     let mut cursor = std::io::Cursor::new(&mmap[..]);
 
     let gguf = crate::gguf::parse(&mut cursor)
         .map_err(|e| WeightLoadError::Io(std::io::Error::other(e)))?;
+
+    let want_q4k = target_dtype == Some(DType::Q4_K);
 
     let mut tensors = HashMap::with_capacity(gguf.tensors.len());
     for tensor_info in &gguf.tensors {
@@ -130,13 +155,15 @@ pub fn load_from_file_mixed(
                 let f32_data = dequantize(raw, tensor_info.ggml_type, numel)?;
                 WeightData::F32(f32_data)
             }
-            // Quantized formats without native ForgeLLM kernels (K-quants and
-            // friends).  Dequantize → re-quantize to Q8_0 to feed the existing
-            // Q8_0 code path.  Uniform target is required so mixed Q4_K_M files
-            // (Q4_K + Q6_K per layer) end up with byte-compatible projections
-            // and can share a single codegen kernel family.  Native Q4_K /
-            // Q6_K kernels with per-tensor dispatch are tracked for a future
-            // release (see v0.9.1 lm_head_dtype plumbing for the scaffolding).
+            // Q4_K target: keep Q4_K raw; requant other K-quants to Q4_K.
+            GGMLType::Q4K if want_q4k => WeightData::Q4_KRaw(raw.to_vec()),
+            _ if want_q4k && numel.is_multiple_of(256) => {
+                // Other quantized format under a Q4_K target — requant via f32.
+                let f32_data = dequantize(raw, tensor_info.ggml_type, numel)?;
+                WeightData::Q4_KRaw(quantize_f32_to_q4_k(&f32_data))
+            }
+            // Default (Q8_0) target, or Q4_K target with non-multiple-of-256
+            // numel: dequant → Q8_0 for everything else.
             _ => {
                 let f32_data = dequantize(raw, tensor_info.ggml_type, numel)?;
                 WeightData::Q8_0Raw(quantize_f32_to_q8_0(&f32_data))
@@ -682,6 +709,14 @@ pub fn load_tensor_by_name<R: Read + Seek>(
 ///
 /// `raw`: raw Q8_0 bytes (34 bytes/block: 2-byte f16 scale + 32 int8 values)
 /// `numel`: total number of elements
+/// Dequantize raw Q4_K bytes (144 bytes per 256-element super-block) back
+/// to f32.  Used by the export-weights path when an embedding tensor is
+/// stored as Q4_K in memory but needs to be written as flat f32 in the
+/// final weight file.
+pub fn dequantize_q4_k_to_f32(raw: &[u8], numel: usize) -> Vec<f32> {
+    dequant_q4_k(raw, numel)
+}
+
 pub fn dequantize_q8_0_to_f32(raw: &[u8], numel: usize) -> Vec<f32> {
     dequant_q8_0(raw, numel)
 }

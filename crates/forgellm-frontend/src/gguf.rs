@@ -167,17 +167,18 @@ impl GGMLType {
             GGMLType::F16 => DType::F16,
             GGMLType::BF16 => DType::BF16,
             GGMLType::Q4_0 => DType::Q4_0,
-            // Everything else quantized → Q8_0 post-load (re-quantized by
-            // weight_loader).  K-quants all go to Q8_0 even for Q4_K to keep
-            // Q4_K_M files (which mix Q4_K projections with Q6_K outputs) on a
-            // single uniform codegen path.  Native Q4_K kernels would require
-            // per-tensor dispatch, which is scaffolded in v0.9.1 via
-            // `ModelConfig::lm_head_dtype` but not yet plumbed for projections.
+            // Q4_K natively maps to DType::Q4_K — the loader keeps it as raw
+            // 144-byte super-blocks when the target dtype is Q4_K.  Codegen
+            // emits the native Q4_K kernel family for it.
+            GGMLType::Q4K => DType::Q4_K,
+            // Everything else quantized → Q8_0 post-load (re-quantized by the
+            // weight loader).  In a Q4_K-target build, Q5_K / Q6_K / Q5_0 /
+            // etc. are re-quantized to Q4_K instead, so a "majority Q4_K"
+            // GGUF compiles uniformly through the Q4_K path.
             GGMLType::Q8_0
             | GGMLType::Q8_1
             | GGMLType::Q8K
             | GGMLType::Q4_1
-            | GGMLType::Q4K
             | GGMLType::IQ4NL
             | GGMLType::IQ4XS
             | GGMLType::Q5_0
@@ -698,9 +699,11 @@ mod tests {
         assert_eq!(GGMLType::BF16.to_dtype(), DType::BF16);
         assert_eq!(GGMLType::Q4_0.to_dtype(), DType::Q4_0);
         assert_eq!(GGMLType::Q8_0.to_dtype(), DType::Q8_0);
-        // K-quants are all re-quantized to Q8_0 on load so mixed Q4_K_M files
-        // (Q4_K projections + Q6_K output) share a uniform codegen path.
-        assert_eq!(GGMLType::Q4K.to_dtype(), DType::Q8_0);
+        // Q4_K maps natively to DType::Q4_K; under a Q4_K-target build the
+        // loader keeps it as raw super-blocks for the native kernel.
+        assert_eq!(GGMLType::Q4K.to_dtype(), DType::Q4_K);
+        // Higher-precision K-quants go to Q8_0 by default (or are
+        // requantized to Q4_K under a Q4_K target — that's a loader concern).
         assert_eq!(GGMLType::Q5K.to_dtype(), DType::Q8_0);
         assert_eq!(GGMLType::Q6K.to_dtype(), DType::Q8_0);
         assert_eq!(GGMLType::Q3K.to_dtype(), DType::Q8_0);

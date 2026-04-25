@@ -31,6 +31,7 @@ pub fn generate(graph: &Graph) -> Result<String, CodegenError> {
     let lm_dtype = config.lm_head_dtype.unwrap_or(config.dtype);
     let needs_q8 = config.dtype == DType::Q8_0 || lm_dtype == DType::Q8_0;
     let needs_q4 = config.dtype == DType::Q4_0 || lm_dtype == DType::Q4_0;
+    let needs_q4k = config.dtype == DType::Q4_K || lm_dtype == DType::Q4_K;
     if needs_q8 {
         emit_q8_0_kernel(&mut code)?;
         emit_q8_0_sdot_kernel(&mut code)?;
@@ -48,6 +49,23 @@ pub fn generate(graph: &Graph) -> Result<String, CodegenError> {
     if config.dtype == DType::Q4_0 {
         emit_specialized_q4_matmul_functions(&mut code, config)?;
         emit_specialized_q4_matmul_batched_functions(&mut code, config)?;
+    }
+    if needs_q4k {
+        // Q4_K reuses `f16_bits_to_f32` and `quantize_to_q8_0_blocks_into` from
+        // the Q8_0 kernel family.  Force the Q8_0 helpers to be emitted when
+        // Q4_K is the projection dtype but Q8_0 isn't otherwise active.
+        let need_q8_helpers_for_q4k = !needs_q8 && !needs_q4;
+        if need_q8_helpers_for_q4k {
+            emit_q8_0_kernel(&mut code)?;
+            emit_q8_0_sdot_kernel(&mut code)?;
+        }
+        emit_q4_k_kernel(
+            &mut code,
+            /* skip_shared_helpers= */ needs_q8 || needs_q4 || need_q8_helpers_for_q4k,
+        )?;
+    }
+    if config.dtype == DType::Q4_K {
+        emit_specialized_q4_k_matmul_functions(&mut code, config)?;
     }
     emit_specialized_matmul_functions(&mut code, config)?;
     emit_forward_function(&mut code, graph, config)?;
@@ -2864,6 +2882,216 @@ fn emit_specialized_q4_matmul_functions(
     Ok(())
 }
 
+/// Emit the Q4_K × Q8_0 dot kernel and the K-quant scale-min unpacker.
+///
+/// Q4_K layout (256-element super-blocks, 144 bytes each):
+///   [0..2]    d  — f16 super-block scale
+///   [2..4]    dmin — f16 super-block min
+///   [4..16]   12 bytes packing 8 sub-block (6-bit scale, 6-bit min) pairs
+///   [16..144] 128 bytes packing 256 × 4-bit unsigned weights
+///
+/// Dequant per 32-element sub-block j:
+///   w[i] = d * sub_scale[j] * q[i] - dmin * sub_min[j]
+///
+/// The kernel takes pre-quantized Q8_0 input (one 32-element block per Q4_K
+/// sub-block, eight blocks per super-block).  Per sub-block it computes two
+/// reductions on int8 input × 4-bit weight: the dot `Σ x_q * q4` and the
+/// plain sum `Σ x_q`, then combines with the f32 scale/min coefficients.
+///
+/// `skip_shared_helpers` controls whether `f16_bits_to_f32` is emitted; the
+/// Q8_0 / Q4_0 kernels also emit it, so we skip when those are present.
+fn emit_q4_k_kernel(code: &mut String, skip_shared_helpers: bool) -> Result<(), CodegenError> {
+    if !skip_shared_helpers {
+        code.push_str(
+            r#"
+/// Convert IEEE 754 half-precision (f16) bit pattern to f32.
+#[inline]
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exponent = ((bits >> 10) & 0x1F) as u32;
+    let mantissa = (bits & 0x3FF) as u32;
+    if exponent == 0 {
+        if mantissa == 0 { return f32::from_bits(sign << 31); }
+        let mut m = mantissa;
+        let mut e: i32 = -14;
+        while m & 0x400 == 0 { m <<= 1; e -= 1; }
+        m &= 0x3FF;
+        let f32_exp = ((e + 127) as u32) & 0xFF;
+        return f32::from_bits((sign << 31) | (f32_exp << 23) | (m << 13));
+    }
+    if exponent == 31 {
+        return f32::from_bits((sign << 31) | (0xFF << 23) | (mantissa << 13));
+    }
+    let f32_exp = (exponent as i32 - 15 + 127) as u32;
+    f32::from_bits((sign << 31) | (f32_exp << 23) | (mantissa << 13))
+}
+"#,
+        );
+    }
+    code.push_str(
+        r#"
+// --- Q4_K × Q8_0 dot product (256-element super-block, scalar reference) ---
+
+/// Unpack the (scale, min) pair for sub-block j (0..8) from the 12-byte
+/// packed scales blob of a Q4_K super-block.  Matches GGML reference.
+#[inline]
+fn get_scale_min_k4(j: usize, scales: &[u8]) -> (u8, u8) {
+    if j < 4 {
+        (scales[j] & 63, scales[j + 4] & 63)
+    } else {
+        let sc = (scales[j + 4] & 0x0F) | ((scales[j - 4] >> 6) << 4);
+        let m = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+        (sc, m)
+    }
+}
+
+/// Dot product of a Q4_K weight row and a Q8_0-quantized input row,
+/// both of length `k` (must be a multiple of 256).
+///
+/// `weight_q4k`: 144 bytes per 256-element super-block.
+/// `input_q8`:    34 bytes per 32-element block (eight per super-block).
+#[inline]
+fn dot_q4_k_q8_0(weight_q4k: &[u8], input_q8: &[u8], k: usize) -> f32 {
+    const Q4K_BLOCK: usize = 256;
+    const Q4K_BYTES: usize = 144;
+    const Q8_BYTES: usize = 34;
+    let num_sb = k / Q4K_BLOCK;
+    let mut acc = 0.0f32;
+    for sb in 0..num_sb {
+        let wb = sb * Q4K_BYTES;
+        let d_bits = u16::from_le_bytes([weight_q4k[wb], weight_q4k[wb + 1]]);
+        let dmin_bits = u16::from_le_bytes([weight_q4k[wb + 2], weight_q4k[wb + 3]]);
+        let d = f16_bits_to_f32(d_bits);
+        let dmin = f16_bits_to_f32(dmin_bits);
+        let scales = &weight_q4k[wb + 4..wb + 16];
+        let qs = &weight_q4k[wb + 16..wb + 144];
+        let x_block_base = sb * 8 * Q8_BYTES;
+        for chunk in 0..4 {
+            let is = chunk * 2;
+            let (sc1, m1) = get_scale_min_k4(is, scales);
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+            let d1_w = d * sc1 as f32;
+            let m1_w = dmin * m1 as f32;
+            let d2_w = d * sc2 as f32;
+            let m2_w = dmin * m2 as f32;
+            let qs_chunk = &qs[chunk * 32..(chunk + 1) * 32];
+            // Sub-block (low nibbles).
+            let x1_off = x_block_base + is * Q8_BYTES;
+            let x1_scale = f16_bits_to_f32(u16::from_le_bytes([
+                input_q8[x1_off],
+                input_q8[x1_off + 1],
+            ]));
+            let x1_i8 = &input_q8[x1_off + 2..x1_off + 34];
+            let mut dot1 = 0i32;
+            let mut sum1 = 0i32;
+            for i in 0..32 {
+                let q4 = (qs_chunk[i] & 0x0F) as i32;
+                let xi = x1_i8[i] as i8 as i32;
+                dot1 += xi * q4;
+                sum1 += xi;
+            }
+            acc += x1_scale * (d1_w * dot1 as f32 - m1_w * sum1 as f32);
+            // Sub-block (high nibbles).
+            let x2_off = x_block_base + (is + 1) * Q8_BYTES;
+            let x2_scale = f16_bits_to_f32(u16::from_le_bytes([
+                input_q8[x2_off],
+                input_q8[x2_off + 1],
+            ]));
+            let x2_i8 = &input_q8[x2_off + 2..x2_off + 34];
+            let mut dot2 = 0i32;
+            let mut sum2 = 0i32;
+            for i in 0..32 {
+                let q4 = (qs_chunk[i] >> 4) as i32;
+                let xi = x2_i8[i] as i8 as i32;
+                dot2 += xi * q4;
+                sum2 += xi;
+            }
+            acc += x2_scale * (d2_w * dot2 as f32 - m2_w * sum2 as f32);
+        }
+    }
+    acc
+}
+
+"#,
+    );
+    Ok(())
+}
+
+/// Q4_K matmul shapes — same set as Q4_0 / Q8_0, but constrained to those
+/// where `k` is a multiple of 256 (Q4_K super-block size).  Tensors with a
+/// non-multiple `k` (rare — typically only norm-sized buffers) fall back to
+/// the Q8_0 path on load.
+fn q4_k_matmul_shapes(config: &ModelConfig) -> Vec<(usize, usize)> {
+    matmul_shapes(config)
+        .into_iter()
+        .filter(|(k, _)| k.is_multiple_of(256))
+        .collect()
+}
+
+/// Emit shape-specialized Q4_K matmul functions: `matmul_vec_q4_k_KxN`.
+///
+/// Each output row is a single `dot_q4_k_q8_0` call.  No row-batched
+/// variants yet — the bandwidth win comes from reading 144 instead of 272
+/// bytes per super-block of weights, not from extra row parallelism.
+fn emit_specialized_q4_k_matmul_functions(
+    code: &mut String,
+    config: &ModelConfig,
+) -> Result<(), CodegenError> {
+    writeln!(
+        code,
+        "// --- Shape-specialized Q4_K matmul functions (m=1, weight is &[u8]) ---"
+    )?;
+    writeln!(code)?;
+
+    // Parallelize when total weight bytes > 1 MB.  Q4_K row size = ceil(k/256)*144.
+    let par_byte_threshold: usize = 1_000_000;
+
+    for &(k, n) in &q4_k_matmul_shapes(config) {
+        let row_bytes = k.div_ceil(256) * 144;
+        let q8_bytes = k.div_ceil(32) * 34;
+        writeln!(
+            code,
+            "/// Q4_K matmul: [1, {k}] x [{n}, {k}]^T -> [1, {n}] (weight stored as raw Q4_K bytes)"
+        )?;
+        writeln!(code, "#[inline]")?;
+        writeln!(
+            code,
+            "fn matmul_vec_q4_k_{k}x{n}(output: &mut [f32; {n}], input: &[f32; {k}], weight: &[u8]) {{"
+        )?;
+        writeln!(code, "    let mut input_q8 = vec![0u8; {q8_bytes}];")?;
+        writeln!(
+            code,
+            "    quantize_to_q8_0_blocks_into(&input[..], &mut input_q8);"
+        )?;
+        if n * row_bytes >= par_byte_threshold {
+            writeln!(
+                code,
+                "    output.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
+            )?;
+            writeln!(code, "        let base = chunk_idx * 256;")?;
+            writeln!(code, "        for r in 0..out.len() {{")?;
+            writeln!(code, "            let j = base + r;")?;
+            writeln!(
+                code,
+                "            out[r] = dot_q4_k_q8_0(&weight[j*{row_bytes}..(j+1)*{row_bytes}], &input_q8, {k});"
+            )?;
+            writeln!(code, "        }}")?;
+            writeln!(code, "    }});")?;
+        } else {
+            writeln!(code, "    for j in 0..{n} {{")?;
+            writeln!(
+                code,
+                "        output[j] = dot_q4_k_q8_0(&weight[j*{row_bytes}..(j+1)*{row_bytes}], &input_q8, {k});"
+            )?;
+            writeln!(code, "    }}")?;
+        }
+        writeln!(code, "}}")?;
+        writeln!(code)?;
+    }
+
+    Ok(())
+}
+
 /// Emit shape-specialized Q4_0 *batched* matmul functions:
 /// `matmul_mat_q4_0_KxN(output, m, input, weight)`.
 ///
@@ -3040,19 +3268,21 @@ fn emit_forward_function(
 
     let is_q8 = config.dtype == DType::Q8_0;
     let is_q4 = config.dtype == DType::Q4_0;
+    let is_q4k = config.dtype == DType::Q4_K;
     // lm_head may use a different storage dtype than projections — Q4_K_M GGUF
-    // files, for instance, store projections as Q4_K (→ Q4_0 post-load) but
-    // `output.weight` as Q6_K (→ Q8_0).  Generate the correct kernel for each.
+    // files, for instance, store projections as Q4_K but `output.weight` as
+    // Q6_K (→ Q8_0).  Generate the correct kernel for each.
     let lm_dtype = config.lm_head_dtype.unwrap_or(config.dtype);
     let lm_is_q8 = lm_dtype == DType::Q8_0;
     let lm_is_q4 = lm_dtype == DType::Q4_0;
+    let lm_is_q4k = lm_dtype == DType::Q4_K;
     // Projection weight type: raw bytes for quantized models, f32 otherwise
-    let proj_type = if is_q8 || is_q4 {
+    let proj_type = if is_q8 || is_q4 || is_q4k {
         "Vec<u8>"
     } else {
         "Vec<f32>"
     };
-    let lm_head_type = if lm_is_q8 || lm_is_q4 {
+    let lm_head_type = if lm_is_q8 || lm_is_q4 || lm_is_q4k {
         "Vec<u8>"
     } else {
         "Vec<f32>"
@@ -3314,6 +3544,25 @@ fn emit_forward_function(
             hidden = hidden,
             kv_size = kv_size
         )?;
+    } else if is_q4k {
+        writeln!(
+            code,
+            "        matmul_vec_q4_k_{hidden}x{qk_size}(&mut q, &normed, &lw.q_proj);",
+            hidden = hidden,
+            qk_size = qk_size
+        )?;
+        writeln!(
+            code,
+            "        matmul_vec_q4_k_{hidden}x{kv_size}(&mut k, &normed, &lw.k_proj);",
+            hidden = hidden,
+            kv_size = kv_size
+        )?;
+        writeln!(
+            code,
+            "        matmul_vec_q4_k_{hidden}x{kv_size}(&mut v, &normed, &lw.v_proj);",
+            hidden = hidden,
+            kv_size = kv_size
+        )?;
     } else {
         writeln!(
             code,
@@ -3452,6 +3701,13 @@ fn emit_forward_function(
             qk_size = qk_size,
             hidden = hidden
         )?;
+    } else if is_q4k {
+        writeln!(
+            code,
+            "        matmul_vec_q4_k_{qk_size}x{hidden}(&mut attn_proj, &attn_out, &lw.o_proj);",
+            qk_size = qk_size,
+            hidden = hidden
+        )?;
     } else {
         writeln!(
             code,
@@ -3498,6 +3754,19 @@ fn emit_forward_function(
             hidden = hidden,
             intermediate = intermediate
         )?;
+    } else if is_q4k {
+        writeln!(
+            code,
+            "        matmul_vec_q4_k_{hidden}x{intermediate}(&mut gate, &normed, &lw.gate_proj);",
+            hidden = hidden,
+            intermediate = intermediate
+        )?;
+        writeln!(
+            code,
+            "        matmul_vec_q4_k_{hidden}x{intermediate}(&mut up, &normed, &lw.up_proj);",
+            hidden = hidden,
+            intermediate = intermediate
+        )?;
     } else {
         writeln!(
             code,
@@ -3523,6 +3792,12 @@ fn emit_forward_function(
         writeln!(
             code,
             "        matmul_vec_q4_0_{intermediate}x{hidden}(&mut ffn_out, &ffn_hidden, &lw.down_proj);",
+            intermediate = intermediate, hidden = hidden
+        )?;
+    } else if is_q4k {
+        writeln!(
+            code,
+            "        matmul_vec_q4_k_{intermediate}x{hidden}(&mut ffn_out, &ffn_hidden, &lw.down_proj);",
             intermediate = intermediate, hidden = hidden
         )?;
     } else {
@@ -3659,6 +3934,30 @@ fn emit_forward_function(
         )?;
         writeln!(code, "        }}")?;
         writeln!(code, "    }});")?;
+    } else if lm_is_q4k {
+        let lm_row_bytes = hidden.div_ceil(256) * 144;
+        let q8_bytes = hidden.div_ceil(32) * 34;
+        writeln!(
+            code,
+            "    let mut normed_q8 = vec![0u8; {q8_bytes}];"
+        )?;
+        writeln!(
+            code,
+            "    quantize_to_q8_0_blocks_into(&normed[..], &mut normed_q8);"
+        )?;
+        writeln!(
+            code,
+            "    logits.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
+        )?;
+        writeln!(code, "        let base = chunk_idx * 256;")?;
+        writeln!(code, "        for r in 0..out.len() {{")?;
+        writeln!(code, "            let j = base + r;")?;
+        writeln!(
+            code,
+            "            out[r] = dot_q4_k_q8_0(&weights.lm_head[j*{lm_row_bytes}..(j+1)*{lm_row_bytes}], &normed_q8, {hidden});"
+        )?;
+        writeln!(code, "        }}")?;
+        writeln!(code, "    }});")?;
     } else {
         // f32 logits path: use cblas_sgemv on macOS for AMX acceleration,
         // fall back to parallel dot_f32 on other platforms.
@@ -3726,10 +4025,12 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
 
     let is_q8 = config.dtype == DType::Q8_0;
     let is_q4 = config.dtype == DType::Q4_0;
+    let is_q4k = config.dtype == DType::Q4_K;
     // lm_head may use a different dtype than projections (see emit_forward_function).
     let lm_dtype = config.lm_head_dtype.unwrap_or(config.dtype);
     let lm_is_q8 = lm_dtype == DType::Q8_0;
     let lm_is_q4 = lm_dtype == DType::Q4_0;
+    let lm_is_q4k = lm_dtype == DType::Q4_K;
 
     writeln!(code)?;
     writeln!(code, "/// Process a prompt sequence and fill the KV cache.")?;
@@ -3875,6 +4176,25 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
             hidden = hidden,
             kv_size = kv_size
         )?;
+    } else if is_q4k {
+        writeln!(
+            code,
+            "            matmul_vec_q4_k_{hidden}x{qk_size}(&mut q, &normed, &lw.q_proj);",
+            hidden = hidden,
+            qk_size = qk_size
+        )?;
+        writeln!(
+            code,
+            "            matmul_vec_q4_k_{hidden}x{kv_size}(&mut k, &normed, &lw.k_proj);",
+            hidden = hidden,
+            kv_size = kv_size
+        )?;
+        writeln!(
+            code,
+            "            matmul_vec_q4_k_{hidden}x{kv_size}(&mut v, &normed, &lw.v_proj);",
+            hidden = hidden,
+            kv_size = kv_size
+        )?;
     } else {
         writeln!(
             code,
@@ -3986,6 +4306,13 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
             qk_size = qk_size,
             hidden = hidden
         )?;
+    } else if is_q4k {
+        writeln!(
+            code,
+            "            matmul_vec_q4_k_{qk_size}x{hidden}(&mut attn_proj, &attn_out, &lw.o_proj);",
+            qk_size = qk_size,
+            hidden = hidden
+        )?;
     } else {
         writeln!(
             code,
@@ -4032,6 +4359,19 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
             hidden = hidden,
             intermediate = intermediate
         )?;
+    } else if is_q4k {
+        writeln!(
+            code,
+            "            matmul_vec_q4_k_{hidden}x{intermediate}(&mut gate, &normed, &lw.gate_proj);",
+            hidden = hidden,
+            intermediate = intermediate
+        )?;
+        writeln!(
+            code,
+            "            matmul_vec_q4_k_{hidden}x{intermediate}(&mut up, &normed, &lw.up_proj);",
+            hidden = hidden,
+            intermediate = intermediate
+        )?;
     } else {
         writeln!(
             code,
@@ -4058,6 +4398,13 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
         writeln!(
             code,
             "            matmul_vec_q4_0_{intermediate}x{hidden}(&mut ffn_out, &ffn_hidden, &lw.down_proj);",
+            intermediate = intermediate,
+            hidden = hidden
+        )?;
+    } else if is_q4k {
+        writeln!(
+            code,
+            "            matmul_vec_q4_k_{intermediate}x{hidden}(&mut ffn_out, &ffn_hidden, &lw.down_proj);",
             intermediate = intermediate,
             hidden = hidden
         )?;
@@ -4203,6 +4550,30 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
         writeln!(
             code,
             "                    out[r] = dot_q4_0(&normed[..], &weights.lm_head[j*{lm_row_bytes}..(j+1)*{lm_row_bytes}], {hidden});"
+        )?;
+        writeln!(code, "                }}")?;
+        writeln!(code, "            }});")?;
+    } else if lm_is_q4k {
+        let lm_row_bytes = hidden.div_ceil(256) * 144;
+        let q8_bytes = hidden.div_ceil(32) * 34;
+        writeln!(
+            code,
+            "            let mut normed_q8 = vec![0u8; {q8_bytes}];"
+        )?;
+        writeln!(
+            code,
+            "            quantize_to_q8_0_blocks_into(&normed[..], &mut normed_q8);"
+        )?;
+        writeln!(
+            code,
+            "            last_logits.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
+        )?;
+        writeln!(code, "                let base = chunk_idx * 256;")?;
+        writeln!(code, "                for r in 0..out.len() {{")?;
+        writeln!(code, "                    let j = base + r;")?;
+        writeln!(
+            code,
+            "                    out[r] = dot_q4_k_q8_0(&weights.lm_head[j*{lm_row_bytes}..(j+1)*{lm_row_bytes}], &normed_q8, {hidden});"
         )?;
         writeln!(code, "                }}")?;
         writeln!(code, "            }});")?;

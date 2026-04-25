@@ -171,48 +171,46 @@ fn generate_main(config: &ModelConfig) -> String {
     let kv_size = num_kv_heads * head_dim;
     let is_q8 = config.dtype == DType::Q8_0;
     let is_q4 = config.dtype == DType::Q4_0;
+    let is_q4k = config.dtype == DType::Q4_K;
     // lm_head may use a different dtype than projections — compute its byte
-    // size separately (Q4_K_M → Q4_0 proj + Q8_0 lm_head is the common case).
+    // size separately (Q4_K_M → Q4_K proj + Q8_0 lm_head is the common case).
     let lm_dtype = config.lm_head_dtype.unwrap_or(config.dtype);
     let lm_is_q8 = lm_dtype == DType::Q8_0;
-    let _lm_is_q4 = lm_dtype == DType::Q4_0;
+    let lm_is_q4k = lm_dtype == DType::Q4_K;
 
-    // Pre-compute Q8_0 row byte sizes (ceil(numel/32)*34 per row)
+    // Pre-compute row byte sizes per dtype.
     let q8_row_bytes = |numel: usize| -> usize { numel.div_ceil(32) * 34 };
-    // Pre-compute Q4_0 row byte sizes (ceil(numel/32)*18 per row)
     let q4_row_bytes = |numel: usize| -> usize { numel.div_ceil(32) * 18 };
+    // Q4_K: 144 bytes per 256-element super-block.
+    let q4k_row_bytes = |numel: usize| -> usize { numel.div_ceil(256) * 144 };
 
-    // Byte sizes for projection weight tensors (Q8_0 or Q4_0, based on config.dtype).
-    let (qp_bytes, kp_bytes, vp_bytes, op_bytes, gp_bytes, up_bytes, dp_bytes) = if is_q8 {
-        (
-            qk_size * q8_row_bytes(hidden),
-            kv_size * q8_row_bytes(hidden),
-            kv_size * q8_row_bytes(hidden),
-            hidden * q8_row_bytes(qk_size),
-            inter * q8_row_bytes(hidden),
-            inter * q8_row_bytes(hidden),
-            hidden * q8_row_bytes(inter),
-        )
+    // Byte sizes for projection weight tensors (Q8_0 / Q4_0 / Q4_K).
+    let proj_row_bytes: fn(usize) -> usize = if is_q4k {
+        |n| n.div_ceil(256) * 144
+    } else if is_q8 {
+        |n| n.div_ceil(32) * 34
     } else {
-        // Q4_0 sizes (also used as placeholder for non-quantized, unused)
-        (
-            qk_size * q4_row_bytes(hidden),
-            kv_size * q4_row_bytes(hidden),
-            kv_size * q4_row_bytes(hidden),
-            hidden * q4_row_bytes(qk_size),
-            inter * q4_row_bytes(hidden),
-            inter * q4_row_bytes(hidden),
-            hidden * q4_row_bytes(inter),
-        )
+        |n| n.div_ceil(32) * 18
     };
+    let (qp_bytes, kp_bytes, vp_bytes, op_bytes, gp_bytes, up_bytes, dp_bytes) = (
+        qk_size * proj_row_bytes(hidden),
+        kv_size * proj_row_bytes(hidden),
+        kv_size * proj_row_bytes(hidden),
+        hidden * proj_row_bytes(qk_size),
+        inter * proj_row_bytes(hidden),
+        inter * proj_row_bytes(hidden),
+        hidden * proj_row_bytes(inter),
+    );
     // lm_head byte size depends on lm_head_dtype, not projection dtype.
     let lmh_bytes = if lm_is_q8 {
         vocab * q8_row_bytes(hidden)
+    } else if lm_is_q4k {
+        vocab * q4k_row_bytes(hidden)
     } else {
         vocab * q4_row_bytes(hidden)
     };
 
-    let weight_loading_code = if is_q8 || is_q4 {
+    let weight_loading_code = if is_q8 || is_q4 || is_q4k {
         // Quantized: load raw bytes; norm/embed are still f32
         r##"fn load_weights_raw(path: &str) -> Vec<u8> {
     let file = std::fs::File::open(path).expect("failed to open weights");
@@ -242,9 +240,15 @@ fn generate_main(config: &ModelConfig) -> String {
         .to_string()
     };
 
-    let weight_slice_code = if is_q8 || is_q4 {
+    let weight_slice_code = if is_q8 || is_q4 || is_q4k {
         // Quantized: byte offsets for projection weights, f32 element offsets for norm/embed
-        let quant_label = if is_q8 { "Q8_0" } else { "Q4_0" };
+        let quant_label = if is_q8 {
+            "Q8_0"
+        } else if is_q4k {
+            "Q4_K"
+        } else {
+            "Q4_0"
+        };
 
         // Qwen2 QKV bias (F32) — read from weights.bin when enabled. Each bias
         // tensor has `num_heads * head_dim` (Q) or `num_kv_heads * head_dim` (K/V)
@@ -689,39 +693,39 @@ fn generate_main_embedded(config: &ModelConfig) -> String {
     let kv_size = num_kv_heads * head_dim;
     let is_q8 = config.dtype == DType::Q8_0;
     let is_q4 = config.dtype == DType::Q4_0;
+    let is_q4k = config.dtype == DType::Q4_K;
     let lm_dtype = config.lm_head_dtype.unwrap_or(config.dtype);
     let lm_is_q8 = lm_dtype == DType::Q8_0;
+    let lm_is_q4k = lm_dtype == DType::Q4_K;
 
     let q8_row_bytes = |numel: usize| -> usize { numel.div_ceil(32) * 34 };
     let q4_row_bytes = |numel: usize| -> usize { numel.div_ceil(32) * 18 };
-    let (qp_bytes, kp_bytes, vp_bytes, op_bytes, gp_bytes, up_bytes, dp_bytes) = if is_q8 {
-        (
-            qk_size * q8_row_bytes(hidden),
-            kv_size * q8_row_bytes(hidden),
-            kv_size * q8_row_bytes(hidden),
-            hidden * q8_row_bytes(qk_size),
-            inter * q8_row_bytes(hidden),
-            inter * q8_row_bytes(hidden),
-            hidden * q8_row_bytes(inter),
-        )
+    let q4k_row_bytes = |numel: usize| -> usize { numel.div_ceil(256) * 144 };
+    let proj_row_bytes: fn(usize) -> usize = if is_q4k {
+        |n| n.div_ceil(256) * 144
+    } else if is_q8 {
+        |n| n.div_ceil(32) * 34
     } else {
-        (
-            qk_size * q4_row_bytes(hidden),
-            kv_size * q4_row_bytes(hidden),
-            kv_size * q4_row_bytes(hidden),
-            hidden * q4_row_bytes(qk_size),
-            inter * q4_row_bytes(hidden),
-            inter * q4_row_bytes(hidden),
-            hidden * q4_row_bytes(inter),
-        )
+        |n| n.div_ceil(32) * 18
     };
+    let (qp_bytes, kp_bytes, vp_bytes, op_bytes, gp_bytes, up_bytes, dp_bytes) = (
+        qk_size * proj_row_bytes(hidden),
+        kv_size * proj_row_bytes(hidden),
+        kv_size * proj_row_bytes(hidden),
+        hidden * proj_row_bytes(qk_size),
+        inter * proj_row_bytes(hidden),
+        inter * proj_row_bytes(hidden),
+        hidden * proj_row_bytes(inter),
+    );
     let lmh_bytes = if lm_is_q8 {
         vocab * q8_row_bytes(hidden)
+    } else if lm_is_q4k {
+        vocab * q4k_row_bytes(hidden)
     } else {
         vocab * q4_row_bytes(hidden)
     };
 
-    let bytes_helper = if is_q8 || is_q4 {
+    let bytes_helper = if is_q8 || is_q4 || is_q4k {
         // For quantized models, we only need the bytes_to_f32 helper for norm/embed extraction
         r##"fn bytes_to_f32_slice(bytes: &[u8]) -> Vec<f32> {
     let n = bytes.len() / 4;
@@ -748,9 +752,15 @@ fn generate_main_embedded(config: &ModelConfig) -> String {
         .to_string()
     };
 
-    let quant_label = if is_q8 { "Q8_0" } else { "Q4_0" };
+    let quant_label = if is_q8 {
+        "Q8_0"
+    } else if is_q4k {
+        "Q4_K"
+    } else {
+        "Q4_0"
+    };
 
-    let weight_slice_code_embedded = if is_q8 || is_q4 {
+    let weight_slice_code_embedded = if is_q8 || is_q4 || is_q4k {
         format!(
             r##"    let w: &[u8] = WEIGHTS_BYTES;
     let mut boff = 0usize;
