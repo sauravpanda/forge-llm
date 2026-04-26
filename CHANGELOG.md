@@ -2,6 +2,62 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.9.4] — 2026-04-25 — Q4_K dot4 ILP: now faster than Q8_0
+
+Q4_K decode is now **faster than the Q8_0 NEON path** at 26% smaller
+binary.  The win comes from amortising the Q8_0 input load across four
+weight rows: a 32-byte input sub-block is fetched once and dotted against
+four Q4_K weight rows in parallel via `dot4_q4_k_q8_0`.  The
+`Σ x_q8` reduction (needed for the affine `dmin` correction) is also
+shared across the four rows.
+
+### Performance
+
+Llama-3.2-1B-Instruct-Q4_K_M, M5 Pro CPU, prompt = "The capital of France is":
+
+| Variant                  | Prefill tok/s | Decode tok/s | weights.bin |
+|--------------------------|--------------:|-------------:|------------:|
+| v0.9.1 (Q8_0 requant)    |          47.5 |         47.7 |     2364 MB |
+| v0.9.2 (Q4_K scalar)     |          29.7 |         26.6 |     1746 MB |
+| v0.9.3 (Q4_K NEON dot1)  |          46.6 |         41.9 |     1746 MB |
+| **v0.9.4 (Q4_K dot4)**   |      **56.8** |     **52.3** | **1746 MB** |
+
+Compared to v0.9.3: decode +25%, prefill +22%.  Compared to v0.9.1 Q8_0:
+decode +10%, prefill +20%, weights.bin -26%.
+
+### Added
+
+- **`dot4_q4_k_q8_0` (NEON)** — 4-row variant of the Q4_K × Q8_0 dot
+  product.  Per Q4_K super-block:
+  - Load Q8_0 input for both sub-blocks once (32 bytes × 2 sub-blocks).
+  - Compute `Σ x_q8` once per sub-block.
+  - For each of 4 weight rows: load 32-byte qs slice, mask/shift to two
+    int8x16 nibble vectors, run two `sdot` instructions per sub-block.
+  - Apply per-row `(d * sub_scale, dmin * sub_min)` FMAs.
+
+  Inline asm interleaves the four sdots so the issue-width is well
+  saturated; in microbench the kernel is 1.5–1.6× faster per output
+  element than four separate `dot_q4_k_q8_0` calls.
+- **`emit_specialized_q4_k_matmul_functions`** now emits a 4-row cascade
+  on aarch64 (`dot4` for groups of 4, `dot1` tail) inside both the
+  parallel and serial branches.  Non-aarch64 stays on the scalar path.
+- The Q4_K **lm_head dispatch** in both `forward()` and
+  `forward_prefill()` uses the same cascade (vocab is large, so dot4 is
+  a substantial chunk of the logits projection).
+- Codegen test
+  `dot4_q4_k_q8_0_matches_four_dot1_calls` — verifies the 4-row kernel
+  matches four scalar `dot_q4_k_q8_0` calls within fp rounding (rel err
+  < 1e-4) on a synthetic super-block batch.
+
+### Not changed
+
+- f32 → Q4_K quantizer is still simple `(min, max)`-affine — output
+  noisier than Q8_0 path on long generations.  Iterative
+  `make_qkx2_quants` port is the next quality step.
+- `forward_prefill_batched` for Q4_K still pending.  Long-context prefill
+  uses the per-token path; for this `m=1` benchmark the cascade above
+  *is* the prefill path.
+
 ## [0.9.3] — 2026-04-25 — NEON Q4_K kernel: 1.58× decode speedup
 
 The Q4_K decode regression flagged in v0.9.2 is mostly closed.  The

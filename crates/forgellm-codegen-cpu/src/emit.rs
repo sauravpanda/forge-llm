@@ -3047,6 +3047,124 @@ fn dot_q4_k_q8_0(weight_q4k: &[u8], input_q8: &[u8], k: usize) -> f32 {
     acc
 }
 
+/// 4-row variant of `dot_q4_k_q8_0`.  One Q8_0 input row × four Q4_K
+/// weight rows in parallel; input loads + `Σ x_q8` reductions are
+/// amortised across the rows.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn dot4_q4_k_q8_0(
+    w0: &[u8],
+    w1: &[u8],
+    w2: &[u8],
+    w3: &[u8],
+    input_q8: &[u8],
+    k: usize,
+) -> (f32, f32, f32, f32) {
+    use std::arch::aarch64::*;
+    const Q4K_BLOCK: usize = 256;
+    const Q4K_BYTES: usize = 144;
+    const Q8_BYTES: usize = 34;
+    let num_sb = k / Q4K_BLOCK;
+    let mut acc0 = 0.0f32;
+    let mut acc1 = 0.0f32;
+    let mut acc2 = 0.0f32;
+    let mut acc3 = 0.0f32;
+    let weights = [w0, w1, w2, w3];
+    for sb in 0..num_sb {
+        let wb = sb * Q4K_BYTES;
+        let mut d_arr = [0.0f32; 4];
+        let mut dmin_arr = [0.0f32; 4];
+        for r in 0..4 {
+            let w = weights[r];
+            let d_bits = u16::from_le_bytes([w[wb], w[wb + 1]]);
+            let dmin_bits = u16::from_le_bytes([w[wb + 2], w[wb + 3]]);
+            d_arr[r] = f16_bits_to_f32(d_bits);
+            dmin_arr[r] = f16_bits_to_f32(dmin_bits);
+        }
+        let x_block_base = sb * 8 * Q8_BYTES;
+        for chunk in 0..4 {
+            let is = chunk * 2;
+            let mut sc1_arr = [0u8; 4];
+            let mut m1_arr = [0u8; 4];
+            let mut sc2_arr = [0u8; 4];
+            let mut m2_arr = [0u8; 4];
+            for r in 0..4 {
+                let scales = &weights[r][wb + 4..wb + 16];
+                let (sc1, m1) = get_scale_min_k4(is, scales);
+                let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+                sc1_arr[r] = sc1;
+                m1_arr[r] = m1;
+                sc2_arr[r] = sc2;
+                m2_arr[r] = m2;
+            }
+            unsafe {
+                let mask = vdupq_n_u8(0x0F);
+                let x1_off = x_block_base + is * Q8_BYTES;
+                let x1_scale = f16_bits_to_f32(u16::from_le_bytes([
+                    input_q8[x1_off],
+                    input_q8[x1_off + 1],
+                ]));
+                let x1_ptr = input_q8[x1_off + 2..].as_ptr() as *const i8;
+                let x1_lo: int8x16_t = vld1q_s8(x1_ptr);
+                let x1_hi: int8x16_t = vld1q_s8(x1_ptr.add(16));
+                let sum1_v = vaddq_s16(vpaddlq_s8(x1_lo), vpaddlq_s8(x1_hi));
+                let sum1 = vaddvq_s16(sum1_v) as i32;
+                let x2_off = x_block_base + (is + 1) * Q8_BYTES;
+                let x2_scale = f16_bits_to_f32(u16::from_le_bytes([
+                    input_q8[x2_off],
+                    input_q8[x2_off + 1],
+                ]));
+                let x2_ptr = input_q8[x2_off + 2..].as_ptr() as *const i8;
+                let x2_lo: int8x16_t = vld1q_s8(x2_ptr);
+                let x2_hi: int8x16_t = vld1q_s8(x2_ptr.add(16));
+                let sum2_v = vaddq_s16(vpaddlq_s8(x2_lo), vpaddlq_s8(x2_hi));
+                let sum2 = vaddvq_s16(sum2_v) as i32;
+
+                let acc_arr = [&mut acc0, &mut acc1, &mut acc2, &mut acc3];
+                for (r, acc_ref) in acc_arr.into_iter().enumerate() {
+                    let qs_ptr = weights[r][wb + 16 + chunk * 32..].as_ptr();
+                    let qs_v0: uint8x16_t = vld1q_u8(qs_ptr);
+                    let qs_v1: uint8x16_t = vld1q_u8(qs_ptr.add(16));
+                    let q1_lo = vreinterpretq_s8_u8(vandq_u8(qs_v0, mask));
+                    let q1_hi = vreinterpretq_s8_u8(vandq_u8(qs_v1, mask));
+                    let q2_lo = vreinterpretq_s8_u8(vshrq_n_u8::<4>(qs_v0));
+                    let q2_hi = vreinterpretq_s8_u8(vshrq_n_u8::<4>(qs_v1));
+                    let mut dot1_v = vdupq_n_s32(0);
+                    let mut dot2_v = vdupq_n_s32(0);
+                    core::arch::asm!(
+                        "sdot {a1:v}.4s, {w1lo:v}.16b, {x1lo:v}.16b",
+                        "sdot {a1:v}.4s, {w1hi:v}.16b, {x1hi:v}.16b",
+                        "sdot {a2:v}.4s, {w2lo:v}.16b, {x2lo:v}.16b",
+                        "sdot {a2:v}.4s, {w2hi:v}.16b, {x2hi:v}.16b",
+                        a1 = inout(vreg) dot1_v,
+                        a2 = inout(vreg) dot2_v,
+                        w1lo = in(vreg) q1_lo,
+                        w1hi = in(vreg) q1_hi,
+                        x1lo = in(vreg) x1_lo,
+                        x1hi = in(vreg) x1_hi,
+                        w2lo = in(vreg) q2_lo,
+                        w2hi = in(vreg) q2_hi,
+                        x2lo = in(vreg) x2_lo,
+                        x2hi = in(vreg) x2_hi,
+                        options(nostack),
+                    );
+                    let dot1 = vaddvq_s32(dot1_v) as i32;
+                    let dot2 = vaddvq_s32(dot2_v) as i32;
+                    let d = d_arr[r];
+                    let dmin = dmin_arr[r];
+                    let d1_w = d * sc1_arr[r] as f32;
+                    let m1_w = dmin * m1_arr[r] as f32;
+                    let d2_w = d * sc2_arr[r] as f32;
+                    let m2_w = dmin * m2_arr[r] as f32;
+                    *acc_ref += x1_scale * (d1_w * dot1 as f32 - m1_w * sum1 as f32);
+                    *acc_ref += x2_scale * (d2_w * dot2 as f32 - m2_w * sum2 as f32);
+                }
+            }
+        }
+    }
+    (acc0, acc1, acc2, acc3)
+}
+
 /// Scalar fallback for non-aarch64 targets — same math, no SIMD.
 #[cfg(not(target_arch = "aarch64"))]
 #[inline]
@@ -3127,9 +3245,10 @@ fn q4_k_matmul_shapes(config: &ModelConfig) -> Vec<(usize, usize)> {
 
 /// Emit shape-specialized Q4_K matmul functions: `matmul_vec_q4_k_KxN`.
 ///
-/// Each output row is a single `dot_q4_k_q8_0` call.  No row-batched
-/// variants yet — the bandwidth win comes from reading 144 instead of 272
-/// bytes per super-block of weights, not from extra row parallelism.
+/// On AArch64, dispatches in groups of 4 output rows via `dot4_q4_k_q8_0`
+/// (one Q8_0 input load shared across 4 weight rows + amortised
+/// `Σ x_q8` reduction), with a single-row tail.  Other targets fall back
+/// to the scalar `dot_q4_k_q8_0` per row.
 fn emit_specialized_q4_k_matmul_functions(
     code: &mut String,
     config: &ModelConfig,
@@ -3166,20 +3285,67 @@ fn emit_specialized_q4_k_matmul_functions(
                 "    output.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
             )?;
             writeln!(code, "        let base = chunk_idx * 256;")?;
-            writeln!(code, "        for r in 0..out.len() {{")?;
-            writeln!(code, "            let j = base + r;")?;
+            writeln!(code, "        let len = out.len();")?;
+            writeln!(code, "        #[cfg(target_arch = \"aarch64\")] {{")?;
+            writeln!(code, "            let chunks4 = len / 4;")?;
+            writeln!(code, "            for c in 0..chunks4 {{")?;
+            writeln!(code, "                let r = base + c * 4;")?;
             writeln!(
                 code,
-                "            out[r] = dot_q4_k_q8_0(&weight[j*{row_bytes}..(j+1)*{row_bytes}], &input_q8, {k});"
+                "                let (d0, d1, d2, d3) = dot4_q4_k_q8_0(&weight[r*{row_bytes}..(r+1)*{row_bytes}], &weight[(r+1)*{row_bytes}..(r+2)*{row_bytes}], &weight[(r+2)*{row_bytes}..(r+3)*{row_bytes}], &weight[(r+3)*{row_bytes}..(r+4)*{row_bytes}], &input_q8, {k});"
             )?;
+            writeln!(code, "                out[c*4] = d0; out[c*4+1] = d1; out[c*4+2] = d2; out[c*4+3] = d3;")?;
+            writeln!(code, "            }}")?;
+            writeln!(code, "            for i in (chunks4 * 4)..len {{")?;
+            writeln!(code, "                let j = base + i;")?;
+            writeln!(
+                code,
+                "                out[i] = dot_q4_k_q8_0(&weight[j*{row_bytes}..(j+1)*{row_bytes}], &input_q8, {k});"
+            )?;
+            writeln!(code, "            }}")?;
+            writeln!(code, "        }}")?;
+            writeln!(code, "        #[cfg(not(target_arch = \"aarch64\"))] {{")?;
+            writeln!(code, "            for r in 0..len {{")?;
+            writeln!(code, "                let j = base + r;")?;
+            writeln!(
+                code,
+                "                out[r] = dot_q4_k_q8_0(&weight[j*{row_bytes}..(j+1)*{row_bytes}], &input_q8, {k});"
+            )?;
+            writeln!(code, "            }}")?;
             writeln!(code, "        }}")?;
             writeln!(code, "    }});")?;
         } else {
-            writeln!(code, "    for j in 0..{n} {{")?;
+            // Below the parallel threshold — emit a 4-wide cascade in-line.
+            writeln!(code, "    #[cfg(target_arch = \"aarch64\")] {{")?;
+            let n4 = n / 4;
+            let n_rem = n % 4;
+            if n4 > 0 {
+                writeln!(code, "        for c in 0..{n4} {{")?;
+                writeln!(code, "            let r = c * 4;")?;
+                writeln!(
+                    code,
+                    "            let (d0, d1, d2, d3) = dot4_q4_k_q8_0(&weight[r*{row_bytes}..(r+1)*{row_bytes}], &weight[(r+1)*{row_bytes}..(r+2)*{row_bytes}], &weight[(r+2)*{row_bytes}..(r+3)*{row_bytes}], &weight[(r+3)*{row_bytes}..(r+4)*{row_bytes}], &input_q8, {k});"
+                )?;
+                writeln!(code, "            output[c*4] = d0; output[c*4+1] = d1; output[c*4+2] = d2; output[c*4+3] = d3;")?;
+                writeln!(code, "        }}")?;
+            }
+            if n_rem > 0 {
+                let base = n4 * 4;
+                writeln!(code, "        for j in {base}..{n} {{")?;
+                writeln!(
+                    code,
+                    "            output[j] = dot_q4_k_q8_0(&weight[j*{row_bytes}..(j+1)*{row_bytes}], &input_q8, {k});"
+                )?;
+                writeln!(code, "        }}")?;
+            }
+            writeln!(code, "    }}")?;
+            writeln!(code, "    #[cfg(not(target_arch = \"aarch64\"))] {{")?;
+            writeln!(code, "        for j in 0..{n} {{")?;
             writeln!(
                 code,
-                "        output[j] = dot_q4_k_q8_0(&weight[j*{row_bytes}..(j+1)*{row_bytes}], &input_q8, {k});"
+                "            output[j] = dot_q4_k_q8_0(&weight[j*{row_bytes}..(j+1)*{row_bytes}], &input_q8, {k});"
             )?;
+            writeln!(code, "        }}")?;
             writeln!(code, "    }}")?;
         }
         writeln!(code, "}}")?;
@@ -4047,12 +4213,33 @@ fn emit_forward_function(
             "    logits.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
         )?;
         writeln!(code, "        let base = chunk_idx * 256;")?;
-        writeln!(code, "        for r in 0..out.len() {{")?;
-        writeln!(code, "            let j = base + r;")?;
+        writeln!(code, "        let len = out.len();")?;
+        writeln!(code, "        #[cfg(target_arch = \"aarch64\")] {{")?;
+        writeln!(code, "            let chunks4 = len / 4;")?;
+        writeln!(code, "            for c in 0..chunks4 {{")?;
+        writeln!(code, "                let r = base + c * 4;")?;
         writeln!(
             code,
-            "            out[r] = dot_q4_k_q8_0(&weights.lm_head[j*{lm_row_bytes}..(j+1)*{lm_row_bytes}], &normed_q8, {hidden});"
+            "                let (d0, d1, d2, d3) = dot4_q4_k_q8_0(&weights.lm_head[r*{lm_row_bytes}..(r+1)*{lm_row_bytes}], &weights.lm_head[(r+1)*{lm_row_bytes}..(r+2)*{lm_row_bytes}], &weights.lm_head[(r+2)*{lm_row_bytes}..(r+3)*{lm_row_bytes}], &weights.lm_head[(r+3)*{lm_row_bytes}..(r+4)*{lm_row_bytes}], &normed_q8, {hidden});"
         )?;
+        writeln!(code, "                out[c*4] = d0; out[c*4+1] = d1; out[c*4+2] = d2; out[c*4+3] = d3;")?;
+        writeln!(code, "            }}")?;
+        writeln!(code, "            for i in (chunks4 * 4)..len {{")?;
+        writeln!(code, "                let j = base + i;")?;
+        writeln!(
+            code,
+            "                out[i] = dot_q4_k_q8_0(&weights.lm_head[j*{lm_row_bytes}..(j+1)*{lm_row_bytes}], &normed_q8, {hidden});"
+        )?;
+        writeln!(code, "            }}")?;
+        writeln!(code, "        }}")?;
+        writeln!(code, "        #[cfg(not(target_arch = \"aarch64\"))] {{")?;
+        writeln!(code, "            for r in 0..len {{")?;
+        writeln!(code, "                let j = base + r;")?;
+        writeln!(
+            code,
+            "                out[r] = dot_q4_k_q8_0(&weights.lm_head[j*{lm_row_bytes}..(j+1)*{lm_row_bytes}], &normed_q8, {hidden});"
+        )?;
+        writeln!(code, "            }}")?;
         writeln!(code, "        }}")?;
         writeln!(code, "    }});")?;
     } else {
@@ -4666,12 +4853,33 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
             "            last_logits.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
         )?;
         writeln!(code, "                let base = chunk_idx * 256;")?;
-        writeln!(code, "                for r in 0..out.len() {{")?;
-        writeln!(code, "                    let j = base + r;")?;
+        writeln!(code, "                let len = out.len();")?;
+        writeln!(code, "                #[cfg(target_arch = \"aarch64\")] {{")?;
+        writeln!(code, "                    let chunks4 = len / 4;")?;
+        writeln!(code, "                    for c in 0..chunks4 {{")?;
+        writeln!(code, "                        let r = base + c * 4;")?;
         writeln!(
             code,
-            "                    out[r] = dot_q4_k_q8_0(&weights.lm_head[j*{lm_row_bytes}..(j+1)*{lm_row_bytes}], &normed_q8, {hidden});"
+            "                        let (d0, d1, d2, d3) = dot4_q4_k_q8_0(&weights.lm_head[r*{lm_row_bytes}..(r+1)*{lm_row_bytes}], &weights.lm_head[(r+1)*{lm_row_bytes}..(r+2)*{lm_row_bytes}], &weights.lm_head[(r+2)*{lm_row_bytes}..(r+3)*{lm_row_bytes}], &weights.lm_head[(r+3)*{lm_row_bytes}..(r+4)*{lm_row_bytes}], &normed_q8, {hidden});"
         )?;
+        writeln!(code, "                        out[c*4] = d0; out[c*4+1] = d1; out[c*4+2] = d2; out[c*4+3] = d3;")?;
+        writeln!(code, "                    }}")?;
+        writeln!(code, "                    for i in (chunks4 * 4)..len {{")?;
+        writeln!(code, "                        let j = base + i;")?;
+        writeln!(
+            code,
+            "                        out[i] = dot_q4_k_q8_0(&weights.lm_head[j*{lm_row_bytes}..(j+1)*{lm_row_bytes}], &normed_q8, {hidden});"
+        )?;
+        writeln!(code, "                    }}")?;
+        writeln!(code, "                }}")?;
+        writeln!(code, "                #[cfg(not(target_arch = \"aarch64\"))] {{")?;
+        writeln!(code, "                    for r in 0..len {{")?;
+        writeln!(code, "                        let j = base + r;")?;
+        writeln!(
+            code,
+            "                        out[r] = dot_q4_k_q8_0(&weights.lm_head[j*{lm_row_bytes}..(j+1)*{lm_row_bytes}], &normed_q8, {hidden});"
+        )?;
+        writeln!(code, "                    }}")?;
         writeln!(code, "                }}")?;
         writeln!(code, "            }});")?;
     } else {
