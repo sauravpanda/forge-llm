@@ -2,6 +2,55 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.9.3] — 2026-04-25 — NEON Q4_K kernel: 1.58× decode speedup
+
+The Q4_K decode regression flagged in v0.9.2 is mostly closed.  The
+emitted `dot_q4_k_q8_0` now uses inline-asm `sdot` for the int8 × 4-bit
+inner reduction and `vpaddlq_s8` + `vaddvq_s16` for the per-sub-block
+`Σ x_q8` correction needed by the affine `dmin` term.
+
+### Performance
+
+Llama-3.2-1B-Instruct-Q4_K_M, M5 Pro CPU, prompt = "The capital of France is":
+
+| Variant                  | Decode tok/s | weights.bin |
+|--------------------------|-------------:|------------:|
+| v0.9.1 (Q8_0 requant)    |         47.7 |      2364 MB |
+| v0.9.2 (Q4_K scalar)     |         26.6 |      1746 MB |
+| **v0.9.3 (Q4_K + NEON)** |     **41.9** | **1746 MB** |
+
+NEON kernel is **1.58× the scalar Q4_K kernel** and reaches 88% of the Q8_0
+NEON sdot path's tok/s — at 26% smaller weights.bin.  Prefill: 46.6 tok/s
+on the same prompt (was 29.7 in v0.9.2).
+
+### Added
+
+- **`dot_q4_k_q8_0` (NEON)** — inline `sdot` (`v.4s, v.16b, v.16b`) for the
+  per-sub-block dot, plus `vpaddlq_s8 + vaddvq_s16` for the `Σ x_q8`
+  reduction.  Two `sdot` invocations per 32-element sub-block (one for
+  the 16-byte low half, one for the high half), both halves of one chunk
+  (low + high nibbles of the same 32 packed-byte qs slice) processed
+  back-to-back.
+- Scalar fallback retained as a `cfg(not(target_arch = "aarch64"))`
+  branch — the previous reference kernel, still valid for x86 / WASM /
+  generic builds.
+- **3 NEON correctness tests** in `weight_loader.rs`:
+  - `dot_q4_k_q8_0_neon_matches_scalar_uniform` — uniform synthetic
+    super-block; NEON ≡ scalar within fp rounding.
+  - `dot_q4_k_q8_0_neon_matches_scalar_varied` — varied scales/mins +
+    cosine input; rel error < 1e-4.
+  - `dot_q4_k_q8_0_neon_multi_superblock` — K=512, two super-blocks
+    end-to-end, exercises the per-super-block pointer arithmetic.
+
+### Not changed
+
+- f32 → Q4_K quantizer is still the simple per-sub-block (min, max)
+  affine — output noisier than the Q8_0 path.  Iterative quantizer
+  (ggml's `make_qkx2_quants`) is the next quality step.
+- Q4_K still uses per-token prefill (no `forward_prefill_batched` for
+  Q4_K yet) — fine at short contexts, slower than Q4_0/Q8_0 at long
+  ones.
+
 ## [0.9.2] — 2026-04-25 — Native Q4_K storage + scalar kernel
 
 End-to-end native Q4_K compile path: `Q4_K_M` GGUFs now compile to a binary

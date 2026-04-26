@@ -2950,6 +2950,105 @@ fn get_scale_min_k4(j: usize, scales: &[u8]) -> (u8, u8) {
 ///
 /// `weight_q4k`: 144 bytes per 256-element super-block.
 /// `input_q8`:    34 bytes per 32-element block (eight per super-block).
+///
+/// On AArch64 with `target-cpu=native` (set in the generated `.cargo/
+/// config.toml`) the inner sub-block dot uses `sdot` via inline asm; the
+/// `dmin` correction needs `Σ x_q8` which we compute with `vpaddlq_s8 +
+/// vaddvq_s16`.  Fallback path is the scalar reference.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn dot_q4_k_q8_0(weight_q4k: &[u8], input_q8: &[u8], k: usize) -> f32 {
+    use std::arch::aarch64::*;
+    const Q4K_BLOCK: usize = 256;
+    const Q4K_BYTES: usize = 144;
+    const Q8_BYTES: usize = 34;
+    let num_sb = k / Q4K_BLOCK;
+    let mut acc = 0.0f32;
+    for sb in 0..num_sb {
+        let wb = sb * Q4K_BYTES;
+        let d_bits = u16::from_le_bytes([weight_q4k[wb], weight_q4k[wb + 1]]);
+        let dmin_bits = u16::from_le_bytes([weight_q4k[wb + 2], weight_q4k[wb + 3]]);
+        let d = f16_bits_to_f32(d_bits);
+        let dmin = f16_bits_to_f32(dmin_bits);
+        let scales = &weight_q4k[wb + 4..wb + 16];
+        let qs = &weight_q4k[wb + 16..wb + 144];
+        let x_block_base = sb * 8 * Q8_BYTES;
+        for chunk in 0..4 {
+            let is = chunk * 2;
+            let (sc1, m1) = get_scale_min_k4(is, scales);
+            let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+            let d1_w = d * sc1 as f32;
+            let m1_w = dmin * m1 as f32;
+            let d2_w = d * sc2 as f32;
+            let m2_w = dmin * m2 as f32;
+            unsafe {
+                let mask = vdupq_n_u8(0x0F);
+                let qs_ptr = qs[chunk * 32..].as_ptr();
+                let qs_v0: uint8x16_t = vld1q_u8(qs_ptr);
+                let qs_v1: uint8x16_t = vld1q_u8(qs_ptr.add(16));
+                // Sub-block 1: low nibbles. Sub-block 2: high nibbles.
+                let q1_lo = vreinterpretq_s8_u8(vandq_u8(qs_v0, mask));
+                let q1_hi = vreinterpretq_s8_u8(vandq_u8(qs_v1, mask));
+                let q2_lo = vreinterpretq_s8_u8(vshrq_n_u8::<4>(qs_v0));
+                let q2_hi = vreinterpretq_s8_u8(vshrq_n_u8::<4>(qs_v1));
+
+                // Sub-block 1 input.
+                let x1_off = x_block_base + is * Q8_BYTES;
+                let x1_scale = f16_bits_to_f32(u16::from_le_bytes([
+                    input_q8[x1_off],
+                    input_q8[x1_off + 1],
+                ]));
+                let x1_ptr = input_q8[x1_off + 2..].as_ptr() as *const i8;
+                let x1_lo: int8x16_t = vld1q_s8(x1_ptr);
+                let x1_hi: int8x16_t = vld1q_s8(x1_ptr.add(16));
+                let mut dot1_v = vdupq_n_s32(0);
+                core::arch::asm!(
+                    "sdot {acc:v}.4s, {w0:v}.16b, {x0:v}.16b",
+                    "sdot {acc:v}.4s, {w1:v}.16b, {x1:v}.16b",
+                    acc = inout(vreg) dot1_v,
+                    w0 = in(vreg) q1_lo,
+                    x0 = in(vreg) x1_lo,
+                    w1 = in(vreg) q1_hi,
+                    x1 = in(vreg) x1_hi,
+                    options(nostack),
+                );
+                let dot1 = vaddvq_s32(dot1_v) as i32;
+                let sum1_v = vaddq_s16(vpaddlq_s8(x1_lo), vpaddlq_s8(x1_hi));
+                let sum1 = vaddvq_s16(sum1_v) as i32;
+                acc += x1_scale * (d1_w * dot1 as f32 - m1_w * sum1 as f32);
+
+                // Sub-block 2 input.
+                let x2_off = x_block_base + (is + 1) * Q8_BYTES;
+                let x2_scale = f16_bits_to_f32(u16::from_le_bytes([
+                    input_q8[x2_off],
+                    input_q8[x2_off + 1],
+                ]));
+                let x2_ptr = input_q8[x2_off + 2..].as_ptr() as *const i8;
+                let x2_lo: int8x16_t = vld1q_s8(x2_ptr);
+                let x2_hi: int8x16_t = vld1q_s8(x2_ptr.add(16));
+                let mut dot2_v = vdupq_n_s32(0);
+                core::arch::asm!(
+                    "sdot {acc:v}.4s, {w0:v}.16b, {x0:v}.16b",
+                    "sdot {acc:v}.4s, {w1:v}.16b, {x1:v}.16b",
+                    acc = inout(vreg) dot2_v,
+                    w0 = in(vreg) q2_lo,
+                    x0 = in(vreg) x2_lo,
+                    w1 = in(vreg) q2_hi,
+                    x1 = in(vreg) x2_hi,
+                    options(nostack),
+                );
+                let dot2 = vaddvq_s32(dot2_v) as i32;
+                let sum2_v = vaddq_s16(vpaddlq_s8(x2_lo), vpaddlq_s8(x2_hi));
+                let sum2 = vaddvq_s16(sum2_v) as i32;
+                acc += x2_scale * (d2_w * dot2 as f32 - m2_w * sum2 as f32);
+            }
+        }
+    }
+    acc
+}
+
+/// Scalar fallback for non-aarch64 targets — same math, no SIMD.
+#[cfg(not(target_arch = "aarch64"))]
 #[inline]
 fn dot_q4_k_q8_0(weight_q4k: &[u8], input_q8: &[u8], k: usize) -> f32 {
     const Q4K_BLOCK: usize = 256;
@@ -2975,7 +3074,6 @@ fn dot_q4_k_q8_0(weight_q4k: &[u8], input_q8: &[u8], k: usize) -> f32 {
             let d2_w = d * sc2 as f32;
             let m2_w = dmin * m2 as f32;
             let qs_chunk = &qs[chunk * 32..(chunk + 1) * 32];
-            // Sub-block (low nibbles).
             let x1_off = x_block_base + is * Q8_BYTES;
             let x1_scale = f16_bits_to_f32(u16::from_le_bytes([
                 input_q8[x1_off],
@@ -2991,7 +3089,6 @@ fn dot_q4_k_q8_0(weight_q4k: &[u8], input_q8: &[u8], k: usize) -> f32 {
                 sum1 += xi;
             }
             acc += x1_scale * (d1_w * dot1 as f32 - m1_w * sum1 as f32);
-            // Sub-block (high nibbles).
             let x2_off = x_block_base + (is + 1) * Q8_BYTES;
             let x2_scale = f16_bits_to_f32(u16::from_le_bytes([
                 input_q8[x2_off],
