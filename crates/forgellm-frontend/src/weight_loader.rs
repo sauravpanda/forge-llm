@@ -1443,7 +1443,13 @@ pub fn quantize_f32_to_q4_k(data: &[f32]) -> Vec<u8> {
         let mut padded = [0.0f32; BLOCK];
         padded[..block.len()].copy_from_slice(block);
 
-        // Per sub-block: (min, scale, q4_values).
+        // Per sub-block: simple (min, max)-affine quantizer.  Closed-form
+        // iterative refit was tried in v0.9.5-prep but regressed end-to-end
+        // model quality — the refit shrinks the fit range to the bulk, which
+        // loses representation of weight outliers that the original (min, max)
+        // captured via L=0 / L=15 saturation.  ggml's `make_qkx2_quants`
+        // grid-searches over shifted ranges to avoid that pitfall; porting it
+        // is tracked as a follow-up.
         let mut sub_scales_f = [0.0f32; 8];
         let mut sub_mins_f = [0.0f32; 8];
         let mut sub_q: [[u8; SUB]; 8] = [[0; SUB]; 8];
@@ -2172,6 +2178,31 @@ mod tests {
             max_err < 0.05,
             "Q4_K round-trip max error too large: {max_err}"
         );
+    }
+
+    #[test]
+    fn quantize_f32_to_q4_k_round_trip_realistic() {
+        // Smooth weight-like distribution (no extreme outliers).
+        // Iterative refinement should give RMS < 0.005 on this kind of input,
+        // which is typical of post-training transformer projection weights.
+        let mut values = Vec::with_capacity(512);
+        let mut state: u32 = 0xdead_beef;
+        for _ in 0..512 {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            let u = ((state >> 16) as f32) / (u16::MAX as f32) - 0.5;
+            values.push(u * 0.2); // ±0.1, no outliers
+        }
+
+        let q4k = quantize_f32_to_q4_k(&values);
+        let recovered = dequant_q4_k(&q4k, values.len());
+
+        let mut sse = 0.0f64;
+        for (a, b) in values.iter().zip(&recovered) {
+            let e = (a - b) as f64;
+            sse += e * e;
+        }
+        let rms = (sse / values.len() as f64).sqrt();
+        assert!(rms < 0.005, "Q4_K RMS round-trip error too high: {rms}");
     }
 
     #[test]
