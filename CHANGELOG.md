@@ -2,6 +2,64 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.9.6] — 2026-04-26 — `forge bench-perplexity` infrastructure
+
+Adds an objective quality benchmark for quantization-vs-baseline
+comparisons.  Single-prompt eval on a 1B Q4_K_M model is too noisy to
+A/B quantizer changes; perplexity-on-corpus is the standard alternative.
+
+### Added
+
+- **`forge bench-perplexity --model X.gguf --tokenizer T.json --corpus
+  corpus.txt`** — reads a UTF-8 text corpus, tokenises it, and runs the
+  CPU interpreter token-by-token through `chunk_size`-token sliding
+  windows.  At each position `i` it computes a numerically-stable
+  log-softmax over the logits and accumulates `-log P(tokens[i+1])`.
+  Reports total perplexity, bits-per-byte, and tokens/second.
+- Flags: `--chunk-size 512` (KV cache resets per chunk),
+  `--max-chunks N` for quick A/B runs, `--simulate-q4k {none,naive,qkx2}`
+  for round-tripping projection weights through a chosen Q4_K quantizer
+  before scoring.
+- `pub fn quantize_f32_to_q4_k_naive` — restores the v0.9.4 simple
+  `(min, max)`-affine quantizer alongside the v0.9.5 `make_qkx2_quants`
+  port, so the two can be compared head-to-head.
+
+### Validated
+
+- Llama-3.2-1B-Instruct-Q8_0 on a 4.9 KB factual-prose corpus:
+  **perplexity 4.23, BPB 0.40, 13 tok/s** (interpreter, single thread
+  for fairness).  Sane numbers for a small instruct-tuned model on
+  coherent prose.
+- Same corpus on Llama-3.2-1B-Instruct-Q4_K_M (using the GGUF's
+  ggml-stored Q4_K bytes, dequantised by ForgeLLM's reader): **ppl
+  4.35** — +2.8% over Q8_0, the expected modest gap.
+
+### Known limitation
+
+- **`--simulate-q4k` produces catastrophic perplexity (~10⁵ vs ~4
+  baseline)** for both `naive` and `qkx2` quantizers when applied to
+  more than a single tensor.  Per-tensor round-trip max-err looks
+  fine in unit tests (~0.03 abs on tensors with 0.1 amplitude); the
+  bug is somewhere in the multi-tensor interaction through attention's
+  V·O matmul, which amplifies a systematic encoding bias my
+  super-block d/dmin packing introduces but ggml's reference quantizer
+  apparently doesn't.  Layer-bisection: a single layer's worth of
+  attention projections is enough to push ppl to ~50k, so it's a
+  per-quantizer-output bias rather than compounding noise across
+  layers.  This means **v0.9.5's `make_qkx2_quants` port is still
+  unvalidated by perplexity**; the simulate path can't yet do the A/B
+  it was designed for.  Tracked as the next session's grind:
+  super-block d/dmin search (matching ggml's reference) so the
+  per-sub-block (scale, min) computed by `make_qkx2` survives the
+  6-bit super-block packing.
+
+### Files
+
+- `crates/forgellm-cli/src/main.rs` — `cmd_bench_perplexity`,
+  `log_softmax_at`.
+- `crates/forgellm-frontend/src/weight_loader.rs` — restored
+  `quantize_f32_to_q4_k_naive` for A/B simulation.
+
 ## [0.9.5] — 2026-04-26 — `make_qkx2_quants` port for Q4_K
 
 `quantize_f32_to_q4_k` now uses the same per-sub-block algorithm as

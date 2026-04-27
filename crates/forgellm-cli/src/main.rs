@@ -175,6 +175,44 @@ enum Commands {
         prompt: String,
     },
 
+    /// Compute perplexity of a model on a text corpus.
+    ///
+    /// Token-by-token forward pass through `--corpus`, accumulating the
+    /// negative log-likelihood of each next-token prediction.  Reports
+    /// perplexity (exp(NLL/N)), bits-per-byte (NLL / log(2) / utf8_bytes),
+    /// and tokens/second.  Compares quantization choices objectively
+    /// where single-prompt eval doesn't.
+    BenchPerplexity {
+        /// Path to GGUF model file
+        #[arg(long)]
+        model: String,
+
+        /// Path to tokenizer.json (auto-detected if omitted)
+        #[arg(long)]
+        tokenizer: Option<String>,
+
+        /// Path to a UTF-8 text corpus (e.g. wikitext-2 sample)
+        #[arg(long)]
+        corpus: String,
+
+        /// Sliding-window chunk size (KV cache reset between chunks)
+        #[arg(long, default_value = "512")]
+        chunk_size: usize,
+
+        /// Cap on number of chunks processed (0 = unlimited).  Useful for
+        /// quick A/B runs while iterating on quantization.
+        #[arg(long, default_value = "0")]
+        max_chunks: usize,
+
+        /// Simulate a Q4_K AOT-binary's quantization noise on each
+        /// projection weight by round-tripping F32 → Q4_K → F32 through
+        /// the chosen quantizer.  `none` measures the source GGUF's
+        /// stored bits; `naive` and `qkx2` A/B-test our two quantizer
+        /// variants.
+        #[arg(long, default_value = "none", value_parser = ["none", "naive", "qkx2"])]
+        simulate_q4k: String,
+    },
+
     /// Interactive chat mode
     Chat {
         /// Path to GGUF model file
@@ -341,6 +379,18 @@ fn main() -> Result<()> {
         } => {
             let tok = resolve_tokenizer(&tokenizer, &model)?;
             cmd_bench(&model, &tok, &prompt, num_tokens, runs)?
+        }
+
+        Commands::BenchPerplexity {
+            model,
+            tokenizer,
+            corpus,
+            chunk_size,
+            max_chunks,
+            simulate_q4k,
+        } => {
+            let tok = resolve_tokenizer(&tokenizer, &model)?;
+            cmd_bench_perplexity(&model, &tok, &corpus, chunk_size, max_chunks, &simulate_q4k)?
         }
 
         Commands::Chat {
@@ -1833,6 +1883,229 @@ fn handle_completion_stream(
     }
 
     Ok(())
+}
+
+/// Compute perplexity on a text corpus.
+///
+/// Token-by-token forward pass through the corpus.  At each position `i`:
+///   logits = forward(tokens[i], i)
+///   nll  += -log_softmax(logits)[tokens[i+1]]
+/// Restart the KV cache between chunks of `chunk_size` tokens (long
+/// contexts would exceed `max_seq_len` and dilute the signal).
+///
+/// Reports perplexity = exp(NLL / N), bits-per-byte = NLL / ln(2) /
+/// utf8_bytes, and tokens/second.  N is the number of *predicted*
+/// tokens (one per position except the last in each chunk).
+fn cmd_bench_perplexity(
+    model_path: &str,
+    tokenizer_path: &str,
+    corpus_path: &str,
+    chunk_size: usize,
+    max_chunks: usize,
+    simulate_q4k: &str,
+) -> Result<()> {
+    use std::time::Instant;
+
+    eprintln!("Loading tokenizer from {tokenizer_path}...");
+    let tokenizer = Tokenizer::from_file(tokenizer_path)
+        .with_context(|| "failed to load tokenizer")?;
+
+    eprintln!("Loading model from {model_path}...");
+    let config = load_model_config(model_path)?;
+    let chunk_size = chunk_size.min(config.max_seq_len.saturating_sub(1)).max(2);
+
+    let graph = graph_builder::build_graph(&config)
+        .with_context(|| "failed to build computation graph")?;
+
+    eprintln!("Loading weights...");
+    let weight_start = Instant::now();
+    let (_gguf, mut weights) = weight_loader::load_from_file(model_path)
+        .with_context(|| "failed to load weights")?;
+    eprintln!(
+        "Loaded {} tensors ({:.1} MB) in {:.1}s",
+        weights.len(),
+        weights.memory_bytes() as f64 / 1e6,
+        weight_start.elapsed().as_secs_f64(),
+    );
+
+    if simulate_q4k != "none" {
+        eprintln!(
+            "Simulating Q4_K quantization noise via `{simulate_q4k}` quantizer..."
+        );
+        eprintln!(
+            "WARNING: --simulate-q4k currently produces catastrophic perplexity \
+             (~10⁵ vs ~4 baseline).  Per-tensor round-trip looks OK (~0.03 max_err) \
+             but multi-tensor interactions through attention amplify a systematic \
+             bias that doesn't show up in single-tensor unit tests.  Treat the \
+             absolute numbers as broken; the infrastructure (no-simulate path) is \
+             the v0.9.6 deliverable."
+        );
+        // Re-quantize each projection weight (everything except norms,
+        // which stay F32 in the AOT path too) through the chosen
+        // quantizer and dequant back to F32, mimicking the bytes the AOT
+        // binary would actually run on.
+        let mut affected = 0usize;
+        let mut total_elements = 0usize;
+        let names: Vec<String> = weights.tensors.keys().cloned().collect();
+        // Diagnostic env var for bisecting the bug — comma-separated
+        // substrings, OR'd; only matching tensor names get requantized.
+        let layer_filter = std::env::var("FORGE_PPL_LAYER_FILTER").ok();
+        for name in names {
+            if name.contains("norm") || name.ends_with(".bias") {
+                continue;
+            }
+            if name == "model.embed_tokens.weight" {
+                continue;
+            }
+            if let Some(ref f) = layer_filter {
+                if !f.split(',').any(|needle| name.contains(needle)) {
+                    continue;
+                }
+            }
+            let f32_data = match weights.tensors.get(&name) {
+                Some(v) => v.clone(),
+                None => continue,
+            };
+            if !f32_data.len().is_multiple_of(256) {
+                continue;
+            }
+            let q4k_bytes = match simulate_q4k {
+                "naive" => weight_loader::quantize_f32_to_q4_k_naive(&f32_data),
+                "qkx2" => weight_loader::quantize_f32_to_q4_k(&f32_data),
+                other => bail!("unknown --simulate-q4k value {other}"),
+            };
+            let dequant =
+                weight_loader::dequantize_q4_k_to_f32(&q4k_bytes, f32_data.len());
+            weights.tensors.insert(name, dequant);
+            affected += 1;
+            total_elements += f32_data.len();
+        }
+        eprintln!(
+            "Re-quantized {} tensors ({:.1}M elements) through `{}` quantizer.",
+            affected,
+            total_elements as f64 / 1e6,
+            simulate_q4k
+        );
+    }
+
+    eprintln!("Reading corpus from {corpus_path}...");
+    let text = fs::read_to_string(corpus_path)
+        .with_context(|| format!("failed to read corpus {corpus_path}"))?;
+    let utf8_bytes = text.len();
+    eprintln!("Corpus: {} UTF-8 bytes", utf8_bytes);
+
+    eprintln!("Tokenizing...");
+    // Don't add BOS — we want raw next-token likelihoods, not chat-template framed.
+    let tokens = tokenizer
+        .encode(&text)
+        .with_context(|| "failed to encode corpus")?;
+    let total_tokens = tokens.len();
+    eprintln!(
+        "Tokenized to {} tokens; chunk_size = {} ({} chunks)",
+        total_tokens,
+        chunk_size,
+        total_tokens.div_ceil(chunk_size),
+    );
+    if total_tokens < 2 {
+        bail!("corpus too short: need at least 2 tokens");
+    }
+
+    let mut total_nll = 0.0f64;
+    let mut total_predicted = 0usize;
+    let mut chunks_done = 0usize;
+    let bench_start = Instant::now();
+
+    for chunk_start in (0..total_tokens.saturating_sub(1)).step_by(chunk_size) {
+        if max_chunks > 0 && chunks_done >= max_chunks {
+            break;
+        }
+        let chunk_end = (chunk_start + chunk_size).min(total_tokens);
+        let chunk = &tokens[chunk_start..chunk_end];
+        if chunk.len() < 2 {
+            break;
+        }
+
+        let mut cache = KVCache::with_capacity(
+            config.num_layers,
+            config.num_kv_heads,
+            config.head_dim,
+            config.max_seq_len,
+        );
+
+        let chunk_t0 = Instant::now();
+        let mut chunk_nll = 0.0f64;
+        for (i, &token) in chunk.iter().enumerate() {
+            let logits = interpreter::forward(token, i, &graph, &weights, &mut cache);
+            cache.advance();
+            // Score the *next* token with these logits — last logits in the
+            // chunk have no follow-up token in this window so we skip them.
+            if i + 1 < chunk.len() {
+                let target = chunk[i + 1] as usize;
+                chunk_nll += -log_softmax_at(&logits, target);
+            }
+        }
+        let predicted_in_chunk = chunk.len() - 1;
+        total_nll += chunk_nll;
+        total_predicted += predicted_in_chunk;
+        chunks_done += 1;
+
+        let chunk_ppl = (chunk_nll / predicted_in_chunk as f64).exp();
+        let running_ppl = (total_nll / total_predicted as f64).exp();
+        let chunk_secs = chunk_t0.elapsed().as_secs_f64();
+        eprintln!(
+            "[chunk {:>4}] tokens={:>4} ppl={:>7.3} running_ppl={:>7.3} ({:.1} tok/s)",
+            chunks_done,
+            chunk.len(),
+            chunk_ppl,
+            running_ppl,
+            chunk.len() as f64 / chunk_secs,
+        );
+    }
+
+    let elapsed = bench_start.elapsed().as_secs_f64();
+    if total_predicted == 0 {
+        bail!("no tokens were scored");
+    }
+    let mean_nll = total_nll / total_predicted as f64;
+    let perplexity = mean_nll.exp();
+    // BPB = (avg nats per token) * (tokens / utf8_bytes) / ln(2)
+    let bits_per_byte = if utf8_bytes > 0 {
+        total_nll / (utf8_bytes as f64) / std::f64::consts::LN_2
+    } else {
+        f64::NAN
+    };
+
+    println!();
+    println!("--- Perplexity ---");
+    println!("Predicted tokens : {}", total_predicted);
+    println!("Mean NLL (nats)  : {:.4}", mean_nll);
+    println!("Perplexity       : {:.4}", perplexity);
+    println!("Bits per byte    : {:.4}", bits_per_byte);
+    println!(
+        "Throughput       : {:.1} tok/s ({:.2}s total)",
+        total_predicted as f64 / elapsed,
+        elapsed
+    );
+
+    Ok(())
+}
+
+/// Numerically-stable `log_softmax(logits)[idx]`.
+fn log_softmax_at(logits: &[f32], idx: usize) -> f64 {
+    if idx >= logits.len() {
+        return f64::NEG_INFINITY;
+    }
+    let mut max = f32::NEG_INFINITY;
+    for &v in logits {
+        if v > max {
+            max = v;
+        }
+    }
+    let mut sum_exp = 0.0f64;
+    for &v in logits {
+        sum_exp += ((v - max) as f64).exp();
+    }
+    (logits[idx] - max) as f64 - sum_exp.ln()
 }
 
 fn cmd_chat(

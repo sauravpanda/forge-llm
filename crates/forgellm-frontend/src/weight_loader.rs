@@ -1409,6 +1409,106 @@ pub fn quantize_f32_to_q4_0(data: &[f32]) -> Vec<u8> {
     out
 }
 
+/// Naive `(min, max)`-affine Q4_K quantizer.  Kept for A/B-testing
+/// against the production `quantize_f32_to_q4_k` (which uses
+/// `make_qkx2_quants`).  Not used by the loader or codegen export
+/// paths.
+pub fn quantize_f32_to_q4_k_naive(data: &[f32]) -> Vec<u8> {
+    const BLOCK: usize = 256;
+    const BYTES: usize = 144;
+    const SUB: usize = 32;
+
+    let num_sb = data.len().div_ceil(BLOCK);
+    let mut out = vec![0u8; num_sb * BYTES];
+
+    for sb in 0..num_sb {
+        let base = sb * BLOCK;
+        let end = (base + BLOCK).min(data.len());
+        let block = &data[base..end];
+        let mut padded = [0.0f32; BLOCK];
+        padded[..block.len()].copy_from_slice(block);
+
+        let mut sub_scales_f = [0.0f32; 8];
+        let mut sub_mins_f = [0.0f32; 8];
+        let mut sub_q: [[u8; SUB]; 8] = [[0; SUB]; 8];
+        for j in 0..8 {
+            let s0 = j * SUB;
+            let sub = &padded[s0..s0 + SUB];
+            let mut mn = f32::INFINITY;
+            let mut mx = f32::NEG_INFINITY;
+            for &v in sub {
+                if v < mn {
+                    mn = v;
+                }
+                if v > mx {
+                    mx = v;
+                }
+            }
+            let scale = (mx - mn) / 15.0;
+            let inv_scale = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+            sub_scales_f[j] = scale;
+            sub_mins_f[j] = mn;
+            for (i, &v) in sub.iter().enumerate() {
+                let q = ((v - mn) * inv_scale).round().clamp(0.0, 15.0) as u8;
+                sub_q[j][i] = q;
+            }
+        }
+
+        let max_scale = sub_scales_f
+            .iter()
+            .fold(0.0f32, |a, &b| if b > a { b } else { a });
+        let d = if max_scale > 0.0 { max_scale / 63.0 } else { 0.0 };
+        let inv_d = if d > 0.0 { 1.0 / d } else { 0.0 };
+
+        let mut max_mag_min = 0.0f32;
+        let mut sign_ref = 0.0f32;
+        for &m in &sub_mins_f {
+            if m.abs() > max_mag_min {
+                max_mag_min = m.abs();
+                sign_ref = m;
+            }
+        }
+        let dmin = if max_mag_min > 0.0 {
+            -sign_ref.signum() * (max_mag_min / 63.0)
+        } else {
+            0.0
+        };
+        let inv_dmin = if dmin.abs() > 0.0 { 1.0 / dmin } else { 0.0 };
+
+        let mut sub_scale_q = [0u8; 8];
+        let mut sub_min_q = [0u8; 8];
+        for j in 0..8 {
+            sub_scale_q[j] = (sub_scales_f[j] * inv_d).round().clamp(0.0, 63.0) as u8;
+            let smq = (-sub_mins_f[j] * inv_dmin).round().clamp(0.0, 63.0) as u8;
+            sub_min_q[j] = smq;
+        }
+
+        let ob = sb * BYTES;
+        let d_bits = f32_to_f16(d);
+        let dmin_bits = f32_to_f16(dmin);
+        out[ob] = d_bits as u8;
+        out[ob + 1] = (d_bits >> 8) as u8;
+        out[ob + 2] = dmin_bits as u8;
+        out[ob + 3] = (dmin_bits >> 8) as u8;
+
+        for i in 0..4 {
+            out[ob + 4 + i] = (sub_scale_q[i] & 63) | ((sub_scale_q[i + 4] >> 4) & 0x3) << 6;
+            out[ob + 8 + i] = (sub_min_q[i] & 63) | ((sub_min_q[i + 4] >> 4) & 0x3) << 6;
+            out[ob + 12 + i] = (sub_scale_q[i + 4] & 0x0F) | ((sub_min_q[i + 4] & 0x0F) << 4);
+        }
+
+        for c in 0..4 {
+            for i in 0..32 {
+                let lo = sub_q[2 * c][i] & 0x0F;
+                let hi = sub_q[2 * c + 1][i] & 0x0F;
+                out[ob + 16 + c * 32 + i] = lo | (hi << 4);
+            }
+        }
+    }
+
+    out
+}
+
 /// Per-sub-block Q4_K quantizer ported from ggml's `make_qkx2_quants`.
 ///
 /// Returns `(scale, the_min, L)` where:
