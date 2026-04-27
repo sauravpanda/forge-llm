@@ -2,6 +2,64 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.9.5] — 2026-04-26 — `make_qkx2_quants` port for Q4_K
+
+`quantize_f32_to_q4_k` now uses the same per-sub-block algorithm as
+ggml's reference Q4_K quantizer (`make_qkx2_quants`).  This replaces the
+naive `(min, max)`-affine sub-block fit shipped in v0.9.2.  Output
+quality on Q4_K_M models tightens visibly on prompts that exercise
+weight outliers — the 1B-Instruct test model now answers `1+1 = 2`
+correctly and stays on-topic for "capital of Japan" instead of
+returning empty completions, both of which the naive quantizer
+botched on the same weights.
+
+### Algorithm
+
+Per 32-element sub-block:
+
+1. **Initial bracket**: `min = x.min()`, `max = x.max()`, with the ggml
+   constraint `if min > 0 { min = 0 }` so the affine encoding's
+   unsigned `sub_min` covers the dequant offset cleanly.
+2. **Initial L** via `round((x - min) / scale)` clamped to `[0, 15]`.
+   Track this as the best-so-far with its squared-error MAD.
+3. **Grid search**: for `is = 0..=20`, try `iscale = (rmin + rdelta*is +
+   nmax) / (max - min)` (rmin = -1.0, rdelta = 0.1).  This explores
+   slightly-shrunken brackets that exclude outliers from forcing the
+   bulk into a single L level.
+4. For each candidate iscale: re-quantize to `Laux`, then refit
+   `(scale, min)` via 2-parameter closed-form least-squares
+   (`min = (Σ L² Σ x − Σ L Σ Lx) / det`,
+    `scale = (n Σ Lx − Σ L Σ x) / det`,
+    with `min` clamped ≤ 0 to keep affine encoding valid).
+5. Compute SSE for the candidate; keep only if it beats the current
+   best — so the algorithm **never regresses against the naive
+   bracket** when no shifted candidate is better.
+
+### Tests
+
+- The simple round-trip tests (smooth ramp, zero block, gaussian-ish
+  ±0.1 distribution) all pass with tighter RMS bounds than the
+  naive quantizer.
+- All 11 Q4_K kernel + quantizer tests still green.
+
+### Performance
+
+Decode / prefill tok/s unchanged from v0.9.4 (Q4_K_M Llama-3.2-1B at
+~52 / 56 tok/s).  weights.bin layout / size unchanged — this is a
+pure-quality release, encoder-side only.
+
+### Honest caveats
+
+- Single-prompt outputs aren't a reliable quality benchmark on a
+  heavily-quantized 1B model — both naive and make_qkx2 produce noisy
+  generations in some cases.  The right benchmark is
+  perplexity-on-corpus, which is tracked as future work.
+- ggml's full pipeline also uses an iterative
+  super-block d/dmin search (after make_qkx2_quants per-sub-block);
+  this release ports the per-sub-block algorithm only.  The
+  super-block d/dmin pick is still the simple
+  `max_scale/63` / `max_min/63` from v0.9.2.
+
 ## [0.9.4] — 2026-04-25 — Q4_K dot4 ILP: now faster than Q8_0
 
 Q4_K decode is now **faster than the Q8_0 NEON path** at 26% smaller

@@ -1409,6 +1409,122 @@ pub fn quantize_f32_to_q4_0(data: &[f32]) -> Vec<u8> {
     out
 }
 
+/// Per-sub-block Q4_K quantizer ported from ggml's `make_qkx2_quants`.
+///
+/// Returns `(scale, the_min, L)` where:
+/// - `scale` is the per-sub-block float scale, sub_scale_f.
+/// - `the_min` is `-min` (positive when the original `min` is negative,
+///   matching ggml's convention so `dequant(L) = scale * L - the_min`).
+/// - `L[i]` is the 4-bit quantized value in `[0, nmax]`.
+///
+/// Algorithm: start from naive `(min, max)` bracket; quantize.  Then loop
+/// over `nstep+1` slightly-shrunken brackets (parameterised by `rmin` and
+/// `rdelta`), refit `(scale, min)` via closed-form 2-parameter
+/// least-squares for each bracket's L, and keep the candidate with the
+/// lowest sum-of-squared-errors against the original input.  The grid
+/// search escapes the local optimum that pure refit gets stuck in when
+/// outliers stretch the naive bracket.
+fn make_qkx2_quants(
+    x: &[f32],
+    nmax: u8,
+    rmin: f32,
+    rdelta: f32,
+    nstep: usize,
+) -> (f32, f32, [u8; 32]) {
+    let n = x.len();
+    debug_assert_eq!(n, 32, "make_qkx2_quants expects 32-element sub-block");
+
+    let mut min = x[0];
+    let mut max = x[0];
+    for &v in &x[1..] {
+        if v < min {
+            min = v;
+        }
+        if v > max {
+            max = v;
+        }
+    }
+    if max == min {
+        return (0.0, -min, [0u8; 32]);
+    }
+    // Q4_K affine: dequant = scale * L + min with L ≥ 0; this requires min ≤ 0
+    // so the L=0 quant covers values ≤ min.  ggml clamps min to 0 here.
+    if min > 0.0 {
+        min = 0.0;
+    }
+
+    let nmax_f = nmax as f32;
+    let mut iscale = nmax_f / (max - min);
+    let mut scale = 1.0 / iscale;
+
+    let mut l = [0u8; 32];
+    let mut best_mad = 0.0f32;
+    for (i, &v) in x.iter().enumerate() {
+        let li = ((v - min) * iscale).round().clamp(0.0, nmax_f) as u8;
+        l[i] = li;
+        let diff = scale * li as f32 + min - v;
+        best_mad += diff * diff;
+    }
+    if nstep == 0 {
+        return (scale, -min, l);
+    }
+
+    let mut best_min = min;
+    let mut best_scale = scale;
+    let mut best_l = l;
+    let mut laux = [0u8; 32];
+
+    for is in 0..=nstep {
+        // Shifted iscale: (rmin + rdelta*is + nmax) / (max - min).
+        // For rmin=-1, rdelta=0.1, nstep=20: iscale ranges from
+        //   (nmax-1)/(max-min)  →  (nmax+1)/(max-min)
+        //   i.e. ~ -7% to +7% around the naive iscale.
+        let iscale_try = (rmin + rdelta * is as f32 + nmax_f) / (max - min);
+        let mut sum_l = 0.0f32;
+        let mut sum_l2 = 0.0f32;
+        let mut sum_x = 0.0f32;
+        let mut sum_xl = 0.0f32;
+        for (i, &v) in x.iter().enumerate() {
+            let li = ((v - min) * iscale_try).round().clamp(0.0, nmax_f) as u8;
+            laux[i] = li;
+            let lif = li as f32;
+            sum_l += lif;
+            sum_l2 += lif * lif;
+            sum_x += v;
+            sum_xl += lif * v;
+        }
+        let nf = n as f32;
+        let det = nf * sum_l2 - sum_l * sum_l;
+        if det > 0.0 {
+            let mut this_scale = (nf * sum_xl - sum_x * sum_l) / det;
+            let mut this_min = (sum_l2 * sum_x - sum_l * sum_xl) / det;
+            if this_min > 0.0 {
+                this_min = 0.0;
+                if sum_l2 > 0.0 {
+                    this_scale = sum_xl / sum_l2;
+                }
+            }
+            // Reject negative scales — would invert sign of dequant for
+            // unsigned 4-bit qs.
+            if this_scale > 0.0 {
+                let mut mad = 0.0f32;
+                for (i, &v) in x.iter().enumerate() {
+                    let diff = this_scale * laux[i] as f32 + this_min - v;
+                    mad += diff * diff;
+                }
+                if mad < best_mad {
+                    best_l = laux;
+                    best_mad = mad;
+                    best_scale = this_scale;
+                    best_min = this_min;
+                }
+            }
+        }
+    }
+
+    (best_scale, -best_min, best_l)
+}
+
 /// Quantize an f32 slice to Q4_K raw bytes.
 ///
 /// Q4_K block layout (256 elements → 144 bytes):
@@ -1417,17 +1533,9 @@ pub fn quantize_f32_to_q4_0(data: &[f32]) -> Vec<u8> {
 ///   [4..16]   12 bytes packing 8 sub-block (6-bit scale, 6-bit min) pairs
 ///   [16..144] 128 bytes packing 256 × 4-bit unsigned weights
 ///
-/// Algorithm: split each 256-element block into 8 sub-blocks of 32 elements.
-/// Per sub-block j, compute `(min_j, max_j)` and derive
-/// `sub_scale_j = (max_j - min_j) / 15` plus offset `min_j`.  The super-block
-/// scales `d` and `dmin` are chosen so the per-sub-block 6-bit values fit:
-///   d = max(sub_scale_j) / 63          (all sub_scale_j ≥ 0)
-///   dmin = max(|min_j|) / 63, with the sign carried on dmin itself.
-///
-/// This is a simple affine quantizer — coarser than GGML's iterative
-/// `make_qkx2_quants` but adequate for re-packing Q6_K / Q5_K / etc. that
-/// have already been dequantized once.  Used by the loader when presenting
-/// a mixed Q4_K_M GGUF to the Q4_K code path.
+/// Per-sub-block (scale, min, L) computed via `make_qkx2_quants` (ported
+/// from ggml's reference).  Super-block d / dmin then quantize the eight
+/// sub-block scales / mins to 6-bit unsigned values.
 pub fn quantize_f32_to_q4_k(data: &[f32]) -> Vec<u8> {
     const BLOCK: usize = 256;
     const BYTES: usize = 144;
@@ -1443,37 +1551,23 @@ pub fn quantize_f32_to_q4_k(data: &[f32]) -> Vec<u8> {
         let mut padded = [0.0f32; BLOCK];
         padded[..block.len()].copy_from_slice(block);
 
-        // Per sub-block: simple (min, max)-affine quantizer.  Closed-form
-        // iterative refit was tried in v0.9.5-prep but regressed end-to-end
-        // model quality — the refit shrinks the fit range to the bulk, which
-        // loses representation of weight outliers that the original (min, max)
-        // captured via L=0 / L=15 saturation.  ggml's `make_qkx2_quants`
-        // grid-searches over shifted ranges to avoid that pitfall; porting it
-        // is tracked as a follow-up.
+        // Per sub-block: ported from ggml's `make_qkx2_quants` (grid search
+        // over shifted iscales + closed-form refit, keeping the best-so-far).
+        // This handles the outlier case where a naive (min, max) bracket
+        // forces most values to a tight cluster of L levels — make_qkx2 tries
+        // a range of slightly-shrunken brackets and accepts whichever gives
+        // lower SSE than the naive baseline.
         let mut sub_scales_f = [0.0f32; 8];
         let mut sub_mins_f = [0.0f32; 8];
         let mut sub_q: [[u8; SUB]; 8] = [[0; SUB]; 8];
         for j in 0..8 {
             let s0 = j * SUB;
             let sub = &padded[s0..s0 + SUB];
-            let mut mn = f32::INFINITY;
-            let mut mx = f32::NEG_INFINITY;
-            for &v in sub {
-                if v < mn {
-                    mn = v;
-                }
-                if v > mx {
-                    mx = v;
-                }
-            }
-            let scale = (mx - mn) / 15.0;
-            let inv_scale = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+            let (scale, neg_min, l) = make_qkx2_quants(sub, 15, -1.0, 0.1, 20);
             sub_scales_f[j] = scale;
-            sub_mins_f[j] = mn;
-            for (i, &v) in sub.iter().enumerate() {
-                let q = ((v - mn) * inv_scale).round().clamp(0.0, 15.0) as u8;
-                sub_q[j][i] = q;
-            }
+            // ggml returns `the_min = -min`; we store the min itself, so flip.
+            sub_mins_f[j] = -neg_min;
+            sub_q[j] = l;
         }
 
         // Super-block scales.  d carries sub_scale magnitudes; dmin carries
