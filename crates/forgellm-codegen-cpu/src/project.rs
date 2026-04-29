@@ -584,7 +584,26 @@ fn main() {{
     let quiet = args.iter().any(|a| a == "--quiet" || a == "-q");
     let save_cache_path = args.windows(2).find(|w| w[0] == "--save-cache").map(|w| w[1].clone());
     let load_cache_path = args.windows(2).find(|w| w[0] == "--load-cache").map(|w| w[1].clone());
-    let prompt = args.iter().skip(3).filter(|a| !a.starts_with("--")).take_while(|a| !a.starts_with("--")).cloned().collect::<Vec<_>>().join(" ");
+    // Walk args[3..] and collect non-flag tokens, skipping known flag-value
+    // pairs and flag-only switches.  An earlier filter+take_while approach
+    // accidentally appended flag *values* (like the `0` in `--temp 0`) to
+    // the prompt.
+    let prompt = {{
+        let known_value_flags = ["--temp", "--top-k", "--top-p", "--max-tokens",
+            "--repeat-penalty", "--seed", "--save-cache", "--load-cache"];
+        let known_bool_flags = ["--quiet", "-q"];
+        let mut parts: Vec<String> = Vec::new();
+        let mut i = 3;
+        while i < args.len() {{
+            let a = &args[i];
+            if known_value_flags.contains(&a.as_str()) {{ i += 2; continue; }}
+            if known_bool_flags.contains(&a.as_str()) {{ i += 1; continue; }}
+            if a.starts_with("--") {{ i += 1; continue; }}  // unknown flag, skip
+            parts.push(a.clone());
+            i += 1;
+        }}
+        parts.join(" ")
+    }};
     let prompt = if prompt.is_empty() {{ "Hello".to_string() }} else {{ prompt }};
 
     let t_load = std::time::Instant::now();
@@ -950,7 +969,25 @@ fn main() {{
     let quiet = args.iter().any(|a| a == "--quiet" || a == "-q");
     let save_cache_path = args.windows(2).find(|w| w[0] == "--save-cache").map(|w| w[1].clone());
     let load_cache_path = args.windows(2).find(|w| w[0] == "--load-cache").map(|w| w[1].clone());
-    let prompt = args.iter().skip(1).filter(|a| !a.starts_with("--")).take_while(|a| !a.starts_with("--")).cloned().collect::<Vec<_>>().join(" ");
+    // Walk args[1..] (embedded build has no weights/tokenizer positionals)
+    // and collect non-flag tokens, skipping known flag-value pairs and
+    // flag-only switches.
+    let prompt = {{
+        let known_value_flags = ["--temp", "--top-k", "--top-p", "--max-tokens",
+            "--repeat-penalty", "--seed", "--save-cache", "--load-cache"];
+        let known_bool_flags = ["--quiet", "-q"];
+        let mut parts: Vec<String> = Vec::new();
+        let mut i = 1;
+        while i < args.len() {{
+            let a = &args[i];
+            if known_value_flags.contains(&a.as_str()) {{ i += 2; continue; }}
+            if known_bool_flags.contains(&a.as_str()) {{ i += 1; continue; }}
+            if a.starts_with("--") {{ i += 1; continue; }}
+            parts.push(a.clone());
+            i += 1;
+        }}
+        parts.join(" ")
+    }};
     let prompt = if prompt.is_empty() {{ "Hello".to_string() }} else {{ prompt }};
 
     eprintln!("AOT-compiled {arch} | {num_layers} layers | hidden={hidden} | weights embedded");

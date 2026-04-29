@@ -2,6 +2,36 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.9.8] — 2026-04-29 — AOT binary CLI parser fix
+
+Surfaced while validating the v0.9.7 fix end-to-end: AOT-compiled binaries
+silently appended flag *values* to the prompt.  E.g.
+`aot-bin weights.bin tok.json "hi" --temp 0 --max-tokens 30` was processing
+the prompt `"hi 0 30"` instead of `"hi"`, because the prompt extractor was
+`filter(!starts_with("--"))` over all of `args[3..]` — which retains every
+flag value (since values don't start with `--`).  Greedy output then looked
+nonsensically "broken" because the model was given a prompt the user never
+wrote.
+
+### Fixed
+
+- `crates/forgellm-codegen-cpu/src/project.rs` — both AOT main.rs templates
+  (regular and `--embed-weights`) now walk args sequentially with a
+  flag-arity table, skipping `(flag, value)` pairs and stand-alone bool
+  switches before collecting the prompt.  Verified: `--temp 0
+  --repeat-penalty 1.0 --max-tokens 50` no longer leaks `0`, `1.0`, `50`
+  into the prompt; AOT-Q8_0 now produces sensible greedy continuations.
+
+### Validation snapshot
+
+Same prompt under interpreter and AOT-Q8_0 (Llama SmolLM2-135M-Q8_0,
+greedy, no penalty) agree on the first 4 generated tokens then diverge —
+consistent with FP32 numerical noise across the two implementations of the
+forward pass (interpreter is token-by-token; AOT uses batched prefill).
+Full perplexity-scoring inside the AOT binary is the next step (proposed
+v0.9.9) so this can be measured rigorously instead of inferred from
+greedy-token agreement.
+
 ## [0.9.7] — 2026-04-29 — `f32_to_f16` round-to-nearest-even (fixes Q4_K simulate path)
 
 Fixes the v0.9.6 known-limitation: `--simulate-q4k` no longer produces
