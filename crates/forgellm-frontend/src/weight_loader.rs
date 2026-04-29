@@ -1275,35 +1275,85 @@ fn f16_to_f32(bits: u16) -> f32 {
 
 /// F32 → F16 conversion (round to nearest, ties to even).
 fn f32_to_f16(x: f32) -> u16 {
+    // Round-to-nearest-even.  An earlier version truncated (mant >> 13),
+    // which gives a SYSTEMATIC NEGATIVE BIAS on every f32→f16 conversion
+    // (always rounds toward zero).  When applied to Q4_K's per-superblock
+    // d / dmin scalars and propagated through the L refit, that bias is
+    // small per-element but compounds in stacked matmuls (V·O in
+    // attention) to catastrophic perplexity (~50K vs baseline ~4).
     let bits = x.to_bits();
     let sign = (bits >> 31) & 1;
     let exp = ((bits >> 23) & 0xFF) as i32;
     let mant = bits & 0x7F_FFFF;
 
     if exp == 0xFF {
-        // Inf / NaN
-        let h_mant = (mant >> 13) & 0x3FF;
+        // Inf / NaN — truncate mantissa, keep NaN-ness if any low bits set.
+        let mut h_mant = (mant >> 13) & 0x3FF;
+        if mant != 0 && h_mant == 0 {
+            h_mant = 1; // preserve NaN signaling
+        }
         return ((sign << 15) | (0x1F << 10) | h_mant) as u16;
+    }
+    if exp == 0 {
+        // f32 zero or subnormal — well below f16 representable range.
+        return (sign << 15) as u16;
     }
 
     let unbiased = exp - 127;
     if unbiased > 15 {
-        // Overflow → f16 infinity
-        return ((sign << 15) | (0x1F << 10)) as u16;
+        return ((sign << 15) | (0x1F << 10)) as u16; // overflow → ∞
     }
     if unbiased < -24 {
-        // Underflow → zero
-        return (sign << 15) as u16;
-    }
-    if unbiased < -14 {
-        // Subnormal f16
-        let shift = (-14 - unbiased) as u32;
-        let h_mant = (mant | 0x80_0000) >> (14 + shift);
-        return ((sign << 15) | h_mant) as u16;
+        return (sign << 15) as u16; // below smallest subnormal
     }
 
-    let h_exp = (unbiased + 15) as u32;
-    let h_mant = mant >> 13;
+    // Implicit-1 + mantissa as a 24-bit unsigned integer.
+    let implicit = (mant | 0x0080_0000) as u32;
+
+    // Total right-shift to pull `implicit` down to the f16 mantissa scale.
+    // For normal f16 (h_exp ≥ 1): mantissa is 11 bits including implicit-1.
+    //   The drop is the 13 low bits of the 24-bit `implicit`.
+    // For subnormal f16 (h_exp = 0): we shift down further by `-14 -
+    //   unbiased` to align with 2^-24.  Total shift = 13 + (-14 - unbiased)
+    //   = -unbiased - 1.
+    let shift: u32 = if unbiased < -14 {
+        ((-1 - unbiased) as u32) // 14..23 inclusive for u in -24..=-15
+    } else {
+        13
+    };
+
+    // Round-to-nearest-even on the dropped bits.
+    let mask = if shift >= 32 { u32::MAX } else { (1u32 << shift) - 1 };
+    let dropped = implicit & mask;
+    let half = 1u32 << (shift - 1);
+    let mut truncated = implicit >> shift;
+    if dropped > half || (dropped == half && (truncated & 1) == 1) {
+        truncated = truncated.wrapping_add(1);
+    }
+
+    // `truncated` is the 11-bit f16 mantissa (including implicit-1 for
+    // normals).  Detect mantissa overflow → exponent bump.
+    if unbiased < -14 {
+        // Subnormal: truncated may have crossed into the normal range
+        // (truncated == 1024 means h_exp transitions from 0 → 1).  In that
+        // case, write the value as a normal f16 with h_exp=1, h_mant=0.
+        if truncated >= 0x400 {
+            return ((sign << 15) | (1 << 10)) as u16;
+        }
+        return ((sign << 15) | truncated) as u16;
+    }
+
+    // Normal path: truncated should be in [1024, 2047].  Mask off implicit-1.
+    let mut h_exp = (unbiased + 15) as u32;
+    if truncated >= 0x800 {
+        // Mantissa overflowed: 1.111...111 → 10.0...0; bump exponent.
+        h_exp += 1;
+        if h_exp >= 0x1F {
+            return ((sign << 15) | (0x1F << 10)) as u16; // overflow → ∞
+        }
+        return ((sign << 15) | (h_exp << 10)) as u16;
+    }
+    let h_mant = truncated & 0x3FF;
     ((sign << 15) | (h_exp << 10) | h_mant) as u16
 }
 
@@ -1653,58 +1703,68 @@ pub fn quantize_f32_to_q4_k(data: &[f32]) -> Vec<u8> {
 
         // Per sub-block: ported from ggml's `make_qkx2_quants` (grid search
         // over shifted iscales + closed-form refit, keeping the best-so-far).
-        // This handles the outlier case where a naive (min, max) bracket
-        // forces most values to a tight cluster of L levels — make_qkx2 tries
-        // a range of slightly-shrunken brackets and accepts whichever gives
-        // lower SSE than the naive baseline.
+        // ggml's `make_qkx2_quants` returns the scale and `the_min ≥ 0` such
+        // that dequant(L) = scale * L - the_min.  We store both as
+        // non-negative scalars and use the NON-NEGATIVE convention end-to-end
+        // (matching ggml's reference; previous sign-juggling was a footgun).
         let mut sub_scales_f = [0.0f32; 8];
-        let mut sub_mins_f = [0.0f32; 8];
+        let mut sub_mins_f = [0.0f32; 8]; // the_min, ≥ 0
         let mut sub_q: [[u8; SUB]; 8] = [[0; SUB]; 8];
         for j in 0..8 {
             let s0 = j * SUB;
             let sub = &padded[s0..s0 + SUB];
-            let (scale, neg_min, l) = make_qkx2_quants(sub, 15, -1.0, 0.1, 20);
+            let (scale, the_min, l) = make_qkx2_quants(sub, 15, -1.0, 0.1, 20);
             sub_scales_f[j] = scale;
-            // ggml returns `the_min = -min`; we store the min itself, so flip.
-            sub_mins_f[j] = -neg_min;
+            sub_mins_f[j] = the_min;
             sub_q[j] = l;
         }
 
-        // Super-block scales.  d carries sub_scale magnitudes; dmin carries
-        // sub_min magnitudes (signed — keep the max-magnitude min's sign).
+        // Super-block scales — verbatim ggml convention (both ≥ 0).
         let max_scale = sub_scales_f
             .iter()
             .fold(0.0f32, |a, &b| if b > a { b } else { a });
+        let max_min = sub_mins_f
+            .iter()
+            .fold(0.0f32, |a, &b| if b > a { b } else { a });
+        let inv_scale = if max_scale > 0.0 { 63.0 / max_scale } else { 0.0 };
+        let inv_min = if max_min > 0.0 { 63.0 / max_min } else { 0.0 };
         let d = if max_scale > 0.0 { max_scale / 63.0 } else { 0.0 };
-        let inv_d = if d > 0.0 { 1.0 / d } else { 0.0 };
+        let dmin = if max_min > 0.0 { max_min / 63.0 } else { 0.0 };
 
-        // For dmin, pick the min_j with largest magnitude, preserve sign.
-        let mut max_mag_min = 0.0f32;
-        let mut sign_ref = 0.0f32;
-        for &m in &sub_mins_f {
-            if m.abs() > max_mag_min {
-                max_mag_min = m.abs();
-                sign_ref = m;
-            }
-        }
-        // Dequant: w[i] = d * sub_scale[j] * q[i] - dmin * sub_min[j]
-        // We want -dmin * sub_min[j] = min_j  ⟹  dmin * sub_min[j] = -min_j
-        // With sub_min ≥ 0, choose dmin = -sign(min_j-with-max-mag) * mag / 63.
-        let dmin = if max_mag_min > 0.0 {
-            -sign_ref.signum() * (max_mag_min / 63.0)
-        } else {
-            0.0
-        };
-        let inv_dmin = if dmin.abs() > 0.0 { 1.0 / dmin } else { 0.0 };
-
-        // 6-bit per-sub-block scale and min.
+        // 6-bit per-sub-block scale and min (both 0..63).
         let mut sub_scale_q = [0u8; 8];
         let mut sub_min_q = [0u8; 8];
         for j in 0..8 {
-            sub_scale_q[j] = (sub_scales_f[j] * inv_d).round().clamp(0.0, 63.0) as u8;
-            // sub_min[j] * dmin = -min_j  ⟹  sub_min[j] = -min_j / dmin
-            let smq = (-sub_mins_f[j] * inv_dmin).round().clamp(0.0, 63.0) as u8;
-            sub_min_q[j] = smq;
+            sub_scale_q[j] = (sub_scales_f[j] * inv_scale).round().clamp(0.0, 63.0) as u8;
+            sub_min_q[j] = (sub_mins_f[j] * inv_min).round().clamp(0.0, 63.0) as u8;
+        }
+
+        // Re-quantize L using the EFFECTIVE stored f16-rounded scales.  ggml
+        // does this in `quantize_row_q4_K_impl` after 6-bit packing because
+        // the original L from `make_qkx2_quants` was fit to the unquantized
+        // (scale, min) — using it with the rounded 6-bit scales would leave
+        // a systematic per-element bias that compounds catastrophically
+        // through stacked matmuls (V·O in attention).  Solve dequant for L:
+        // L = (x + dmin * sub_min_q) / (d * sub_scale_q), clamp to [0, 15].
+        // Use f16-rounded d, dmin (matches what the loader will see).
+        let d_stored = f16_to_f32(f32_to_f16(d));
+        let dmin_stored = f16_to_f32(f32_to_f16(dmin));
+        for j in 0..8 {
+            let s_eff = d_stored * sub_scale_q[j] as f32;
+            if s_eff == 0.0 {
+                for i in 0..SUB {
+                    sub_q[j][i] = 0;
+                }
+                continue;
+            }
+            let inv_s_eff = 1.0 / s_eff;
+            let dm_eff = dmin_stored * sub_min_q[j] as f32;
+            let s0 = j * SUB;
+            for i in 0..SUB {
+                let x = padded[s0 + i];
+                let li = ((x + dm_eff) * inv_s_eff).round().clamp(0.0, 15.0) as u8;
+                sub_q[j][i] = li;
+            }
         }
 
         // Write super-block header.
@@ -2397,6 +2457,118 @@ mod tests {
         }
         let rms = (sse / values.len() as f64).sqrt();
         assert!(rms < 0.005, "Q4_K RMS round-trip error too high: {rms}");
+    }
+
+    #[test]
+    fn quantize_f32_to_q4_k_mean_bias_unbiased() {
+        // The bug v0.9.6 chased: per-element max-err is small (~0.03 abs)
+        // but the MEAN error is non-zero, and multi-tensor matmuls amplify
+        // that systematic bias.  For D=2048 and Gaussian weights with
+        // σ ≈ 0.05, a per-element bias of 1e-3 produces a column-sum bias
+        // of 2.0 — comparable to the signal magnitude.  An honest quantizer
+        // should keep |mean_err| << element_std / sqrt(N) for N elements,
+        // i.e. essentially unbiased.
+        //
+        // Generate a Gaussian-like weight tensor: 16 × 256 = 4096 elements,
+        // σ ≈ 0.05.  Box–Muller via deterministic xorshift.
+        let mut state: u32 = 0x1357_9bdf;
+        let mut next_u32 = || -> u32 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        let mut next_f01 = || -> f32 {
+            // (1, 1.5).  Not strict (0,1] but bounded away from 0 — fine for ln().
+            (1.0 + (next_u32() >> 8) as f32 / (1u32 << 24) as f32 * 0.5)
+        };
+        let mut values = Vec::with_capacity(4096);
+        while values.len() < 4096 {
+            let u1 = next_f01() - 1.0; // (0, 0.5]
+            let u2 = next_f01() - 1.0;
+            let u1 = u1.max(1e-7);
+            let r = (-2.0 * u1.ln()).sqrt();
+            let theta = 2.0 * std::f32::consts::PI * u2;
+            values.push(0.05 * r * theta.cos());
+            values.push(0.05 * r * theta.sin());
+        }
+        values.truncate(4096);
+
+        let q4k = quantize_f32_to_q4_k(&values);
+        let recovered = dequant_q4_k(&q4k, values.len());
+
+        let mut sum_err = 0.0f64;
+        let mut sse = 0.0f64;
+        for (a, b) in values.iter().zip(&recovered) {
+            let e = (b - a) as f64;
+            sum_err += e;
+            sse += e * e;
+        }
+        let n = values.len() as f64;
+        let mean_err = sum_err / n;
+        let rms = (sse / n).sqrt();
+        // Element σ ≈ 0.05.  Standard error of the mean for a sample of
+        // 4096 unbiased zero-mean noise should be ≈ rms / sqrt(N).  We
+        // demand |mean_err| ≤ 5x that — generous, but catches a bias
+        // orders-of-magnitude larger than chance.
+        let chance_bound = 5.0 * rms / n.sqrt();
+        assert!(
+            mean_err.abs() < chance_bound,
+            "Q4_K quantizer is BIASED: mean_err={mean_err:.6}, rms={rms:.6}, \
+             chance_bound={chance_bound:.6} (5σ).  This bias compounds through \
+             stacked matmuls and explodes perplexity."
+        );
+    }
+
+    #[test]
+    fn quantize_f32_to_q4_k_mean_bias_outlier_heavy() {
+        // Real LLM weights are heavy-tailed: few outliers + bulk near zero.
+        // The naive (max-min)/15 scale gets dominated by outliers, leaving the
+        // bulk in just a couple L buckets.  Combined with super-block d / dmin
+        // 6-bit packing rounding, this can leave a systematic mean bias if the
+        // refit isn't right.  Stress the L refit with a Student-t-like
+        // distribution: σ ≈ 0.05 bulk + ~0.5% values at ±0.3.
+        let mut state: u32 = 0xacedf00d;
+        let mut next = || -> u32 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        let mut values = Vec::with_capacity(8192);
+        for i in 0..8192 {
+            let r = (next() as f32) / (u32::MAX as f32);
+            // Box-Muller for tail-heavier draws.
+            let u1 = (r * 0.99).max(1e-6);
+            let u2 = ((next() as f32) / (u32::MAX as f32)).max(1e-6);
+            let mag = (-2.0 * u1.ln()).sqrt();
+            let theta = 2.0 * std::f32::consts::PI * u2;
+            let z = mag * theta.cos();
+            // Mostly Gaussian σ=0.05; ~0.5% outliers ±0.3.
+            let v = if i % 200 == 0 { 0.3 * z.signum() } else { 0.05 * z };
+            values.push(v);
+        }
+
+        let q4k = quantize_f32_to_q4_k(&values);
+        let recovered = dequant_q4_k(&q4k, values.len());
+
+        let mut sum_err = 0.0f64;
+        let mut sse = 0.0f64;
+        for (a, b) in values.iter().zip(&recovered) {
+            let e = (b - a) as f64;
+            sum_err += e;
+            sse += e * e;
+        }
+        let n = values.len() as f64;
+        let mean_err = sum_err / n;
+        let rms = (sse / n).sqrt();
+        let chance_bound = 5.0 * rms / n.sqrt();
+        assert!(
+            mean_err.abs() < chance_bound,
+            "Q4_K outlier-heavy mean bias: mean_err={mean_err:.6}, rms={rms:.6}, \
+             chance_bound={chance_bound:.6} (5σ).  Bias is {:.1}x stronger than chance.",
+            (mean_err.abs() / chance_bound),
+        );
     }
 
     #[test]

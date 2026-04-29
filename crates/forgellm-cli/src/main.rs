@@ -1932,14 +1932,6 @@ fn cmd_bench_perplexity(
         eprintln!(
             "Simulating Q4_K quantization noise via `{simulate_q4k}` quantizer..."
         );
-        eprintln!(
-            "WARNING: --simulate-q4k currently produces catastrophic perplexity \
-             (~10⁵ vs ~4 baseline).  Per-tensor round-trip looks OK (~0.03 max_err) \
-             but multi-tensor interactions through attention amplify a systematic \
-             bias that doesn't show up in single-tensor unit tests.  Treat the \
-             absolute numbers as broken; the infrastructure (no-simulate path) is \
-             the v0.9.6 deliverable."
-        );
         // Re-quantize each projection weight (everything except norms,
         // which stay F32 in the AOT path too) through the chosen
         // quantizer and dequant back to F32, mimicking the bytes the AOT
@@ -1950,6 +1942,10 @@ fn cmd_bench_perplexity(
         // Diagnostic env var for bisecting the bug — comma-separated
         // substrings, OR'd; only matching tensor names get requantized.
         let layer_filter = std::env::var("FORGE_PPL_LAYER_FILTER").ok();
+        // FORGE_PPL_DUMP_ERRORS=1: print per-tensor mean / rms / max / scale.
+        let dump_errors = std::env::var("FORGE_PPL_DUMP_ERRORS")
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false);
         for name in names {
             if name.contains("norm") || name.ends_with(".bias") {
                 continue;
@@ -1976,6 +1972,40 @@ fn cmd_bench_perplexity(
             };
             let dequant =
                 weight_loader::dequantize_q4_k_to_f32(&q4k_bytes, f32_data.len());
+            if dump_errors {
+                let n = f32_data.len() as f64;
+                let mut sum_err = 0.0f64;
+                let mut sum_x = 0.0f64;
+                let mut sse = 0.0f64;
+                let mut max_e = 0.0f32;
+                let mut max_abs_x = 0.0f32;
+                for (a, b) in f32_data.iter().zip(&dequant) {
+                    let e = (b - a) as f64;
+                    sum_err += e;
+                    sum_x += *a as f64;
+                    sse += e * e;
+                    if e.abs() as f32 > max_e {
+                        max_e = e.abs() as f32;
+                    }
+                    if a.abs() > max_abs_x {
+                        max_abs_x = a.abs();
+                    }
+                }
+                let mean_err = sum_err / n;
+                let mean_x = sum_x / n;
+                let rms = (sse / n).sqrt();
+                eprintln!(
+                    "  {:<60} N={:>9} mean_x={:+.5} mean_err={:+.5e} \
+                     rms={:.5} max_err={:.5} max|x|={:.4}",
+                    name,
+                    f32_data.len(),
+                    mean_x,
+                    mean_err,
+                    rms,
+                    max_e,
+                    max_abs_x,
+                );
+            }
             weights.tensors.insert(name, dequant);
             affected += 1;
             total_elements += f32_data.len();

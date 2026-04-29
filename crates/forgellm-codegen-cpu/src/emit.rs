@@ -1434,17 +1434,45 @@ fn quantize_to_q8_0_blocks(input: &[f32]) -> Vec<u8> {
     out
 }
 
-/// f32 → IEEE 754 f16 bit pattern (for quantization scale storage).
+/// f32 → IEEE 754 f16 bit pattern with round-to-nearest-even.  Truncation
+/// (`mant >> 13`) gives a systematic round-toward-zero bias on every scale
+/// that compounds through stacked matmuls — fixed in v0.9.7 after Q4_K
+/// simulate path showed catastrophic perplexity (~50K vs baseline ~4).
 #[inline]
 fn f32_to_f16_bits(x: f32) -> u16 {
     let bits = x.to_bits();
-    let sign    = ((bits >> 16) & 0x8000) as u16;
+    let sign = ((bits >> 16) & 0x8000) as u16;
     let exp_f32 = ((bits >> 23) & 0xFF) as i32;
-    let exp_f16 = exp_f32 - 127 + 15;
-    let mantissa = ((bits >> 13) & 0x3FF) as u16;
-    if exp_f16 <= 0        { sign }
-    else if exp_f16 >= 31  { sign | 0x7C00 }
-    else                   { sign | ((exp_f16 as u16) << 10) | mantissa }
+    let mant = bits & 0x7F_FFFF;
+    if exp_f32 == 0xFF {
+        let mut h_mant = ((mant >> 13) & 0x3FF) as u16;
+        if mant != 0 && h_mant == 0 { h_mant = 1; }
+        return sign | 0x7C00 | h_mant;
+    }
+    if exp_f32 == 0 { return sign; }
+    let unbiased = exp_f32 - 127;
+    if unbiased > 15 { return sign | 0x7C00; }
+    if unbiased < -24 { return sign; }
+    let implicit = (mant | 0x0080_0000) as u32;
+    let shift: u32 = if unbiased < -14 { (-1 - unbiased) as u32 } else { 13 };
+    let mask = (1u32 << shift) - 1;
+    let dropped = implicit & mask;
+    let half = 1u32 << (shift - 1);
+    let mut truncated = implicit >> shift;
+    if dropped > half || (dropped == half && (truncated & 1) == 1) {
+        truncated = truncated.wrapping_add(1);
+    }
+    if unbiased < -14 {
+        if truncated >= 0x400 { return sign | (1 << 10); }
+        return sign | (truncated as u16);
+    }
+    let mut h_exp = (unbiased + 15) as u32;
+    if truncated >= 0x800 {
+        h_exp += 1;
+        if h_exp >= 0x1F { return sign | 0x7C00; }
+        return sign | ((h_exp as u16) << 10);
+    }
+    sign | ((h_exp as u16) << 10) | ((truncated & 0x3FF) as u16)
 }
 
 /// Dot product of two Q8_0 vectors using AArch64 `sdot` instruction via inline asm.
@@ -2384,17 +2412,45 @@ fn quantize_to_q8_0_blocks(input: &[f32]) -> Vec<u8> {
     out
 }
 
-/// f32 → IEEE 754 f16 bit pattern (for quantization scale storage).
+/// f32 → IEEE 754 f16 bit pattern with round-to-nearest-even.  Truncation
+/// (`mant >> 13`) gives a systematic round-toward-zero bias on every scale
+/// that compounds through stacked matmuls — fixed in v0.9.7 after Q4_K
+/// simulate path showed catastrophic perplexity (~50K vs baseline ~4).
 #[inline]
 fn f32_to_f16_bits(x: f32) -> u16 {
     let bits = x.to_bits();
-    let sign    = ((bits >> 16) & 0x8000) as u16;
+    let sign = ((bits >> 16) & 0x8000) as u16;
     let exp_f32 = ((bits >> 23) & 0xFF) as i32;
-    let exp_f16 = exp_f32 - 127 + 15;
-    let mantissa = ((bits >> 13) & 0x3FF) as u16;
-    if exp_f16 <= 0        { sign }
-    else if exp_f16 >= 31  { sign | 0x7C00 }
-    else                   { sign | ((exp_f16 as u16) << 10) | mantissa }
+    let mant = bits & 0x7F_FFFF;
+    if exp_f32 == 0xFF {
+        let mut h_mant = ((mant >> 13) & 0x3FF) as u16;
+        if mant != 0 && h_mant == 0 { h_mant = 1; }
+        return sign | 0x7C00 | h_mant;
+    }
+    if exp_f32 == 0 { return sign; }
+    let unbiased = exp_f32 - 127;
+    if unbiased > 15 { return sign | 0x7C00; }
+    if unbiased < -24 { return sign; }
+    let implicit = (mant | 0x0080_0000) as u32;
+    let shift: u32 = if unbiased < -14 { (-1 - unbiased) as u32 } else { 13 };
+    let mask = (1u32 << shift) - 1;
+    let dropped = implicit & mask;
+    let half = 1u32 << (shift - 1);
+    let mut truncated = implicit >> shift;
+    if dropped > half || (dropped == half && (truncated & 1) == 1) {
+        truncated = truncated.wrapping_add(1);
+    }
+    if unbiased < -14 {
+        if truncated >= 0x400 { return sign | (1 << 10); }
+        return sign | (truncated as u16);
+    }
+    let mut h_exp = (unbiased + 15) as u32;
+    if truncated >= 0x800 {
+        h_exp += 1;
+        if h_exp >= 0x1F { return sign | 0x7C00; }
+        return sign | ((h_exp as u16) << 10);
+    }
+    sign | ((h_exp as u16) << 10) | ((truncated & 0x3FF) as u16)
 }
 "#,
         );

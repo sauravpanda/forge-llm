@@ -2,6 +2,67 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.9.7] — 2026-04-29 — `f32_to_f16` round-to-nearest-even (fixes Q4_K simulate path)
+
+Fixes the v0.9.6 known-limitation: `--simulate-q4k` no longer produces
+catastrophic perplexity.  The bug was a single line in `f32_to_f16` —
+`mant >> 13` truncates instead of rounding to nearest even, biasing every
+f16 stored scale toward zero.  Per-element error is small (~0.05% relative)
+but compounds through stacked matmuls (V·O in attention) into a systematic
+~0.03 mean shift on dequant output, which is enough to dominate the signal.
+
+### Result
+
+- `--simulate-q4k qkx2` on Llama-3.2-1B-Q8_0 baseline:
+  **ppl 423,338 → 4.57** (~92,000× improvement).  4.57 vs Q8_0 baseline
+  4.23 is +8%, the expected Q4_K-without-imatrix gap; the v0.9.5
+  `make_qkx2_quants` port is now validated end-to-end.
+- `--simulate-q4k naive`: ppl ≈ 4.55 — within statistical noise of qkx2 on
+  a 4.9 KB corpus.  Confirms naive (min, max) affine is competitive when
+  the underlying f16 scale storage is unbiased; the v0.9.5 quality grind
+  was nearly entirely amortized by this f16 bug masking real differences.
+
+### Fixed
+
+- **`crates/forgellm-frontend/src/weight_loader.rs::f32_to_f16`** — now
+  does proper round-to-nearest-even with subnormal handling, mantissa
+  carry, NaN preservation, and overflow-to-infinity.  Affects every Q4_0
+  / Q4_K / Q8_0 quantization scale stored to f16 from the frontend.
+- **`crates/forgellm-codegen-cpu/src/emit.rs`** — both copies of the
+  emitted `f32_to_f16_bits` helper (Q4_0 and Q8_0 sdot-kernel fallback
+  paths) updated to round-to-nearest-even.  Every AOT-compiled binary's
+  live activation quantization now uses unbiased scales too.
+- **`quantize_f32_to_q4_k`** — cleaned up super-block packing to match
+  ggml's reference verbatim: the_min / dmin are stored non-negative
+  end-to-end (no sign-juggling), L is re-quantized after 6-bit pack
+  using the f16-rounded effective scales.  Both pieces matter; the f16
+  fix was the dominant bug, the L refit and clean packing tighten the
+  remainder.
+
+### Added
+
+- `quantize_f32_to_q4_k_mean_bias_unbiased` /
+  `quantize_f32_to_q4_k_mean_bias_outlier_heavy` unit tests — assert the
+  per-element MEAN of `dequant - original` is within 5σ of chance for
+  Gaussian and outlier-heavy distributions.  v0.9.6's tests only
+  bounded max-err (per-element) and rms (total spread); both passed
+  with the f16 truncation bug present.  Mean-bias is what compounds in
+  matmuls and is now a regression gate.
+- `FORGE_PPL_DUMP_ERRORS=1` env var on `forge bench-perplexity
+  --simulate-q4k` — prints per-tensor `mean_x`, `mean_err`, `rms`,
+  `max_err`, `max|x|` so future quantizer regressions surface
+  immediately.
+
+### Files
+
+- `crates/forgellm-frontend/src/weight_loader.rs` — `f32_to_f16` rewrite,
+  Q4_K super-block packing cleanup, two new mean-bias tests.
+- `crates/forgellm-codegen-cpu/src/emit.rs` — emitted
+  `f32_to_f16_bits` rewrite (×2 sites).
+- `crates/forgellm-cli/src/main.rs` — `FORGE_PPL_DUMP_ERRORS` flag,
+  removed v0.9.6 catastrophic-perplexity warning text.
+- `Cargo.toml` — version 0.9.6 → 0.9.7.
+
 ## [0.9.6] — 2026-04-26 — `forge bench-perplexity` infrastructure
 
 Adds an objective quality benchmark for quantization-vs-baseline
