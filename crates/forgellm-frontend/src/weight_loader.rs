@@ -20,6 +20,9 @@ pub enum WeightData {
     Q4_0Raw(Vec<u8>),
     /// Raw Q4_K bytes: N_blocks * 144 bytes each super-block of 256 elements.
     Q4_KRaw(Vec<u8>),
+    /// Raw Q6_K bytes: N_blocks * 210 bytes each super-block of 256 elements.
+    /// Layout: [128B ql][64B qh][16B int8 scales][2B f16 d].
+    Q6_KRaw(Vec<u8>),
 }
 
 /// Model weights with mixed storage: Q8_0 kept as raw bytes, others as f32.
@@ -61,6 +64,14 @@ impl ModelWeightsRaw {
         }
     }
 
+    /// Get a Q6_K raw byte tensor by name.
+    pub fn get_q6k_raw(&self, name: &str) -> Option<&[u8]> {
+        match self.tensors.get(name) {
+            Some(WeightData::Q6_KRaw(v)) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+
     /// Number of loaded tensors.
     pub fn len(&self) -> usize {
         self.tensors.len()
@@ -80,6 +91,7 @@ impl ModelWeightsRaw {
                 WeightData::Q8_0Raw(b) => b.len(),
                 WeightData::Q4_0Raw(b) => b.len(),
                 WeightData::Q4_KRaw(b) => b.len(),
+                WeightData::Q6_KRaw(b) => b.len(),
             })
             .sum()
     }
@@ -154,6 +166,8 @@ pub fn load_from_file_mixed_with_target(
             GGMLType::F32 | GGMLType::F16 | GGMLType::BF16
         );
 
+        let want_q6k = target_dtype == Some(DType::Q6_K);
+
         let weight_data = if is_dense {
             let f32_data = dequantize(raw, tensor_info.ggml_type, numel)?;
             WeightData::F32(f32_data)
@@ -172,9 +186,22 @@ pub fn load_from_file_mixed_with_target(
                 let f32_data = dequantize(raw, tensor_info.ggml_type, numel)?;
                 WeightData::Q8_0Raw(quantize_f32_to_q8_0(&f32_data))
             }
+        } else if want_q6k {
+            // Q6_K target — same pattern as Q4_K.
+            if tensor_info.ggml_type == GGMLType::Q6K {
+                WeightData::Q6_KRaw(raw.to_vec())
+            } else if numel.is_multiple_of(256) {
+                let f32_data = dequantize(raw, tensor_info.ggml_type, numel)?;
+                WeightData::Q6_KRaw(quantize_f32_to_q6_k(&f32_data))
+            } else {
+                let f32_data = dequantize(raw, tensor_info.ggml_type, numel)?;
+                WeightData::Q8_0Raw(quantize_f32_to_q8_0(&f32_data))
+            }
         } else {
             // Default Q8_0 target.  Native Q8_0 / Q4_0 stay as raw bytes;
-            // everything else dequants to f32 and re-quantizes to Q8_0.
+            // everything else (including Q6_K — codegen still requires
+            // uniform Q8_0 / Q4_K projections in v0.9.11) dequants to f32
+            // and re-quantizes to Q8_0.
             match tensor_info.ggml_type {
                 GGMLType::Q8_0 => WeightData::Q8_0Raw(raw.to_vec()),
                 GGMLType::Q4_0 => WeightData::Q4_0Raw(raw.to_vec()),
@@ -590,6 +617,7 @@ fn weight_elem_count(w: &WeightData) -> usize {
         WeightData::Q8_0Raw(b) => b.len() / 34 * 32,
         WeightData::Q4_0Raw(b) => b.len() / 18 * 32,
         WeightData::Q4_KRaw(b) => b.len() / 144 * 256,
+        WeightData::Q6_KRaw(b) => b.len() / 210 * 256,
     }
 }
 
@@ -643,6 +671,19 @@ fn split_weight_three(
                 WeightData::Q4_KRaw(b[b1 + b2..].to_vec()),
             )
         }
+        WeightData::Q6_KRaw(b) => {
+            assert!(n1.is_multiple_of(256) && n2.is_multiple_of(256) && n3.is_multiple_of(256),
+                "Q6_K three-way split requires each part to be a multiple of 256; got {n1}, {n2}, {n3}");
+            let b1 = n1 / 256 * 210;
+            let b2 = n2 / 256 * 210;
+            let b3 = n3 / 256 * 210;
+            assert_eq!(b.len(), b1 + b2 + b3);
+            (
+                WeightData::Q6_KRaw(b[0..b1].to_vec()),
+                WeightData::Q6_KRaw(b[b1..b1 + b2].to_vec()),
+                WeightData::Q6_KRaw(b[b1 + b2..].to_vec()),
+            )
+        }
     }
 }
 
@@ -682,6 +723,17 @@ fn split_weight_two(w: &WeightData, n1: usize, n2: usize) -> (WeightData, Weight
             (
                 WeightData::Q4_KRaw(b[0..b1].to_vec()),
                 WeightData::Q4_KRaw(b[b1..].to_vec()),
+            )
+        }
+        WeightData::Q6_KRaw(b) => {
+            assert!(n1.is_multiple_of(256) && n2.is_multiple_of(256),
+                "Q6_K two-way split requires each part to be a multiple of 256; got {n1}, {n2}");
+            let b1 = n1 / 256 * 210;
+            let b2 = n2 / 256 * 210;
+            assert_eq!(b.len(), b1 + b2);
+            (
+                WeightData::Q6_KRaw(b[0..b1].to_vec()),
+                WeightData::Q6_KRaw(b[b1..].to_vec()),
             )
         }
     }
@@ -1912,6 +1964,242 @@ pub fn dot_q4_k_q8_0(weight_q4k: &[u8], input_q8: &[u8], k: usize) -> f32 {
     acc
 }
 
+/// Per-sub-block Q6_K quantizer (16 elements per sub-block).
+///
+/// Returns `(scale, L)` where `dequant(L[i]) = scale * L[i]`, L ∈ [-32, 31].
+/// Simple `iscale = -nmax/max(|x|)` fit; unlike Q4_K's `make_qkx2_quants`
+/// there is no min/dmin offset (Q6_K is symmetric around zero).
+fn make_q6k_quants(x: &[f32]) -> (f32, [i8; 16]) {
+    debug_assert_eq!(x.len(), 16);
+    let mut max = 0.0f32;
+    let mut amax = 0.0f32;
+    for &v in x {
+        let av = v.abs();
+        if av > amax {
+            amax = av;
+            max = v;
+        }
+    }
+    if amax < 1e-30 {
+        return (0.0, [0i8; 16]);
+    }
+    let iscale = -32.0 / max;
+    let scale = 1.0 / iscale;
+    let mut l = [0i8; 16];
+    for i in 0..16 {
+        let q = (iscale * x[i]).round() as i32;
+        l[i] = q.clamp(-32, 31) as i8;
+    }
+    (scale, l)
+}
+
+/// Quantize f32 → Q6_K bytes.
+///
+/// Q6_K block layout (256 elements → 210 bytes):
+///   [0..128]   ql: low 4 bits of 256 quants, packed 2 per byte (interleaved)
+///   [128..192] qh: top 2 bits of 256 quants, packed 4 per byte
+///   [192..208] scales: 16 sub-block i8 scales
+///   [208..210] d: f16 super-block scale
+///
+/// Per-sub-block (16 elements) `make_q6k_quants` fit; super-block
+/// `iscale = -128 / signed_max_sub_scale`; L re-quantized with the
+/// effective `d * scales_q` to absorb the i8 rounding (matches the
+/// pattern Q4_K uses for `quantize_f32_to_q4_k`).
+pub fn quantize_f32_to_q6_k(data: &[f32]) -> Vec<u8> {
+    const BLOCK: usize = 256;
+    const BYTES: usize = 210;
+    const SUB: usize = 16;
+
+    let num_sb = data.len().div_ceil(BLOCK);
+    let mut out = vec![0u8; num_sb * BYTES];
+
+    for sb in 0..num_sb {
+        let base = sb * BLOCK;
+        let end = (base + BLOCK).min(data.len());
+        let block = &data[base..end];
+        let mut padded = [0.0f32; BLOCK];
+        padded[..block.len()].copy_from_slice(block);
+
+        // Per-sub-block fit.
+        let mut sub_scales = [0.0f32; 16];
+        for j in 0..16 {
+            let s0 = j * SUB;
+            let (scale, _l) = make_q6k_quants(&padded[s0..s0 + SUB]);
+            sub_scales[j] = scale;
+        }
+
+        // Super-block: pick the sub-scale with max |.|, sign-preserved.
+        let mut max_scale = 0.0f32;
+        let mut max_abs_scale = 0.0f32;
+        for &s in &sub_scales {
+            let abs = s.abs();
+            if abs > max_abs_scale {
+                max_abs_scale = abs;
+                max_scale = s;
+            }
+        }
+
+        let ob = sb * BYTES;
+        if max_abs_scale < 1e-30 {
+            // All zero block — write zeros.
+            for v in out[ob..ob + BYTES].iter_mut() {
+                *v = 0;
+            }
+            continue;
+        }
+
+        let super_iscale = -128.0 / max_scale;
+        let super_d = 1.0 / super_iscale;
+        let d_bits = f32_to_f16(super_d);
+
+        // Store d at offset 208-209.
+        out[ob + 208] = d_bits as u8;
+        out[ob + 209] = (d_bits >> 8) as u8;
+
+        // Quantize sub-scales to i8 at offset 192-207.
+        let mut scales_q = [0i8; 16];
+        for j in 0..16 {
+            let q = (super_iscale * sub_scales[j]).round() as i32;
+            scales_q[j] = q.clamp(-128, 127) as i8;
+            out[ob + 192 + j] = scales_q[j] as u8;
+        }
+
+        // Re-quantize L using effective stored scales (super_d * scales_q[j]).
+        // f16-round super_d to match what the dot kernel will see.
+        let super_d_stored = f16_to_f32(d_bits);
+        let mut l_full = [0i8; 256];
+        for j in 0..16 {
+            let s_eff = super_d_stored * scales_q[j] as f32;
+            if s_eff == 0.0 {
+                continue; // l_full default 0
+            }
+            let inv = 1.0 / s_eff;
+            let s0 = j * SUB;
+            for i in 0..SUB {
+                let q = (inv * padded[s0 + i]).round() as i32;
+                l_full[s0 + i] = q.clamp(-32, 31) as i8;
+            }
+        }
+
+        // Pack ql + qh.  Each "j_chunk" handles one 128-element half.
+        // L + 32 fits in [0, 63] (6 bits): low 4 → ql, top 2 → qh.
+        for j_chunk in [0usize, 128] {
+            let ql_base = ob + j_chunk / 2;
+            let qh_base = ob + 128 + j_chunk / 4;
+            for l in 0..32 {
+                let q1 = ((l_full[j_chunk + l] as i32) + 32) as u8;
+                let q2 = ((l_full[j_chunk + l + 32] as i32) + 32) as u8;
+                let q3 = ((l_full[j_chunk + l + 64] as i32) + 32) as u8;
+                let q4 = ((l_full[j_chunk + l + 96] as i32) + 32) as u8;
+
+                out[ql_base + l] = (q1 & 0x0F) | ((q3 & 0x0F) << 4);
+                out[ql_base + l + 32] = (q2 & 0x0F) | ((q4 & 0x0F) << 4);
+                out[qh_base + l] = (q1 >> 4)
+                    | ((q2 >> 4) << 2)
+                    | ((q3 >> 4) << 4)
+                    | ((q4 >> 4) << 6);
+            }
+        }
+    }
+
+    out
+}
+
+/// Public dequant accessor for Q6_K raw bytes (used by the simulate path
+/// and tests).
+pub fn dequantize_q6_k_to_f32(raw: &[u8], numel: usize) -> Vec<f32> {
+    dequant_q6_k(raw, numel)
+}
+
+/// Scalar Q6_K × Q8_0 dot product.
+///
+/// Q6_K super-block (256 elements) pairs with 8 Q8_0 input blocks (32 elem
+/// each).  Per-sub-block (16 elem) i8 scales × the super-block f16 d
+/// give the effective per-element weight scale.  Q6_K quants are stored
+/// as 6-bit unsigned in `[0, 63]` (= L + 32 with L ∈ [-32, 31]); we
+/// re-center to int8 before the dot.
+///
+/// Layout per Q8_0 input block within a Q6_K super-block:
+///
+/// | block | ql slice    | nibble | qh slice    | qh shift | scale lo/hi |
+/// |-------|-------------|--------|-------------|----------|-------------|
+/// | 0     | ql[0..32]   | low    | qh[0..32]   | 0        | sc[0]/sc[1] |
+/// | 1     | ql[32..64]  | low    | qh[0..32]   | 2        | sc[2]/sc[3] |
+/// | 2     | ql[0..32]   | high   | qh[0..32]   | 4        | sc[4]/sc[5] |
+/// | 3     | ql[32..64]  | high   | qh[0..32]   | 6        | sc[6]/sc[7] |
+/// | 4     | ql[64..96]  | low    | qh[32..64]  | 0        | sc[8]/sc[9] |
+/// | 5     | ql[96..128] | low    | qh[32..64]  | 2        | sc[10]/sc[11] |
+/// | 6     | ql[64..96]  | high   | qh[32..64]  | 4        | sc[12]/sc[13] |
+/// | 7     | ql[96..128] | high   | qh[32..64]  | 6        | sc[14]/sc[15] |
+pub fn dot_q6_k_q8_0(weight_q6k: &[u8], input_q8: &[u8], k: usize) -> f32 {
+    const Q6K_BLOCK: usize = 256;
+    const Q6K_BYTES: usize = 210;
+    const Q8_BYTES: usize = 34;
+    assert!(
+        k.is_multiple_of(Q6K_BLOCK),
+        "Q6_K dot requires k multiple of 256, got {k}"
+    );
+
+    let num_sb = k / Q6K_BLOCK;
+    let mut acc = 0.0f32;
+
+    // Per-block dispatch table: (ql_off, qh_off, nibble_shift, qh_shift, sc_idx_base).
+    let blocks: [(usize, usize, u32, u32, usize); 8] = [
+        (0, 0, 0, 0, 0),
+        (32, 0, 0, 2, 2),
+        (0, 0, 4, 4, 4),
+        (32, 0, 4, 6, 6),
+        (64, 32, 0, 0, 8),
+        (96, 32, 0, 2, 10),
+        (64, 32, 4, 4, 12),
+        (96, 32, 4, 6, 14),
+    ];
+
+    for sb in 0..num_sb {
+        let wb = sb * Q6K_BYTES;
+        let ql = &weight_q6k[wb..wb + 128];
+        let qh = &weight_q6k[wb + 128..wb + 192];
+        let scales = &weight_q6k[wb + 192..wb + 208];
+        let d_bits = u16::from_le_bytes([weight_q6k[wb + 208], weight_q6k[wb + 209]]);
+        let d = f16_to_f32(d_bits);
+
+        let x_block_base = sb * 8 * Q8_BYTES;
+
+        for (q8_blk, &(ql_off, qh_off, nibble_shift, qh_shift, sc_idx)) in blocks.iter().enumerate() {
+            let x_off = x_block_base + q8_blk * Q8_BYTES;
+            let x_scale = f16_to_f32(u16::from_le_bytes([
+                input_q8[x_off],
+                input_q8[x_off + 1],
+            ]));
+            let x_i8 = &input_q8[x_off + 2..x_off + 34];
+
+            let sc_lo = scales[sc_idx] as i8 as i32;
+            let sc_hi = scales[sc_idx + 1] as i8 as i32;
+
+            let mut dot_lo = 0i32;
+            let mut dot_hi = 0i32;
+            for l in 0..16 {
+                let q6_unsigned = ((ql[ql_off + l] >> nibble_shift) & 0x0F) as i32
+                    | (((qh[qh_off + l] >> qh_shift) & 0x03) as i32) << 4;
+                let q6 = q6_unsigned - 32;
+                let xi = x_i8[l] as i8 as i32;
+                dot_lo += q6 * xi;
+            }
+            for l in 16..32 {
+                let q6_unsigned = ((ql[ql_off + l] >> nibble_shift) & 0x0F) as i32
+                    | (((qh[qh_off + l] >> qh_shift) & 0x03) as i32) << 4;
+                let q6 = q6_unsigned - 32;
+                let xi = x_i8[l] as i8 as i32;
+                dot_hi += q6 * xi;
+            }
+
+            acc += d * x_scale * (sc_lo as f32 * dot_lo as f32 + sc_hi as f32 * dot_hi as f32);
+        }
+    }
+
+    acc
+}
+
 /// AArch64 NEON 4-row variant of `dot_q4_k_q8_0`.  Computes the dot product
 /// of one Q8_0 input row against four Q4_K weight rows simultaneously.
 ///
@@ -2595,6 +2883,103 @@ mod tests {
         for v in recovered {
             assert!(v.abs() < 1e-3, "zero block dequanted to {v}");
         }
+    }
+
+    #[test]
+    fn quantize_f32_to_q6_k_round_trip_smooth() {
+        // Smooth ramp across two super-blocks; 32 nominal levels in Q6_K
+        // (signed [-32,31] → 64 levels but the per-sub-block i8 scale carries
+        // most of the dynamic range).  Per-element error should be well
+        // under 1% of amplitude.
+        let values: Vec<f32> = (0..512).map(|i| (i as f32 - 256.0) * 0.005).collect();
+        let q6k = quantize_f32_to_q6_k(&values);
+        assert_eq!(q6k.len(), 2 * 210);
+        let recovered = dequantize_q6_k_to_f32(&q6k, values.len());
+        let max_err = values
+            .iter()
+            .zip(&recovered)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_err < 0.02, "Q6_K round-trip max error too large: {max_err}");
+    }
+
+    #[test]
+    fn quantize_f32_to_q6_k_mean_bias_unbiased() {
+        // Same regression gate as Q4_K: an unbiased quantizer has |mean_err|
+        // within a few σ of chance.  Catches a sign-flipped or systematic
+        // scale-shift bug that would silently compound through stacked
+        // matmuls.
+        let mut state: u32 = 0xfeedbabe;
+        let mut next = || -> u32 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        let mut values = Vec::with_capacity(4096);
+        while values.len() < 4096 {
+            let u1 = ((next() as f32) / (u32::MAX as f32)).max(1e-7);
+            let u2 = (next() as f32) / (u32::MAX as f32);
+            let r = (-2.0 * u1.ln()).sqrt();
+            let theta = 2.0 * std::f32::consts::PI * u2;
+            values.push(0.05 * r * theta.cos());
+            values.push(0.05 * r * theta.sin());
+        }
+        values.truncate(4096);
+
+        let q6k = quantize_f32_to_q6_k(&values);
+        let recovered = dequantize_q6_k_to_f32(&q6k, values.len());
+
+        let mut sum_err = 0.0f64;
+        let mut sse = 0.0f64;
+        for (a, b) in values.iter().zip(&recovered) {
+            let e = (b - a) as f64;
+            sum_err += e;
+            sse += e * e;
+        }
+        let n = values.len() as f64;
+        let mean_err = sum_err / n;
+        let rms = (sse / n).sqrt();
+        let chance_bound = 5.0 * rms / n.sqrt();
+        assert!(
+            mean_err.abs() < chance_bound,
+            "Q6_K quantizer is BIASED: mean_err={mean_err:.6}, rms={rms:.6}, \
+             chance_bound={chance_bound:.6} (5σ).",
+        );
+    }
+
+    #[test]
+    fn quantize_f32_to_q6_k_round_trip_zero_block() {
+        let values = vec![0.0f32; 256];
+        let q6k = quantize_f32_to_q6_k(&values);
+        let recovered = dequantize_q6_k_to_f32(&q6k, 256);
+        for v in recovered {
+            assert!(v.abs() < 1e-3, "zero block dequanted to {v}");
+        }
+    }
+
+    #[test]
+    fn dot_q6_k_q8_0_matches_f32_reference() {
+        // 256 elements, smooth varied input/weight.  Compare scalar
+        // dot_q6_k_q8_0 against the f32 reference (dequant W, dequant X,
+        // sum w*x).  Tight tolerance — Q6_K is high-precision so the
+        // reconstruction error per element is small.
+        let weight_f32: Vec<f32> = (0..256)
+            .map(|i| ((i as f32 - 128.0) * 0.01).cos() * 0.3)
+            .collect();
+        let input_f32: Vec<f32> = (0..256).map(|i| (i as f32 * 0.07).sin() * 0.4).collect();
+
+        let weight_q6k = quantize_f32_to_q6_k(&weight_f32);
+        let input_q8 = quantize_f32_to_q8_0(&input_f32);
+
+        // f32 reference: dequant both, dot.
+        let weight_dq = dequantize_q6_k_to_f32(&weight_q6k, 256);
+        let input_dq = dequant_q8_0(&input_q8, 256);
+        let f32_dot: f32 = weight_dq.iter().zip(&input_dq).map(|(w, x)| w * x).sum();
+
+        let q_dot = dot_q6_k_q8_0(&weight_q6k, &input_q8, 256);
+        let rel = (q_dot - f32_dot).abs() / f32_dot.abs().max(1e-6);
+        assert!(rel < 1e-3, "f32_dot={f32_dot} q_dot={q_dot} rel_err={rel}");
     }
 
     #[test]

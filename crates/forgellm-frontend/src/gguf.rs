@@ -172,9 +172,13 @@ impl GGMLType {
             // emits the native Q4_K kernel family for it.
             GGMLType::Q4K => DType::Q4_K,
             // Everything else quantized → Q8_0 post-load (re-quantized by the
-            // weight loader).  In a Q4_K-target build, Q5_K / Q6_K / Q5_0 /
-            // etc. are re-quantized to Q4_K instead, so a "majority Q4_K"
-            // GGUF compiles uniformly through the Q4_K path.
+            // weight loader).  Q6_K → DType::Q8_0 here even though the
+            // weight_loader can preserve Q6_K bytes under an explicit Q6_K
+            // target — the codegen path requires uniform Q4_K / Q8_0
+            // projections through v0.9.11, so reporting Q6_K here would
+            // make `detect_gguf_dtype` flip the majority pick on mixed
+            // Q4_K_M GGUFs in a way codegen can't yet handle.  Lifted in
+            // v0.9.12 once Q6_K codegen lands.
             GGMLType::Q8_0
             | GGMLType::Q8_1
             | GGMLType::Q8K
@@ -704,6 +708,9 @@ mod tests {
         assert_eq!(GGMLType::Q4K.to_dtype(), DType::Q4_K);
         // Higher-precision K-quants go to Q8_0 by default (or are
         // requantized to Q4_K under a Q4_K target — that's a loader concern).
+        // Q6_K stays mapped to Q8_0 in v0.9.11 even though
+        // `WeightData::Q6_KRaw` exists and `quantize_f32_to_q6_k` is
+        // implemented — codegen support comes in v0.9.12.
         assert_eq!(GGMLType::Q5K.to_dtype(), DType::Q8_0);
         assert_eq!(GGMLType::Q6K.to_dtype(), DType::Q8_0);
         assert_eq!(GGMLType::Q3K.to_dtype(), DType::Q8_0);

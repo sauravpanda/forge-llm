@@ -2428,6 +2428,9 @@ fn cmd_export_weights_impl(
                 Some(WeightData::Q4_KRaw(b)) => {
                     data.extend_from_slice(b);
                 }
+                Some(WeightData::Q6_KRaw(b)) => {
+                    data.extend_from_slice(b);
+                }
                 None => {
                     // lm_head fallback: use embed_tokens (same as lm_head in tied-weight models)
                     if name == "lm_head.weight" {
@@ -2459,6 +2462,9 @@ fn cmd_export_weights_impl(
                                 data.extend_from_slice(b);
                             }
                             Some(WeightData::Q4_KRaw(b)) => {
+                                data.extend_from_slice(b);
+                            }
+                            Some(WeightData::Q6_KRaw(b)) => {
                                 data.extend_from_slice(b);
                             }
                             None => bail!("neither lm_head nor embed_tokens found"),
@@ -2493,6 +2499,12 @@ fn cmd_export_weights_impl(
                 }
                 Some(WeightData::Q4_KRaw(b)) => {
                     let f32s = forgellm_frontend::weight_loader::dequantize_q4_k_to_f32(b, numel);
+                    for val in f32s {
+                        data.extend_from_slice(&val.to_le_bytes());
+                    }
+                }
+                Some(WeightData::Q6_KRaw(b)) => {
+                    let f32s = forgellm_frontend::weight_loader::dequantize_q6_k_to_f32(b, numel);
                     for val in f32s {
                         data.extend_from_slice(&val.to_le_bytes());
                     }

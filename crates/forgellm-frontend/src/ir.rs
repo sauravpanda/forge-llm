@@ -32,6 +32,8 @@ pub enum DType {
     Q4_1,
     /// 4-bit K-quant — 256-element super-block, per-sub-block 6-bit scale + 6-bit min.
     Q4_K,
+    /// 6-bit K-quant — 256-element super-block, per-16-elem int8 scale, no min.
+    Q6_K,
     /// 2-bit quantized
     Q2,
     /// 4-bit NormalFloat (for QLoRA)
@@ -50,6 +52,7 @@ impl DType {
             DType::I64 => 8,
             // Quantized types: return 1 as a placeholder; actual size depends on block size
             DType::Q4_0 | DType::Q4_1 | DType::Q4_K | DType::NF4 => 1,
+            DType::Q6_K => 1,
             DType::Q2 => 1,
         }
     }
@@ -81,6 +84,7 @@ impl fmt::Display for DType {
             DType::Q4_0 => write!(f, "q4_0"),
             DType::Q4_1 => write!(f, "q4_1"),
             DType::Q4_K => write!(f, "q4_k"),
+            DType::Q6_K => write!(f, "q6_k"),
             DType::Q2 => write!(f, "q2"),
             DType::NF4 => write!(f, "nf4"),
             DType::I32 => write!(f, "i32"),

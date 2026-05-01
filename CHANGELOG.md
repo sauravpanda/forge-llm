@@ -2,6 +2,64 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.9.11] — 2026-05-01 — Native Q6_K quantizer + dot kernel (foundation)
+
+Q4_K_M GGUFs ship `attn_v` and `ffn_down` as Q6_K, which historically
+got dequantized at load and re-quantized to Q8_0 (≈2× memory blowup).
+This release lays the foundation for native Q6_K storage: a quantizer,
+a scalar reference dot kernel, the `WeightData::Q6_KRaw` variant, and
+the `Q6_K` target option in `load_from_file_mixed_with_target`.
+
+Codegen / AOT integration is intentionally deferred to v0.9.12: shipping
+the loader change plus codegen in one release would break AOT builds
+on any GGUF that contains Q6_K tensors before the kernel emission lands.
+The default loader path is unchanged in v0.9.11 — Q6_K still gets
+re-quantized to Q8_0 unless the caller explicitly requests
+`Some(DType::Q6_K)` as the target.
+
+### Added
+
+- **`forgellm_frontend::ir::DType::Q6_K`** — new dtype variant.
+- **`WeightData::Q6_KRaw(Vec<u8>)`** + `get_q6k_raw()` accessor +
+  matching arms in `weight_elem_count`, `split_weight_two`,
+  `split_weight_three`, `memory_bytes`.
+- **`pub fn quantize_f32_to_q6_k(data: &[f32]) -> Vec<u8>`** — F32 → Q6_K
+  bytes.  Per-sub-block (16-elem) `iscale = -32 / signed_max` fit, then
+  super-block `iscale = -128 / max_signed_sub_scale`, with L
+  re-quantized using the f16-rounded effective scales (the same fix
+  pattern v0.9.7 applied to Q4_K).
+- **`pub fn dequantize_q6_k_to_f32`** — public dequant accessor.
+- **`pub fn dot_q6_k_q8_0(weight, input, k)`** — scalar reference dot.
+  Per-Q8_0-block dispatch table maps each of the 8 Q8_0 blocks per
+  super-block to its `(ql_off, qh_off, nibble_shift, qh_shift,
+  scale_idx)` slot.
+- **Q6_K target arm** in `load_from_file_mixed_with_target` — accepts
+  `Some(DType::Q6_K)`; preserves native Q6_K bytes, requantizes other
+  source formats through F32, falls back to Q8_0 for tensors whose
+  numel isn't a multiple of 256.
+
+### Tests
+
+- `quantize_f32_to_q6_k_round_trip_smooth` — smooth ramp, max element
+  error < 0.02 over two super-blocks.
+- `quantize_f32_to_q6_k_round_trip_zero_block` — all-zero block dequants
+  to ≈ 0.
+- `quantize_f32_to_q6_k_mean_bias_unbiased` — same regression gate Q4_K
+  uses (|mean_err| within 5σ of chance on 4 K Gaussian samples) so a
+  systematic bias can't slip in.
+- `dot_q6_k_q8_0_matches_f32_reference` — kernel matches the
+  dequant-then-f32-dot reference within 1e-3 relative error.
+
+### Why split this from v0.9.12
+
+Adding Q6_K codegen integration would touch ~15 dispatch sites in
+`forgellm-codegen-cpu` (forward, forward_prefill,
+forward_prefill_batched, weight slicing, project.rs row-byte
+calc) plus a new `emit_q6_k_kernel`.  Shipping the foundation
+separately makes the v0.9.12 codegen patch easier to review against a
+green test suite and keeps Q6_K-containing GGUFs working through the
+existing requantization path until codegen catches up.
+
 ## [0.9.10] — 2026-05-01 — `--force-q4k` (AOT Q4_K codegen validated)
 
 Closes the Q4_K validation story.  v0.9.7 fixed the f16 round-to-nearest
