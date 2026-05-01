@@ -2,6 +2,49 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.9.9] — 2026-04-30 — AOT `--score-corpus` perplexity mode (codegen validated)
+
+Adds a corpus-scoring perplexity mode to AOT-compiled binaries.  Mirrors
+the interpreter's `forge bench-perplexity` semantics so the two paths
+produce comparable numbers on identical inputs.  Closes the v0.9.7 / 0.9.8
+validation gap: until now, "is the AOT codegen producing correct logits?"
+was inferred from short greedy-token agreement, which only confirms
+top-1 stability and is fragile to FP32 noise on near-tied candidates.
+
+### Result — AOT codegen mathematically validated
+
+SmolLM2-135M-Q8_0 on the 4.9 KB factual-prose corpus:
+
+| path                        | ppl    | BPB    | tok/s |
+| --------------------------- | ------ | ------ | ----- |
+| AOT  `--score-corpus`       | 5.4763 | 0.4770 | 135   |
+| Interpreter `bench-perplexity` | 5.4597 | 0.4762 | 95    |
+
+ppl agreement: **0.30%** — well inside FP32-rounding tolerance for two
+independent forward implementations.  Per-chunk numbers match within
+~0.06% on both chunks.  AOT runs ~40% faster on this model.
+
+### Added
+
+- `crates/forgellm-codegen-cpu/src/project.rs` — both AOT main.rs
+  templates (regular + `--embed-weights`) now emit a `--score-corpus
+  <path> [--chunk-size N=512] [--max-chunks N=0]` mode.  Token-by-token
+  log-softmax accumulator (numerically stable; max-shift before
+  `sum_exp.ln()`).  Reuses `model::forward` (no batched prefill) so the
+  numerical path matches the interpreter.
+
+### Why this matters
+
+- v0.9.7 fixed the f16 round-to-nearest bug at the *quantizer* layer.
+  The simulate-Q4_K interpreter ppl confirmed it works.
+- v0.9.8 fixed an unrelated CLI parser bug found while spot-checking the
+  AOT binary.  Greedy match for ~4 tokens hinted the codegen was healthy
+  but didn't *measure* it.
+- v0.9.9 closes that gap: AOT-Q8_0 ppl matches interpreter-Q8_0 ppl
+  end-to-end, so future quantizer / kernel work can use the AOT path as
+  ground truth without a separate validation step.  Once a Q4_K_M GGUF
+  is on hand, the same diff lights up the AOT-Q4_K path too.
+
 ## [0.9.8] — 2026-04-29 — AOT binary CLI parser fix
 
 Surfaced while validating the v0.9.7 fix end-to-end: AOT-compiled binaries

@@ -590,7 +590,8 @@ fn main() {{
     // the prompt.
     let prompt = {{
         let known_value_flags = ["--temp", "--top-k", "--top-p", "--max-tokens",
-            "--repeat-penalty", "--seed", "--save-cache", "--load-cache"];
+            "--repeat-penalty", "--seed", "--save-cache", "--load-cache",
+            "--score-corpus", "--chunk-size", "--max-chunks"];
         let known_bool_flags = ["--quiet", "-q"];
         let mut parts: Vec<String> = Vec::new();
         let mut i = 3;
@@ -605,6 +606,9 @@ fn main() {{
         parts.join(" ")
     }};
     let prompt = if prompt.is_empty() {{ "Hello".to_string() }} else {{ prompt }};
+    let score_corpus_path = args.windows(2).find(|w| w[0] == "--score-corpus").map(|w| w[1].clone());
+    let chunk_size = parse_usize_arg(&args, "--chunk-size", 512);
+    let max_chunks_score = parse_usize_arg(&args, "--max-chunks", 0);
 
     let t_load = std::time::Instant::now();
     eprintln!("Loading tokenizer...");
@@ -615,6 +619,68 @@ fn main() {{
     eprintln!("Load time: {{:.2}}s", t_load.elapsed().as_secs_f64());
     let mut cache = model::KVCache::new();
     if let Some(ref cp) = load_cache_path {{ load_kv_cache(cp, &mut cache); }}
+
+    // --score-corpus: token-by-token perplexity over a UTF-8 corpus.
+    // Mirrors `forge bench-perplexity` interpreter semantics so AOT
+    // numbers can be A/B-compared apples-to-apples.  Uses model::forward
+    // (per-token, no batched prefill) to match the interpreter's path.
+    if let Some(ref corpus_path) = score_corpus_path {{
+        eprintln!("Reading corpus from {{}}...", corpus_path);
+        let text = std::fs::read_to_string(corpus_path).expect("failed to read corpus");
+        let utf8_bytes = text.len();
+        eprintln!("Corpus: {{}} UTF-8 bytes", utf8_bytes);
+        let enc = tokenizer.encode(text.as_str(), false).expect("encode failed");
+        let tokens: Vec<u32> = enc.get_ids().to_vec();
+        let n_chunks_total = (tokens.len() + chunk_size - 1) / chunk_size;
+        let n_chunks = if max_chunks_score == 0 {{ n_chunks_total }} else {{ n_chunks_total.min(max_chunks_score) }};
+        eprintln!("Tokenized to {{}} tokens; chunk_size = {{}} ({{}} chunks)",
+            tokens.len(), chunk_size, n_chunks);
+        let mut total_nll = 0.0f64;
+        let mut total_tokens = 0usize;
+        let t_score = std::time::Instant::now();
+        for chunk_idx in 0..n_chunks {{
+            let start = chunk_idx * chunk_size;
+            let end = (start + chunk_size).min(tokens.len());
+            let chunk = &tokens[start..end];
+            if chunk.len() < 2 {{ continue; }}
+            let mut scache = model::KVCache::new();
+            let mut logits = model::forward(chunk[0], &weights, &mut scache);
+            let mut chunk_nll = 0.0f64;
+            let chunk_t0 = std::time::Instant::now();
+            for i in 1..chunk.len() {{
+                let target = chunk[i] as usize;
+                let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum_exp = 0.0f64;
+                for &l in logits.iter() {{ sum_exp += ((l - max_l) as f64).exp(); }}
+                let log_z = (max_l as f64) + sum_exp.ln();
+                let log_p = (logits[target] as f64) - log_z;
+                chunk_nll -= log_p;
+                logits = model::forward(chunk[i], &weights, &mut scache);
+            }}
+            let n = (chunk.len() - 1) as f64;
+            let cppl = (chunk_nll / n).exp();
+            total_nll += chunk_nll;
+            total_tokens += chunk.len() - 1;
+            let running = (total_nll / total_tokens.max(1) as f64).exp();
+            let dt = chunk_t0.elapsed().as_secs_f64().max(1e-9);
+            let tps = (chunk.len() - 1) as f64 / dt;
+            eprintln!("[chunk {{:>4}}] tokens={{:>4}} ppl={{:>7.3}} running_ppl={{:>7.3}} ({{:.1}} tok/s)",
+                chunk_idx + 1, chunk.len() - 1, cppl, running, tps);
+        }}
+        let elapsed = t_score.elapsed().as_secs_f64().max(1e-9);
+        let mean_nll = total_nll / total_tokens.max(1) as f64;
+        let ppl = mean_nll.exp();
+        let bpb = total_nll / (utf8_bytes.max(1) as f64) / 2.0_f64.ln();
+        println!();
+        println!("--- Perplexity ---");
+        println!("Predicted tokens : {{}}", total_tokens);
+        println!("Mean NLL (nats)  : {{:.4}}", mean_nll);
+        println!("Perplexity       : {{:.4}}", ppl);
+        println!("Bits per byte    : {{:.4}}", bpb);
+        println!("Throughput       : {{:.1}} tok/s ({{:.2}}s total)",
+            total_tokens as f64 / elapsed, elapsed);
+        return;
+    }}
 
     let enc = tokenizer.encode(prompt.as_str(), false).expect("encode failed");
     let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
@@ -974,7 +1040,8 @@ fn main() {{
     // flag-only switches.
     let prompt = {{
         let known_value_flags = ["--temp", "--top-k", "--top-p", "--max-tokens",
-            "--repeat-penalty", "--seed", "--save-cache", "--load-cache"];
+            "--repeat-penalty", "--seed", "--save-cache", "--load-cache",
+            "--score-corpus", "--chunk-size", "--max-chunks"];
         let known_bool_flags = ["--quiet", "-q"];
         let mut parts: Vec<String> = Vec::new();
         let mut i = 1;
@@ -989,6 +1056,9 @@ fn main() {{
         parts.join(" ")
     }};
     let prompt = if prompt.is_empty() {{ "Hello".to_string() }} else {{ prompt }};
+    let score_corpus_path = args.windows(2).find(|w| w[0] == "--score-corpus").map(|w| w[1].clone());
+    let chunk_size = parse_usize_arg(&args, "--chunk-size", 512);
+    let max_chunks_score = parse_usize_arg(&args, "--max-chunks", 0);
 
     eprintln!("AOT-compiled {arch} | {num_layers} layers | hidden={hidden} | weights embedded");
 
@@ -1001,6 +1071,65 @@ fn main() {{
     eprintln!("Load time: {{:.2}}s", t_load.elapsed().as_secs_f64());
     let mut cache = model::KVCache::new();
     if let Some(ref cp) = load_cache_path {{ load_kv_cache(cp, &mut cache); }}
+
+    // --score-corpus: token-by-token perplexity over a UTF-8 corpus.
+    if let Some(ref corpus_path) = score_corpus_path {{
+        eprintln!("Reading corpus from {{}}...", corpus_path);
+        let text = std::fs::read_to_string(corpus_path).expect("failed to read corpus");
+        let utf8_bytes = text.len();
+        eprintln!("Corpus: {{}} UTF-8 bytes", utf8_bytes);
+        let enc = tokenizer.encode(text.as_str(), false).expect("encode failed");
+        let tokens: Vec<u32> = enc.get_ids().to_vec();
+        let n_chunks_total = (tokens.len() + chunk_size - 1) / chunk_size;
+        let n_chunks = if max_chunks_score == 0 {{ n_chunks_total }} else {{ n_chunks_total.min(max_chunks_score) }};
+        eprintln!("Tokenized to {{}} tokens; chunk_size = {{}} ({{}} chunks)",
+            tokens.len(), chunk_size, n_chunks);
+        let mut total_nll = 0.0f64;
+        let mut total_tokens = 0usize;
+        let t_score = std::time::Instant::now();
+        for chunk_idx in 0..n_chunks {{
+            let start = chunk_idx * chunk_size;
+            let end = (start + chunk_size).min(tokens.len());
+            let chunk = &tokens[start..end];
+            if chunk.len() < 2 {{ continue; }}
+            let mut scache = model::KVCache::new();
+            let mut logits = model::forward(chunk[0], &weights, &mut scache);
+            let mut chunk_nll = 0.0f64;
+            let chunk_t0 = std::time::Instant::now();
+            for i in 1..chunk.len() {{
+                let target = chunk[i] as usize;
+                let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum_exp = 0.0f64;
+                for &l in logits.iter() {{ sum_exp += ((l - max_l) as f64).exp(); }}
+                let log_z = (max_l as f64) + sum_exp.ln();
+                let log_p = (logits[target] as f64) - log_z;
+                chunk_nll -= log_p;
+                logits = model::forward(chunk[i], &weights, &mut scache);
+            }}
+            let n = (chunk.len() - 1) as f64;
+            let cppl = (chunk_nll / n).exp();
+            total_nll += chunk_nll;
+            total_tokens += chunk.len() - 1;
+            let running = (total_nll / total_tokens.max(1) as f64).exp();
+            let dt = chunk_t0.elapsed().as_secs_f64().max(1e-9);
+            let tps = (chunk.len() - 1) as f64 / dt;
+            eprintln!("[chunk {{:>4}}] tokens={{:>4}} ppl={{:>7.3}} running_ppl={{:>7.3}} ({{:.1}} tok/s)",
+                chunk_idx + 1, chunk.len() - 1, cppl, running, tps);
+        }}
+        let elapsed = t_score.elapsed().as_secs_f64().max(1e-9);
+        let mean_nll = total_nll / total_tokens.max(1) as f64;
+        let ppl = mean_nll.exp();
+        let bpb = total_nll / (utf8_bytes.max(1) as f64) / 2.0_f64.ln();
+        println!();
+        println!("--- Perplexity ---");
+        println!("Predicted tokens : {{}}", total_tokens);
+        println!("Mean NLL (nats)  : {{:.4}}", mean_nll);
+        println!("Perplexity       : {{:.4}}", ppl);
+        println!("Bits per byte    : {{:.4}}", bpb);
+        println!("Throughput       : {{:.1}} tok/s ({{:.2}}s total)",
+            total_tokens as f64 / elapsed, elapsed);
+        return;
+    }}
 
     let enc = tokenizer.encode(prompt.as_str(), false).expect("encode failed");
     let prompt_tokens: Vec<u32> = enc.get_ids().to_vec();
