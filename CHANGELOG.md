@@ -2,6 +2,54 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.9.10] — 2026-05-01 — `--force-q4k` (AOT Q4_K codegen validated)
+
+Closes the Q4_K validation story.  v0.9.7 fixed the f16 round-to-nearest
+bug so the simulate-Q4_K interpreter path scored sane perplexity (4.57)
+on Llama-3.2-1B-Q8_0; v0.9.9 added `--score-corpus` to AOT binaries so
+the AOT codegen path could be measured the same way.  This release
+adds `--force-q4k` to `forge compile` / `forge export-weights`,
+re-quantizing projection weights via `quantize_f32_to_q4_k` (the
+v0.9.7-fixed quantizer) at compile time.  That makes Q8_0 source GGUFs
+suitable for AOT-Q4_K validation without needing a Q4_K_M file on disk.
+
+### Result — AOT Q4_K codegen agrees with interpreter simulate path
+
+Llama-3.2-1B-Q8_0 → `--force-q4k` → AOT-Q4_K, scored on 4.9 KB factual
+corpus:
+
+| path                                  | ppl    | BPB    | tok/s |
+| ------------------------------------- | ------ | ------ | ----- |
+| AOT-Q4_K `--score-corpus`             | 4.6332 | 0.4229 | 40    |
+| Interpreter `--simulate-q4k qkx2`     | 4.5733 | 0.4193 | 13    |
+
+ppl agreement: **1.31%** — well within FP32-rounding tolerance for two
+independent Q4_K dot-product implementations (codegen-emitted NEON sdot
++ dot4 ILP vs. the interpreter's reference path through F32 dequant).
+AOT runs **3.2×** faster on the same model.
+
+Combined with v0.9.9's AOT-Q8_0 result (ppl 5.4763 vs interpreter
+5.4597, 0.30%), both quantization tiers are now math-validated
+end-to-end through the AOT path.
+
+### Added
+
+- `forge compile --force-q4k` and `forge export-weights --force-q4k`:
+  override the source GGUF projection dtype to Q4_K and re-quantize
+  through the in-tree `quantize_f32_to_q4_k`.  Norm tensors stay F32;
+  tensors whose `numel` isn't a multiple of 256 (Q4_K's super-block
+  size) fall back to Q8_0 with a notice.
+
+### Fixed
+
+- `crates/forgellm-frontend/src/weight_loader.rs::load_from_file_mixed_with_target`
+  — Q8_0 / Q4_0 source tensors used to short-circuit to their raw-bytes
+  variant *before* the `want_q4k` branch, so passing
+  `Some(DType::Q4_K)` against a Q8_0 GGUF silently kept Q8_0 bytes.
+  Restructured the match so the target-format branch wins when set.
+  This was the bug that made `--force-q4k` produce NaN logits on first
+  attempt; now resolved.
+
 ## [0.9.9] — 2026-04-30 — AOT `--score-corpus` perplexity mode (codegen validated)
 
 Adds a corpus-scoring perplexity mode to AOT-compiled binaries.  Mirrors

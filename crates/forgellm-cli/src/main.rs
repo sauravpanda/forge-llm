@@ -72,6 +72,12 @@ enum Commands {
         /// Path to a LoRA adapter file (.safetensors) to merge into the base weights at compile time
         #[arg(long)]
         lora: Option<String>,
+
+        /// Force projection weights to be re-quantized to Q4_K via the in-tree
+        /// quantizer.  Useful for A/B-testing the AOT-Q4_K path on Q8_0 / F32
+        /// source GGUFs without needing a Q4_K_M file on disk.
+        #[arg(long)]
+        force_q4k: bool,
     },
 
     /// Export model weights as a flat binary file for AOT binaries
@@ -83,6 +89,11 @@ enum Commands {
         /// Output path for the weights binary
         #[arg(long)]
         output: String,
+
+        /// Force projection weights to be re-quantized to Q4_K (mirrors
+        /// `forge compile --force-q4k`).
+        #[arg(long)]
+        force_q4k: bool,
     },
 
     /// Export a model to ONNX format
@@ -301,6 +312,7 @@ fn main() -> Result<()> {
             embed_weights,
             cross_target,
             lora,
+            force_q4k,
         } => cmd_compile(CompileArgs {
             model_path: &model,
             target: &target,
@@ -311,9 +323,12 @@ fn main() -> Result<()> {
             embed_weights,
             cross_target: cross_target.as_deref(),
             lora_path: lora.as_deref(),
+            force_q4k,
         })?,
 
-        Commands::ExportWeights { model, output } => cmd_export_weights(&model, &output)?,
+        Commands::ExportWeights { model, output, force_q4k } => {
+            cmd_export_weights_impl(&model, &output, None, force_q4k)?
+        }
 
         Commands::ExportOnnx { model, output } => {
             let config = load_model_config(&model)?;
@@ -753,6 +768,9 @@ struct CompileArgs<'a> {
     cross_target: Option<&'a str>,
     /// Optional path to a LoRA adapter (.safetensors) to merge at compile time.
     lora_path: Option<&'a str>,
+    /// If true, override the source GGUF dtype to Q4_K and requant projection
+    /// weights via `quantize_f32_to_q4_k`.
+    force_q4k: bool,
 }
 
 fn cmd_compile(args: CompileArgs<'_>) -> Result<()> {
@@ -766,9 +784,19 @@ fn cmd_compile(args: CompileArgs<'_>) -> Result<()> {
         embed_weights,
         cross_target,
         lora_path,
+        force_q4k,
     } = args;
     println!("Loading model config from {model_path}...");
-    let config = load_model_config(model_path)?;
+    let mut config = load_model_config(model_path)?;
+    if force_q4k {
+        use forgellm_frontend::ir::DType;
+        println!(
+            "--force-q4k: overriding projection dtype {:?} → Q4_K (re-quantizing via in-tree quantizer)",
+            config.dtype
+        );
+        config.dtype = DType::Q4_K;
+        config.lm_head_dtype = Some(DType::Q4_K);
+    }
     config
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid model config: {e}"))?;
@@ -790,7 +818,7 @@ fn cmd_compile(args: CompileArgs<'_>) -> Result<()> {
     if embed_weights {
         println!("Exporting weights for embedding...");
         let weights_path = output_dir.join("weights.bin");
-        cmd_export_weights_impl(model_path, &weights_path.to_string_lossy(), lora_path)?;
+        cmd_export_weights_impl(model_path, &weights_path.to_string_lossy(), lora_path, force_q4k)?;
 
         println!("Copying tokenizer for embedding...");
         let tokenizer_src = resolve_tokenizer(tokenizer_opt, model_path)?;
@@ -906,7 +934,7 @@ fn cmd_compile(args: CompileArgs<'_>) -> Result<()> {
         let weights_path = output_dir.join("weights.bin");
         let weights_path_str = weights_path.to_string_lossy().to_string();
         println!("[1/4] Exporting weights...");
-        cmd_export_weights_impl(model_path, &weights_path_str, lora_path)?;
+        cmd_export_weights_impl(model_path, &weights_path_str, lora_path, force_q4k)?;
 
         println!("[2/4] Resolving tokenizer...");
         let tokenizer_src = resolve_tokenizer(tokenizer_opt, model_path)?;
@@ -2315,19 +2343,28 @@ fn cmd_models(dir: &str) -> Result<()> {
 }
 
 fn cmd_export_weights(model_path: &str, output_path: &str) -> Result<()> {
-    cmd_export_weights_impl(model_path, output_path, None)
+    cmd_export_weights_impl(model_path, output_path, None, false)
 }
 
 fn cmd_export_weights_impl(
     model_path: &str,
     output_path: &str,
     lora_path: Option<&str>,
+    force_q4k: bool,
 ) -> Result<()> {
     use forgellm_frontend::ir::DType;
     use forgellm_frontend::weight_loader::{load_from_file_mixed_with_target, WeightData};
 
     eprintln!("Loading model from {model_path}...");
-    let config = load_model_config(model_path)?;
+    let mut config = load_model_config(model_path)?;
+    if force_q4k {
+        eprintln!(
+            "--force-q4k: overriding projection dtype {:?} → Q4_K",
+            config.dtype
+        );
+        config.dtype = DType::Q4_K;
+        config.lm_head_dtype = Some(DType::Q4_K);
+    }
 
     let is_q8 = config.dtype == DType::Q8_0;
     let is_q4 = config.dtype == DType::Q4_0;

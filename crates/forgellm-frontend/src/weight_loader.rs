@@ -147,26 +147,41 @@ pub fn load_from_file_mixed_with_target(
         let raw = &mmap[start..end];
         let hf_name = gguf_name_to_hf(&tensor_info.name);
 
-        let weight_data = match tensor_info.ggml_type {
-            GGMLType::Q8_0 => WeightData::Q8_0Raw(raw.to_vec()),
-            GGMLType::Q4_0 => WeightData::Q4_0Raw(raw.to_vec()),
-            // Dense / non-quantized: dequant to f32 and store dense.
-            GGMLType::F32 | GGMLType::F16 | GGMLType::BF16 => {
-                let f32_data = dequantize(raw, tensor_info.ggml_type, numel)?;
-                WeightData::F32(f32_data)
-            }
-            // Q4_K target: keep Q4_K raw; requant other K-quants to Q4_K.
-            GGMLType::Q4K if want_q4k => WeightData::Q4_KRaw(raw.to_vec()),
-            _ if want_q4k && numel.is_multiple_of(256) => {
-                // Other quantized format under a Q4_K target — requant via f32.
+        // Norms / dense F-format tensors: always store as F32 regardless of
+        // target, since the codegen expects F32 for these.
+        let is_dense = matches!(
+            tensor_info.ggml_type,
+            GGMLType::F32 | GGMLType::F16 | GGMLType::BF16
+        );
+
+        let weight_data = if is_dense {
+            let f32_data = dequantize(raw, tensor_info.ggml_type, numel)?;
+            WeightData::F32(f32_data)
+        } else if want_q4k {
+            // Q4_K target: prefer Q4_KRaw across all source formats.  If the
+            // source is already Q4_K, keep bytes verbatim; otherwise dequant
+            // to f32 and re-quantize through `quantize_f32_to_q4_k`.
+            // Tensors whose numel isn't a multiple of 256 fall back to Q8_0
+            // (a single Q4_K super-block is 256 elements).
+            if tensor_info.ggml_type == GGMLType::Q4K {
+                WeightData::Q4_KRaw(raw.to_vec())
+            } else if numel.is_multiple_of(256) {
                 let f32_data = dequantize(raw, tensor_info.ggml_type, numel)?;
                 WeightData::Q4_KRaw(quantize_f32_to_q4_k(&f32_data))
-            }
-            // Default (Q8_0) target, or Q4_K target with non-multiple-of-256
-            // numel: dequant → Q8_0 for everything else.
-            _ => {
+            } else {
                 let f32_data = dequantize(raw, tensor_info.ggml_type, numel)?;
                 WeightData::Q8_0Raw(quantize_f32_to_q8_0(&f32_data))
+            }
+        } else {
+            // Default Q8_0 target.  Native Q8_0 / Q4_0 stay as raw bytes;
+            // everything else dequants to f32 and re-quantizes to Q8_0.
+            match tensor_info.ggml_type {
+                GGMLType::Q8_0 => WeightData::Q8_0Raw(raw.to_vec()),
+                GGMLType::Q4_0 => WeightData::Q4_0Raw(raw.to_vec()),
+                _ => {
+                    let f32_data = dequantize(raw, tensor_info.ggml_type, numel)?;
+                    WeightData::Q8_0Raw(quantize_f32_to_q8_0(&f32_data))
+                }
             }
         };
 
