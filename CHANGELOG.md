@@ -2,6 +2,72 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.9.12] — 2026-05-01 — Q6_K codegen + AOT validation (closes the Q6_K arc)
+
+Builds on v0.9.11's foundation: emits a Q6_K dot kernel into AOT
+binaries, wires `is_q6k` / `lm_is_q6k` dispatch through every
+projection / lm_head emission site, threads `--force-q6k` through
+`forge compile` and `forge export-weights`, and validates the codegen
+end-to-end via `--score-corpus`.
+
+### Result — AOT Q6_K codegen mathematically validated
+
+Llama-3.2-1B-Q8_0 → `--force-q6k` → AOT-Q6_K, on 4.9 KB factual
+corpus:
+
+| path                                  | ppl    | BPB    | tok/s |
+| ------------------------------------- | ------ | ------ | ----- |
+| AOT-Q6_K  `--score-corpus`            | 4.2647 | 0.4000 | 13    |
+| Interpreter Q8_0 `bench-perplexity`   | 4.2294 | 0.3976 | 13    |
+
+Q6_K vs Q8_0 ppl: **+0.8%** — exactly the expected high-bit quant
+quality gap.  The +0.6% over AOT-Q4_K (4.5733) is also as expected
+(Q6_K is 6.5 bits/elem vs Q4_K's 4.5).  Storage: Q6_K row is 23%
+smaller than Q8_0 (1680 vs 2176 bytes for k=2048).
+
+Throughput is currently scalar-only (no NEON dot4 yet); ~3× slower
+than the AOT-Q4_K NEON sdot path on the same model.  v0.9.13 will
+add the NEON Q6_K kernel.
+
+### Added
+
+- **`emit_q6_k_kernel`** in codegen-cpu — emits scalar
+  `dot_q6_k_q8_0` into the AOT crate.  Reuses `f16_bits_to_f32` and
+  `quantize_to_q8_0_blocks_into` shared with the Q8_0/Q4_0/Q4_K kernel
+  families when any of them are also active.
+- **`emit_specialized_q6_k_matmul_functions`** — generates
+  `matmul_vec_q6_k_KxN` per (in, out) projection size.  Parallelizes
+  over output rows when total weight bytes > 1 MB.
+- **`is_q6k` / `lm_is_q6k` dispatch** in `emit_forward_function` and
+  `emit_prefill_function` (both QKV / o_proj / gate-up / down_proj /
+  lm_head sites + the `proj_type` / `lm_head_type` selection).
+- **Q6_K paths in `forgellm-codegen-cpu/src/project.rs`** — row-byte
+  helpers, weight-loading branch, weight-slicing for both regular and
+  `--embed-weights` builds.
+- **`forge compile --force-q6k`** and **`forge export-weights
+  --force-q6k`** — mirrors the `--force-q4k` flag.  Mutually exclusive
+  with `--force-q4k`.
+
+### Validated
+
+- All 339 workspace tests still pass; codegen tests still build
+  syntactically valid Rust for the Q6_K-containing emission.
+- Greedy continuation on Llama-3.2-1B-Q6_K produces coherent text
+  ("The capital of France is Paris. The capital of Germany is Berlin.
+  The capital of Italy is Rome.").
+- Per-chunk perplexity matches expected Q6_K quality: +0.8% over Q8_0,
+  and notably better than Q4_K (4.26 vs 4.57).
+
+### Deferred to v0.9.13
+
+- **NEON Q6_K dot kernel** — current scalar path runs at ~13 tok/s on
+  Llama-1B; AOT-Q4_K with NEON sdot runs at ~40 tok/s.  Adding
+  `dot4_q6_k_q8_0` with sdot ILP across 4 output rows should close
+  most of that gap.
+- **Per-tensor dtype mixing** — required to load real Q4_K_M GGUFs
+  (which mix Q4_K + Q6_K + F32 per tensor) without `--force-*`.
+  Currently codegen requires uniform projection dtype.
+
 ## [0.9.11] — 2026-05-01 — Native Q6_K quantizer + dot kernel (foundation)
 
 Q4_K_M GGUFs ship `attn_v` and `ffn_down` as Q6_K, which historically

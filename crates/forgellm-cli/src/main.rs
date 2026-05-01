@@ -78,6 +78,12 @@ enum Commands {
         /// source GGUFs without needing a Q4_K_M file on disk.
         #[arg(long)]
         force_q4k: bool,
+
+        /// Force projection weights to be re-quantized to Q6_K (v0.9.12+).
+        /// Same purpose as --force-q4k but routes through the native Q6_K
+        /// kernel.  Mutually exclusive with --force-q4k.
+        #[arg(long)]
+        force_q6k: bool,
     },
 
     /// Export model weights as a flat binary file for AOT binaries
@@ -94,6 +100,10 @@ enum Commands {
         /// `forge compile --force-q4k`).
         #[arg(long)]
         force_q4k: bool,
+
+        /// Force projection weights to be re-quantized to Q6_K.
+        #[arg(long)]
+        force_q6k: bool,
     },
 
     /// Export a model to ONNX format
@@ -313,21 +323,31 @@ fn main() -> Result<()> {
             cross_target,
             lora,
             force_q4k,
-        } => cmd_compile(CompileArgs {
-            model_path: &model,
-            target: &target,
-            output_path: &output,
-            run,
-            prompt: prompt.as_deref(),
-            tokenizer_opt: &tokenizer,
-            embed_weights,
-            cross_target: cross_target.as_deref(),
-            lora_path: lora.as_deref(),
-            force_q4k,
-        })?,
+            force_q6k,
+        } => {
+            if force_q4k && force_q6k {
+                bail!("--force-q4k and --force-q6k are mutually exclusive");
+            }
+            cmd_compile(CompileArgs {
+                model_path: &model,
+                target: &target,
+                output_path: &output,
+                run,
+                prompt: prompt.as_deref(),
+                tokenizer_opt: &tokenizer,
+                embed_weights,
+                cross_target: cross_target.as_deref(),
+                lora_path: lora.as_deref(),
+                force_q4k,
+                force_q6k,
+            })?
+        }
 
-        Commands::ExportWeights { model, output, force_q4k } => {
-            cmd_export_weights_impl(&model, &output, None, force_q4k)?
+        Commands::ExportWeights { model, output, force_q4k, force_q6k } => {
+            if force_q4k && force_q6k {
+                bail!("--force-q4k and --force-q6k are mutually exclusive");
+            }
+            cmd_export_weights_impl(&model, &output, None, force_q4k, force_q6k)?
         }
 
         Commands::ExportOnnx { model, output } => {
@@ -771,6 +791,9 @@ struct CompileArgs<'a> {
     /// If true, override the source GGUF dtype to Q4_K and requant projection
     /// weights via `quantize_f32_to_q4_k`.
     force_q4k: bool,
+    /// If true, override the source GGUF dtype to Q6_K and requant projection
+    /// weights via `quantize_f32_to_q6_k`.
+    force_q6k: bool,
 }
 
 fn cmd_compile(args: CompileArgs<'_>) -> Result<()> {
@@ -785,6 +808,7 @@ fn cmd_compile(args: CompileArgs<'_>) -> Result<()> {
         cross_target,
         lora_path,
         force_q4k,
+        force_q6k,
     } = args;
     println!("Loading model config from {model_path}...");
     let mut config = load_model_config(model_path)?;
@@ -796,6 +820,15 @@ fn cmd_compile(args: CompileArgs<'_>) -> Result<()> {
         );
         config.dtype = DType::Q4_K;
         config.lm_head_dtype = Some(DType::Q4_K);
+    }
+    if force_q6k {
+        use forgellm_frontend::ir::DType;
+        println!(
+            "--force-q6k: overriding projection dtype {:?} → Q6_K (re-quantizing via in-tree quantizer)",
+            config.dtype
+        );
+        config.dtype = DType::Q6_K;
+        config.lm_head_dtype = Some(DType::Q6_K);
     }
     config
         .validate()
@@ -818,7 +851,7 @@ fn cmd_compile(args: CompileArgs<'_>) -> Result<()> {
     if embed_weights {
         println!("Exporting weights for embedding...");
         let weights_path = output_dir.join("weights.bin");
-        cmd_export_weights_impl(model_path, &weights_path.to_string_lossy(), lora_path, force_q4k)?;
+        cmd_export_weights_impl(model_path, &weights_path.to_string_lossy(), lora_path, force_q4k, force_q6k)?;
 
         println!("Copying tokenizer for embedding...");
         let tokenizer_src = resolve_tokenizer(tokenizer_opt, model_path)?;
@@ -934,7 +967,7 @@ fn cmd_compile(args: CompileArgs<'_>) -> Result<()> {
         let weights_path = output_dir.join("weights.bin");
         let weights_path_str = weights_path.to_string_lossy().to_string();
         println!("[1/4] Exporting weights...");
-        cmd_export_weights_impl(model_path, &weights_path_str, lora_path, force_q4k)?;
+        cmd_export_weights_impl(model_path, &weights_path_str, lora_path, force_q4k, force_q6k)?;
 
         println!("[2/4] Resolving tokenizer...");
         let tokenizer_src = resolve_tokenizer(tokenizer_opt, model_path)?;
@@ -2343,7 +2376,7 @@ fn cmd_models(dir: &str) -> Result<()> {
 }
 
 fn cmd_export_weights(model_path: &str, output_path: &str) -> Result<()> {
-    cmd_export_weights_impl(model_path, output_path, None, false)
+    cmd_export_weights_impl(model_path, output_path, None, false, false)
 }
 
 fn cmd_export_weights_impl(
@@ -2351,6 +2384,7 @@ fn cmd_export_weights_impl(
     output_path: &str,
     lora_path: Option<&str>,
     force_q4k: bool,
+    force_q6k: bool,
 ) -> Result<()> {
     use forgellm_frontend::ir::DType;
     use forgellm_frontend::weight_loader::{load_from_file_mixed_with_target, WeightData};
@@ -2365,16 +2399,26 @@ fn cmd_export_weights_impl(
         config.dtype = DType::Q4_K;
         config.lm_head_dtype = Some(DType::Q4_K);
     }
+    if force_q6k {
+        eprintln!(
+            "--force-q6k: overriding projection dtype {:?} → Q6_K",
+            config.dtype
+        );
+        config.dtype = DType::Q6_K;
+        config.lm_head_dtype = Some(DType::Q6_K);
+    }
 
     let is_q8 = config.dtype == DType::Q8_0;
     let is_q4 = config.dtype == DType::Q4_0;
     let is_q4k = config.dtype == DType::Q4_K;
+    let is_q6k = config.dtype == DType::Q6_K;
 
-    if is_q8 || is_q4 || is_q4k {
+    if is_q8 || is_q4 || is_q4k || is_q6k {
         let quant_label = match config.dtype {
             DType::Q8_0 => "Q8_0",
             DType::Q4_0 => "Q4_0",
             DType::Q4_K => "Q4_K",
+            DType::Q6_K => "Q6_K",
             _ => "?",
         };
         if lora_path.is_some() {
