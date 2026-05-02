@@ -580,6 +580,111 @@ fn detect_gguf_lm_head_dtype(
     }
 }
 
+/// Map a GGUF `GGMLType` to the storage `DType` we'd actually use for that
+/// tensor in the AOT codegen.  Returns `None` for unsupported types (caller
+/// falls back to the file-level majority dtype).
+fn ggml_type_storage_dtype(
+    ggml: forgellm_frontend::gguf::GGMLType,
+) -> Option<forgellm_frontend::ir::DType> {
+    use forgellm_frontend::gguf::GGMLType;
+    use forgellm_frontend::ir::DType;
+    match ggml {
+        GGMLType::Q8_0 => Some(DType::Q8_0),
+        GGMLType::Q4_0 => Some(DType::Q4_0),
+        GGMLType::Q4K => Some(DType::Q4_K),
+        GGMLType::Q6K => Some(DType::Q6_K),
+        GGMLType::F32 | GGMLType::F16 | GGMLType::BF16 => Some(DType::F16),
+        _ => None,
+    }
+}
+
+/// Detect per-projection storage dtypes from a parsed GGUF file.
+///
+/// For each `ProjCategory`, picks the majority storage dtype across all
+/// tensors that map to that category.  Categories with no supported tensors
+/// fall back to `fallback_dtype` (typically the file-level majority).  The
+/// resulting `ProjectionDTypes` lets the codegen run real Q4_K_M GGUFs
+/// natively — Q4_K for q/k/o/gate/up, Q6_K for v/down/lm_head.
+fn detect_gguf_proj_dtypes(
+    gguf_file: &gguf::GGUFFile,
+    fallback_dtype: forgellm_frontend::ir::DType,
+) -> forgellm_frontend::ir::ProjectionDTypes {
+    use forgellm_frontend::ir::{DType, ProjCategory, ProjectionDTypes};
+    use std::collections::HashMap;
+
+    let cats = [
+        ProjCategory::Embed,
+        ProjCategory::Q,
+        ProjCategory::K,
+        ProjCategory::V,
+        ProjCategory::O,
+        ProjCategory::Gate,
+        ProjCategory::Up,
+        ProjCategory::Down,
+        ProjCategory::LmHead,
+    ];
+
+    // Higher rank = prefer this dtype on count ties — break in favor of
+    // higher precision so Q4_K_M files where v/down are 50/50 Q4_K/Q6_K
+    // upgrade to Q6_K (preserving the higher-precision tensors) rather
+    // than non-deterministically downgrading to Q4_K via HashMap iteration.
+    fn precision_rank(d: DType) -> u8 {
+        match d {
+            DType::F32 => 6,
+            DType::F16 | DType::BF16 => 5,
+            DType::Q8_0 => 4,
+            DType::Q6_K => 3,
+            DType::Q4_K => 2,
+            DType::Q4_0 => 1,
+            _ => 0,
+        }
+    }
+
+    let pick = |cat: ProjCategory| -> DType {
+        let mut counts: HashMap<DType, usize> = HashMap::new();
+        for t in &gguf_file.tensors {
+            if ProjCategory::from_gguf_name(&t.name) != Some(cat) {
+                continue;
+            }
+            if let Some(dt) = ggml_type_storage_dtype(t.ggml_type) {
+                *counts.entry(dt).or_insert(0) += 1;
+            }
+        }
+        counts
+            .into_iter()
+            .max_by_key(|&(d, c)| (c, precision_rank(d)))
+            .map(|(d, _)| d)
+            .unwrap_or(fallback_dtype)
+    };
+
+    let mut dtypes = ProjectionDTypes::uniform(fallback_dtype, None);
+    for cat in cats {
+        let dt = pick(cat);
+        match cat {
+            ProjCategory::Embed => dtypes.embed = dt,
+            ProjCategory::Q => dtypes.q = dt,
+            ProjCategory::K => dtypes.k = dt,
+            ProjCategory::V => dtypes.v = dt,
+            ProjCategory::O => dtypes.o = dt,
+            ProjCategory::Gate => dtypes.gate = dt,
+            ProjCategory::Up => dtypes.up = dt,
+            ProjCategory::Down => dtypes.down = dt,
+            ProjCategory::LmHead => dtypes.lm_head = dt,
+        }
+    }
+    // Tied-weight models (e.g. Llama-3.2-1B) have no separate `output.weight`
+    // tensor — `cmd_export_weights_impl` falls back to writing `embed_tokens`
+    // for the lm_head slot, so the runtime kernel must match `embed`'s dtype.
+    let has_lm_head_tensor = gguf_file
+        .tensors
+        .iter()
+        .any(|t| ProjCategory::from_gguf_name(&t.name) == Some(ProjCategory::LmHead));
+    if !has_lm_head_tensor {
+        dtypes.lm_head = dtypes.embed;
+    }
+    dtypes
+}
+
 /// Load a ModelConfig from a GGUF file, SafeTensors file, or HF config.json directory.
 fn load_model_config(model_path: &str) -> Result<ModelConfig> {
     let path = Path::new(model_path);
@@ -674,6 +779,16 @@ fn load_model_config(model_path: &str) -> Result<ModelConfig> {
 
         let dtype = detect_gguf_dtype(&gguf_file);
         let lm_head_dtype = detect_gguf_lm_head_dtype(&gguf_file, dtype);
+        // Per-projection dtype detection: when the file mixes dtypes across
+        // projection categories (e.g. Q4_K_M storing Q4_K for q/k/o/gate/up
+        // and Q6_K for v/down/lm_head), we keep the full mix so the codegen
+        // can dispatch the right kernel per projection.
+        let detected_proj_dtypes = detect_gguf_proj_dtypes(&gguf_file, dtype);
+        let proj_dtypes = if detected_proj_dtypes.is_uniform() {
+            None
+        } else {
+            Some(detected_proj_dtypes)
+        };
 
         Ok(ModelConfig {
             architecture,
@@ -689,6 +804,7 @@ fn load_model_config(model_path: &str) -> Result<ModelConfig> {
             rope_theta,
             dtype,
             lm_head_dtype,
+            proj_dtypes,
             sliding_window_size,
             qkv_bias,
             hidden_activation,
@@ -820,6 +936,7 @@ fn cmd_compile(args: CompileArgs<'_>) -> Result<()> {
         );
         config.dtype = DType::Q4_K;
         config.lm_head_dtype = Some(DType::Q4_K);
+        config.proj_dtypes = None;
     }
     if force_q6k {
         use forgellm_frontend::ir::DType;
@@ -829,6 +946,7 @@ fn cmd_compile(args: CompileArgs<'_>) -> Result<()> {
         );
         config.dtype = DType::Q6_K;
         config.lm_head_dtype = Some(DType::Q6_K);
+        config.proj_dtypes = None;
     }
     config
         .validate()
@@ -843,6 +961,12 @@ fn cmd_compile(args: CompileArgs<'_>) -> Result<()> {
         config.num_kv_heads,
         config.vocab_size,
     );
+    if let Some(pdt) = config.proj_dtypes {
+        println!(
+            "Per-projection dtypes: q={:?} k={:?} v={:?} o={:?} gate={:?} up={:?} down={:?} embed={:?} lm_head={:?}",
+            pdt.q, pdt.k, pdt.v, pdt.o, pdt.gate, pdt.up, pdt.down, pdt.embed, pdt.lm_head,
+        );
+    }
 
     // If embedding weights, export them first so they're available for generate_project
     let output_dir = Path::new(output_path);
@@ -2386,8 +2510,10 @@ fn cmd_export_weights_impl(
     force_q4k: bool,
     force_q6k: bool,
 ) -> Result<()> {
-    use forgellm_frontend::ir::DType;
-    use forgellm_frontend::weight_loader::{load_from_file_mixed_with_target, WeightData};
+    use forgellm_frontend::ir::{DType, ProjCategory};
+    use forgellm_frontend::weight_loader::{
+        load_from_file_mixed_per_tensor, load_from_file_mixed_with_target, WeightData,
+    };
 
     eprintln!("Loading model from {model_path}...");
     let mut config = load_model_config(model_path)?;
@@ -2398,6 +2524,7 @@ fn cmd_export_weights_impl(
         );
         config.dtype = DType::Q4_K;
         config.lm_head_dtype = Some(DType::Q4_K);
+        config.proj_dtypes = None;
     }
     if force_q6k {
         eprintln!(
@@ -2406,6 +2533,7 @@ fn cmd_export_weights_impl(
         );
         config.dtype = DType::Q6_K;
         config.lm_head_dtype = Some(DType::Q6_K);
+        config.proj_dtypes = None;
     }
 
     let is_q8 = config.dtype == DType::Q8_0;
@@ -2428,11 +2556,36 @@ fn cmd_export_weights_impl(
             );
         }
         // Quantized: keep projection weights as raw bytes, dequantize norm/embed to f32.
-        // Pass the projection dtype to the loader so K-quants get requanted to the right
-        // uniform target (Q8_0 by default, Q4_K when projections are majority-Q4_K).
-        let (_gguf_file, weights) =
+        // When `config.proj_dtypes` is set, route per-projection (Q4_K_M GGUFs:
+        // Q4_K for q/k/o/gate/up, Q6_K for v/down/lm_head).  Otherwise pass the
+        // single config dtype as a uniform target.
+        let (_gguf_file, weights) = if let Some(pdt) = config.proj_dtypes {
+            eprintln!(
+                "Mixed-dtype GGUF detected — routing per-projection: \
+                 q={:?} k={:?} v={:?} o={:?} gate={:?} up={:?} down={:?} embed={:?} lm_head={:?}",
+                pdt.q,
+                pdt.k,
+                pdt.v,
+                pdt.o,
+                pdt.gate,
+                pdt.up,
+                pdt.down,
+                pdt.embed,
+                pdt.lm_head,
+            );
+            let fallback = config.dtype;
+            load_from_file_mixed_per_tensor(model_path, move |hf_name| {
+                Some(
+                    ProjCategory::from_hf_name(hf_name)
+                        .map(|cat| pdt.get(cat))
+                        .unwrap_or(fallback),
+                )
+            })
+            .with_context(|| "failed to load weights")?
+        } else {
             load_from_file_mixed_with_target(model_path, Some(config.dtype))
-                .with_context(|| "failed to load weights")?;
+                .with_context(|| "failed to load weights")?
+        };
 
         eprintln!(
             "Model: {} | {} layers | {} tensors | {:.1} MB ({quant_label} raw)",
@@ -2836,5 +2989,84 @@ mod tests {
     fn detect_dtype_empty_returns_f16() {
         let gguf = make_gguf_with_types(&[]);
         assert_eq!(detect_gguf_dtype(&gguf), DType::F16);
+    }
+
+    #[test]
+    fn proj_dtypes_q4km_layout() {
+        // Synthetic Q4_K_M layout with mixed Q4_K + Q6_K projections.
+        // Layer 0/1: v + ffn_down upgraded to Q6_K (Bartowski-style 50/50
+        // split between layers); q/k/o/gate/up always Q4_K; output Q6_K.
+        let gguf = make_gguf_with_types(&[
+            ("token_embd.weight", GGMLType::Q6K),
+            ("blk.0.attn_q.weight", GGMLType::Q4K),
+            ("blk.0.attn_k.weight", GGMLType::Q4K),
+            ("blk.0.attn_v.weight", GGMLType::Q6K),
+            ("blk.0.attn_output.weight", GGMLType::Q4K),
+            ("blk.0.ffn_gate.weight", GGMLType::Q4K),
+            ("blk.0.ffn_up.weight", GGMLType::Q4K),
+            ("blk.0.ffn_down.weight", GGMLType::Q6K),
+            ("blk.1.attn_q.weight", GGMLType::Q4K),
+            ("blk.1.attn_k.weight", GGMLType::Q4K),
+            ("blk.1.attn_v.weight", GGMLType::Q4K),
+            ("blk.1.attn_output.weight", GGMLType::Q4K),
+            ("blk.1.ffn_gate.weight", GGMLType::Q4K),
+            ("blk.1.ffn_up.weight", GGMLType::Q4K),
+            ("blk.1.ffn_down.weight", GGMLType::Q4K),
+            ("output.weight", GGMLType::Q6K),
+        ]);
+        let pdt = detect_gguf_proj_dtypes(&gguf, DType::Q4_K);
+        // q/k/o/gate/up are always Q4_K — easy majority.
+        assert_eq!(pdt.q, DType::Q4_K);
+        assert_eq!(pdt.k, DType::Q4_K);
+        assert_eq!(pdt.o, DType::Q4_K);
+        assert_eq!(pdt.gate, DType::Q4_K);
+        assert_eq!(pdt.up, DType::Q4_K);
+        // v and down are 1 Q6_K + 1 Q4_K — tied.  Higher-precision tie-break
+        // should upgrade to Q6_K so the Q6_K bytes are preserved natively.
+        assert_eq!(pdt.v, DType::Q6_K);
+        assert_eq!(pdt.down, DType::Q6_K);
+        assert_eq!(pdt.embed, DType::Q6_K);
+        assert_eq!(pdt.lm_head, DType::Q6_K);
+        assert!(!pdt.is_uniform());
+    }
+
+    #[test]
+    fn proj_dtypes_uniform_q4k() {
+        // All projections Q4_K → uniform; is_uniform() returns true.
+        let gguf = make_gguf_with_types(&[
+            ("token_embd.weight", GGMLType::Q4K),
+            ("blk.0.attn_q.weight", GGMLType::Q4K),
+            ("blk.0.attn_k.weight", GGMLType::Q4K),
+            ("blk.0.attn_v.weight", GGMLType::Q4K),
+            ("blk.0.attn_output.weight", GGMLType::Q4K),
+            ("blk.0.ffn_gate.weight", GGMLType::Q4K),
+            ("blk.0.ffn_up.weight", GGMLType::Q4K),
+            ("blk.0.ffn_down.weight", GGMLType::Q4K),
+            ("output.weight", GGMLType::Q4K),
+        ]);
+        let pdt = detect_gguf_proj_dtypes(&gguf, DType::Q4_K);
+        assert!(pdt.is_uniform());
+        assert_eq!(pdt.q, DType::Q4_K);
+        assert_eq!(pdt.lm_head, DType::Q4_K);
+    }
+
+    #[test]
+    fn proj_dtypes_tied_lm_head_inherits_embed() {
+        // No `output.weight`/`lm_head.weight` tensor — typical tied-weight
+        // model.  The detect should mirror `embed` for `lm_head` so the
+        // codegen kernel matches the bytes the exporter writes.
+        let gguf = make_gguf_with_types(&[
+            ("token_embd.weight", GGMLType::Q6K),
+            ("blk.0.attn_q.weight", GGMLType::Q4K),
+            ("blk.0.attn_k.weight", GGMLType::Q4K),
+            ("blk.0.attn_v.weight", GGMLType::Q4K),
+            ("blk.0.attn_output.weight", GGMLType::Q4K),
+            ("blk.0.ffn_gate.weight", GGMLType::Q4K),
+            ("blk.0.ffn_up.weight", GGMLType::Q4K),
+            ("blk.0.ffn_down.weight", GGMLType::Q4K),
+        ]);
+        let pdt = detect_gguf_proj_dtypes(&gguf, DType::Q4_K);
+        assert_eq!(pdt.embed, DType::Q6_K);
+        assert_eq!(pdt.lm_head, DType::Q6_K);
     }
 }

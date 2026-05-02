@@ -25,19 +25,20 @@ pub fn generate(graph: &Graph) -> Result<String, CodegenError> {
 
     emit_header(&mut code, config)?;
     emit_kernel_functions(&mut code, config)?;
-    // lm_head may use a different dtype than projections (e.g. Q4_K_M GGUF →
-    // Q4_0 projections + Q8_0 output).  Emit each kernel family whenever either
-    // projections or lm_head needs it.
-    let lm_dtype = config.lm_head_dtype.unwrap_or(config.dtype);
-    let needs_q8 = config.dtype == DType::Q8_0 || lm_dtype == DType::Q8_0;
-    let needs_q4 = config.dtype == DType::Q4_0 || lm_dtype == DType::Q4_0;
-    let needs_q4k = config.dtype == DType::Q4_K || lm_dtype == DType::Q4_K;
-    let needs_q6k = config.dtype == DType::Q6_K || lm_dtype == DType::Q6_K;
+    // Per-projection dtype usage: any projection (or lm_head) using a
+    // dtype turns on its kernel family.  For uniform configs this matches
+    // the legacy `config.dtype == X` checks; for mixed Q4_K_M GGUFs both
+    // Q4_K and Q6_K kernel families are emitted.
+    let pdt = config.effective_proj_dtypes();
+    let needs_q8 = pdt.uses(DType::Q8_0);
+    let needs_q4 = pdt.uses(DType::Q4_0);
+    let needs_q4k = pdt.uses(DType::Q4_K);
+    let needs_q6k = pdt.uses(DType::Q6_K);
     if needs_q8 {
         emit_q8_0_kernel(&mut code)?;
         emit_q8_0_sdot_kernel(&mut code)?;
     }
-    if config.dtype == DType::Q8_0 {
+    if needs_q8 {
         emit_specialized_q8_matmul_functions(&mut code, config)?;
         emit_specialized_q8_matmul_batched_functions(&mut code, config)?;
     }
@@ -47,7 +48,7 @@ pub fn generate(graph: &Graph) -> Result<String, CodegenError> {
         // (quantize_to_q8_0_blocks, f32_to_f16_bits) will clash.  Skip them.
         emit_q4_0_sdot_kernel(&mut code, /* skip_shared_helpers= */ needs_q8)?;
     }
-    if config.dtype == DType::Q4_0 {
+    if needs_q4 {
         emit_specialized_q4_matmul_functions(&mut code, config)?;
         emit_specialized_q4_matmul_batched_functions(&mut code, config)?;
     }
@@ -65,7 +66,7 @@ pub fn generate(graph: &Graph) -> Result<String, CodegenError> {
             /* skip_shared_helpers= */ needs_q8 || needs_q4 || need_q8_helpers_for_q4k,
         )?;
     }
-    if config.dtype == DType::Q4_K {
+    if needs_q4k {
         emit_specialized_q4_k_matmul_functions(&mut code, config)?;
     }
     if needs_q6k {
@@ -82,7 +83,7 @@ pub fn generate(graph: &Graph) -> Result<String, CodegenError> {
             /* skip_shared_helpers= */ needs_q8 || needs_q4 || needs_q4k || need_q8_helpers_for_q6k,
         )?;
     }
-    if config.dtype == DType::Q6_K {
+    if needs_q6k {
         emit_specialized_q6_k_matmul_functions(&mut code, config)?;
     }
     emit_specialized_matmul_functions(&mut code, config)?;
@@ -3310,8 +3311,69 @@ fn dot_q4_k_q8_0(weight_q4k: &[u8], input_q8: &[u8], k: usize) -> f32 {
 /// where `k` is a multiple of 256 (Q4_K super-block size).  Tensors with a
 /// non-multiple `k` (rare — typically only norm-sized buffers) fall back to
 /// the Q8_0 path on load.
+/// Format a single shape-specialized matmul call for the given storage dtype.
+/// Returns a line of Rust source like `matmul_vec_q4_k_4096x4096(&mut q, &normed, &lw.q_proj);`
+/// (with `indent` prepended).  Per-projection dispatch sites in
+/// `forward`/`prefill` use this so each projection picks its own kernel
+/// based on `ModelConfig::effective_dtype`.
+fn matmul_call(
+    dtype: DType,
+    k: usize,
+    n: usize,
+    dst: &str,
+    src: &str,
+    weight: &str,
+    indent: &str,
+) -> String {
+    let prefix = match dtype {
+        DType::Q8_0 => "matmul_vec_q8_0_",
+        DType::Q4_0 => "matmul_vec_q4_0_",
+        DType::Q4_K => "matmul_vec_q4_k_",
+        DType::Q6_K => "matmul_vec_q6_k_",
+        _ => "matmul_vec_",
+    };
+    format!("{indent}{prefix}{k}x{n}(&mut {dst}, &{src}, &{weight});")
+}
+
+/// Shapes for which to emit specialized matmul kernels for `target` dtype.
+///
+/// With per-projection dtype mixing (`config.proj_dtypes`), each projection
+/// category may have its own storage dtype.  This returns the (K, N) shapes
+/// of the projections that match `target` so we only emit kernels for what
+/// the model actually uses.  Falls through to all matmul shapes when the
+/// config is uniformly `target`.
+fn proj_shapes_for_dtype(config: &ModelConfig, target: DType) -> Vec<(usize, usize)> {
+    use forgellm_frontend::ir::ProjCategory;
+    let pdt = config.effective_proj_dtypes();
+    let hidden = config.hidden_size;
+    let intermediate = config.intermediate_size;
+    let qk_size = config.num_attention_heads * config.head_dim;
+    let kv_size = config.num_kv_heads * config.head_dim;
+    let vocab = config.vocab_size;
+
+    let pairs: [(ProjCategory, usize, usize); 8] = [
+        (ProjCategory::Q, hidden, qk_size),
+        (ProjCategory::K, hidden, kv_size),
+        (ProjCategory::V, hidden, kv_size),
+        (ProjCategory::O, qk_size, hidden),
+        (ProjCategory::Gate, hidden, intermediate),
+        (ProjCategory::Up, hidden, intermediate),
+        (ProjCategory::Down, intermediate, hidden),
+        (ProjCategory::LmHead, hidden, vocab),
+    ];
+
+    let mut shapes: Vec<(usize, usize)> = pairs
+        .iter()
+        .filter(|(cat, _, _)| pdt.get(*cat) == target)
+        .map(|(_, k, n)| (*k, *n))
+        .collect();
+    shapes.sort();
+    shapes.dedup();
+    shapes
+}
+
 fn q4_k_matmul_shapes(config: &ModelConfig) -> Vec<(usize, usize)> {
-    matmul_shapes(config)
+    proj_shapes_for_dtype(config, DType::Q4_K)
         .into_iter()
         .filter(|(k, _)| k.is_multiple_of(256))
         .collect()
@@ -3430,7 +3492,7 @@ fn emit_specialized_q4_k_matmul_functions(
 }
 
 fn q6_k_matmul_shapes(config: &ModelConfig) -> Vec<(usize, usize)> {
-    matmul_shapes(config)
+    proj_shapes_for_dtype(config, DType::Q6_K)
         .into_iter()
         .filter(|(k, _)| k.is_multiple_of(256))
         .collect()
@@ -3768,29 +3830,43 @@ fn emit_forward_function(
     let qk_size = num_heads * head_dim;
     let kv_size = num_kv_heads * head_dim;
 
-    let is_q8 = config.dtype == DType::Q8_0;
-    let is_q4 = config.dtype == DType::Q4_0;
-    let is_q4k = config.dtype == DType::Q4_K;
-    let is_q6k = config.dtype == DType::Q6_K;
-    // lm_head may use a different storage dtype than projections — Q4_K_M GGUF
-    // files, for instance, store projections as Q4_K but `output.weight` as
-    // Q6_K.  Generate the correct kernel for each.
-    let lm_dtype = config.lm_head_dtype.unwrap_or(config.dtype);
+    use forgellm_frontend::ir::ProjCategory;
+    let pdt = config.effective_proj_dtypes();
+    let q_dtype = pdt.q;
+    let k_dtype = pdt.k;
+    let v_dtype = pdt.v;
+    let o_dtype = pdt.o;
+    let gate_dtype = pdt.gate;
+    let up_dtype = pdt.up;
+    let down_dtype = pdt.down;
+    let lm_dtype = config.effective_dtype(ProjCategory::LmHead);
     let lm_is_q8 = lm_dtype == DType::Q8_0;
     let lm_is_q4 = lm_dtype == DType::Q4_0;
     let lm_is_q4k = lm_dtype == DType::Q4_K;
     let lm_is_q6k = lm_dtype == DType::Q6_K;
-    // Projection weight type: raw bytes for quantized models, f32 otherwise
-    let proj_type = if is_q8 || is_q4 || is_q4k || is_q6k {
-        "Vec<u8>"
-    } else {
-        "Vec<f32>"
+    // Projection weight type: raw bytes for quantized projections, f32
+    // otherwise.  All current quantized variants (Q8_0 / Q4_0 / Q4_K / Q6_K)
+    // store as Vec<u8>, so a per-field projection only needs the f32 escape
+    // hatch when the dtype is non-byte-storage (currently never the case for
+    // mixed Q4_K_M files).
+    let dtype_is_bytes = |d: DType| {
+        matches!(d, DType::Q8_0 | DType::Q4_0 | DType::Q4_K | DType::Q6_K)
     };
-    let lm_head_type = if lm_is_q8 || lm_is_q4 || lm_is_q4k || lm_is_q6k {
-        "Vec<u8>"
-    } else {
-        "Vec<f32>"
+    let proj_type_for = |d: DType| {
+        if dtype_is_bytes(d) {
+            "Vec<u8>"
+        } else {
+            "Vec<f32>"
+        }
     };
+    let q_proj_type = proj_type_for(q_dtype);
+    let k_proj_type = proj_type_for(k_dtype);
+    let v_proj_type = proj_type_for(v_dtype);
+    let o_proj_type = proj_type_for(o_dtype);
+    let gate_proj_type = proj_type_for(gate_dtype);
+    let up_proj_type = proj_type_for(up_dtype);
+    let down_proj_type = proj_type_for(down_dtype);
+    let lm_head_type = proj_type_for(lm_dtype);
 
     writeln!(
         code,
@@ -3814,17 +3890,17 @@ fn emit_forward_function(
     writeln!(code, "    pub attn_norm: Vec<f32>,           // [{hidden}]")?;
     writeln!(
         code,
-        "    pub q_proj: {proj_type},              // [{} * {hidden}]",
+        "    pub q_proj: {q_proj_type},              // [{} * {hidden}]",
         num_heads * head_dim
     )?;
     writeln!(
         code,
-        "    pub k_proj: {proj_type},              // [{} * {hidden}]",
+        "    pub k_proj: {k_proj_type},              // [{} * {hidden}]",
         num_kv_heads * head_dim
     )?;
     writeln!(
         code,
-        "    pub v_proj: {proj_type},              // [{} * {hidden}]",
+        "    pub v_proj: {v_proj_type},              // [{} * {hidden}]",
         num_kv_heads * head_dim
     )?;
     // Bias fields for Qwen2 (qkv_bias = true)
@@ -3844,21 +3920,21 @@ fn emit_forward_function(
     }
     writeln!(
         code,
-        "    pub o_proj: {proj_type},              // [{hidden} * {}]",
+        "    pub o_proj: {o_proj_type},              // [{hidden} * {}]",
         num_heads * head_dim
     )?;
     writeln!(code, "    pub ffn_norm: Vec<f32>,            // [{hidden}]")?;
     writeln!(
         code,
-        "    pub gate_proj: {proj_type},           // [{intermediate} * {hidden}]"
+        "    pub gate_proj: {gate_proj_type},           // [{intermediate} * {hidden}]"
     )?;
     writeln!(
         code,
-        "    pub up_proj: {proj_type},             // [{intermediate} * {hidden}]"
+        "    pub up_proj: {up_proj_type},             // [{intermediate} * {hidden}]"
     )?;
     writeln!(
         code,
-        "    pub down_proj: {proj_type},           // [{hidden} * {intermediate}]"
+        "    pub down_proj: {down_proj_type},           // [{hidden} * {intermediate}]"
     )?;
     writeln!(code, "}}")?;
     writeln!(code)?;
@@ -4010,87 +4086,21 @@ fn emit_forward_function(
     )?;
     writeln!(code)?;
     writeln!(code, "        // QKV projections (shape-specialized)")?;
-    if is_q8 {
-        writeln!(
-            code,
-            "        matmul_vec_q8_0_{hidden}x{qk_size}(&mut q, &normed, &lw.q_proj);",
-            hidden = hidden,
-            qk_size = qk_size
-        )?;
-        writeln!(
-            code,
-            "        matmul_vec_q8_0_{hidden}x{kv_size}(&mut k, &normed, &lw.k_proj);",
-            hidden = hidden,
-            kv_size = kv_size
-        )?;
-        writeln!(
-            code,
-            "        matmul_vec_q8_0_{hidden}x{kv_size}(&mut v, &normed, &lw.v_proj);",
-            hidden = hidden,
-            kv_size = kv_size
-        )?;
-    } else if is_q4 {
-        writeln!(
-            code,
-            "        matmul_vec_q4_0_{hidden}x{qk_size}(&mut q, &normed, &lw.q_proj);",
-            hidden = hidden,
-            qk_size = qk_size
-        )?;
-        writeln!(
-            code,
-            "        matmul_vec_q4_0_{hidden}x{kv_size}(&mut k, &normed, &lw.k_proj);",
-            hidden = hidden,
-            kv_size = kv_size
-        )?;
-        writeln!(
-            code,
-            "        matmul_vec_q4_0_{hidden}x{kv_size}(&mut v, &normed, &lw.v_proj);",
-            hidden = hidden,
-            kv_size = kv_size
-        )?;
-    } else if is_q4k {
-        writeln!(
-            code,
-            "        matmul_vec_q4_k_{hidden}x{qk_size}(&mut q, &normed, &lw.q_proj);",
-            hidden = hidden,
-            qk_size = qk_size
-        )?;
-        writeln!(
-            code,
-            "        matmul_vec_q4_k_{hidden}x{kv_size}(&mut k, &normed, &lw.k_proj);",
-            hidden = hidden,
-            kv_size = kv_size
-        )?;
-        writeln!(
-            code,
-            "        matmul_vec_q4_k_{hidden}x{kv_size}(&mut v, &normed, &lw.v_proj);",
-            hidden = hidden,
-            kv_size = kv_size
-        )?;
-    } else if is_q6k {
-        writeln!(code, "        matmul_vec_q6_k_{hidden}x{qk_size}(&mut q, &normed, &lw.q_proj);")?;
-        writeln!(code, "        matmul_vec_q6_k_{hidden}x{kv_size}(&mut k, &normed, &lw.k_proj);")?;
-        writeln!(code, "        matmul_vec_q6_k_{hidden}x{kv_size}(&mut v, &normed, &lw.v_proj);")?;
-    } else {
-        writeln!(
-            code,
-            "        matmul_vec_{hidden}x{qk_size}(&mut q, &normed, &lw.q_proj);",
-            hidden = hidden,
-            qk_size = qk_size
-        )?;
-        writeln!(
-            code,
-            "        matmul_vec_{hidden}x{kv_size}(&mut k, &normed, &lw.k_proj);",
-            hidden = hidden,
-            kv_size = kv_size
-        )?;
-        writeln!(
-            code,
-            "        matmul_vec_{hidden}x{kv_size}(&mut v, &normed, &lw.v_proj);",
-            hidden = hidden,
-            kv_size = kv_size
-        )?;
-    }
+    writeln!(
+        code,
+        "{}",
+        matmul_call(q_dtype, hidden, qk_size, "q", "normed", "lw.q_proj", "        ")
+    )?;
+    writeln!(
+        code,
+        "{}",
+        matmul_call(k_dtype, hidden, kv_size, "k", "normed", "lw.k_proj", "        ")
+    )?;
+    writeln!(
+        code,
+        "{}",
+        matmul_call(v_dtype, hidden, kv_size, "v", "normed", "lw.v_proj", "        ")
+    )?;
     // Optional QKV bias adds (Qwen2)
     if config.qkv_bias {
         writeln!(code)?;
@@ -4195,37 +4205,19 @@ fn emit_forward_function(
     writeln!(code, "        );")?;
     writeln!(code)?;
     writeln!(code, "        // Output projection + fused residual add")?;
-    if is_q8 {
-        writeln!(
-            code,
-            "        matmul_vec_q8_0_{qk_size}x{hidden}(&mut attn_proj, &attn_out, &lw.o_proj);",
-            qk_size = qk_size,
-            hidden = hidden
-        )?;
-    } else if is_q4 {
-        writeln!(
-            code,
-            "        matmul_vec_q4_0_{qk_size}x{hidden}(&mut attn_proj, &attn_out, &lw.o_proj);",
-            qk_size = qk_size,
-            hidden = hidden
-        )?;
-    } else if is_q4k {
-        writeln!(
-            code,
-            "        matmul_vec_q4_k_{qk_size}x{hidden}(&mut attn_proj, &attn_out, &lw.o_proj);",
-            qk_size = qk_size,
-            hidden = hidden
-        )?;
-    } else if is_q6k {
-        writeln!(code, "        matmul_vec_q6_k_{qk_size}x{hidden}(&mut attn_proj, &attn_out, &lw.o_proj);")?;
-    } else {
-        writeln!(
-            code,
-            "        matmul_vec_{qk_size}x{hidden}(&mut attn_proj, &attn_out, &lw.o_proj);",
-            qk_size = qk_size,
-            hidden = hidden
-        )?;
-    }
+    writeln!(
+        code,
+        "{}",
+        matmul_call(
+            o_dtype,
+            qk_size,
+            hidden,
+            "attn_proj",
+            "attn_out",
+            "lw.o_proj",
+            "        "
+        )
+    )?;
     writeln!(code, "        residual_add(&mut hidden_state, &attn_proj);")?;
     writeln!(code)?;
     writeln!(code, "        // FFN norm")?;
@@ -4238,91 +4230,46 @@ fn emit_forward_function(
         code,
         "        // FFN: fused silu_mul eliminates gate_act buffer"
     )?;
-    if is_q8 {
-        writeln!(
-            code,
-            "        matmul_vec_q8_0_{hidden}x{intermediate}(&mut gate, &normed, &lw.gate_proj);",
-            hidden = hidden,
-            intermediate = intermediate
-        )?;
-        writeln!(
-            code,
-            "        matmul_vec_q8_0_{hidden}x{intermediate}(&mut up, &normed, &lw.up_proj);",
-            hidden = hidden,
-            intermediate = intermediate
-        )?;
-    } else if is_q4 {
-        writeln!(
-            code,
-            "        matmul_vec_q4_0_{hidden}x{intermediate}(&mut gate, &normed, &lw.gate_proj);",
-            hidden = hidden,
-            intermediate = intermediate
-        )?;
-        writeln!(
-            code,
-            "        matmul_vec_q4_0_{hidden}x{intermediate}(&mut up, &normed, &lw.up_proj);",
-            hidden = hidden,
-            intermediate = intermediate
-        )?;
-    } else if is_q4k {
-        writeln!(
-            code,
-            "        matmul_vec_q4_k_{hidden}x{intermediate}(&mut gate, &normed, &lw.gate_proj);",
-            hidden = hidden,
-            intermediate = intermediate
-        )?;
-        writeln!(
-            code,
-            "        matmul_vec_q4_k_{hidden}x{intermediate}(&mut up, &normed, &lw.up_proj);",
-            hidden = hidden,
-            intermediate = intermediate
-        )?;
-    } else if is_q6k {
-        writeln!(code, "        matmul_vec_q6_k_{hidden}x{intermediate}(&mut gate, &normed, &lw.gate_proj);")?;
-        writeln!(code, "        matmul_vec_q6_k_{hidden}x{intermediate}(&mut up, &normed, &lw.up_proj);")?;
-    } else {
-        writeln!(
-            code,
-            "        matmul_vec_{hidden}x{intermediate}(&mut gate, &normed, &lw.gate_proj);",
-            hidden = hidden,
-            intermediate = intermediate
-        )?;
-        writeln!(
-            code,
-            "        matmul_vec_{hidden}x{intermediate}(&mut up, &normed, &lw.up_proj);",
-            hidden = hidden,
-            intermediate = intermediate
-        )?;
-    }
+    writeln!(
+        code,
+        "{}",
+        matmul_call(
+            gate_dtype,
+            hidden,
+            intermediate,
+            "gate",
+            "normed",
+            "lw.gate_proj",
+            "        "
+        )
+    )?;
+    writeln!(
+        code,
+        "{}",
+        matmul_call(
+            up_dtype,
+            hidden,
+            intermediate,
+            "up",
+            "normed",
+            "lw.up_proj",
+            "        "
+        )
+    )?;
     writeln!(code, "        silu_mul(&mut ffn_hidden, &gate, &up);")?;
-    if is_q8 {
-        writeln!(
-            code,
-            "        matmul_vec_q8_0_{intermediate}x{hidden}(&mut ffn_out, &ffn_hidden, &lw.down_proj);",
-            intermediate = intermediate, hidden = hidden
-        )?;
-    } else if is_q4 {
-        writeln!(
-            code,
-            "        matmul_vec_q4_0_{intermediate}x{hidden}(&mut ffn_out, &ffn_hidden, &lw.down_proj);",
-            intermediate = intermediate, hidden = hidden
-        )?;
-    } else if is_q4k {
-        writeln!(
-            code,
-            "        matmul_vec_q4_k_{intermediate}x{hidden}(&mut ffn_out, &ffn_hidden, &lw.down_proj);",
-            intermediate = intermediate, hidden = hidden
-        )?;
-    } else if is_q6k {
-        writeln!(code, "        matmul_vec_q6_k_{intermediate}x{hidden}(&mut ffn_out, &ffn_hidden, &lw.down_proj);")?;
-    } else {
-        writeln!(
-            code,
-            "        matmul_vec_{intermediate}x{hidden}(&mut ffn_out, &ffn_hidden, &lw.down_proj);",
-            intermediate = intermediate,
-            hidden = hidden
-        )?;
-    }
+    writeln!(
+        code,
+        "{}",
+        matmul_call(
+            down_dtype,
+            intermediate,
+            hidden,
+            "ffn_out",
+            "ffn_hidden",
+            "lw.down_proj",
+            "        "
+        )
+    )?;
     writeln!(code)?;
     writeln!(code, "        // Fused residual add")?;
     writeln!(code, "        residual_add(&mut hidden_state, &ffn_out);")?;
@@ -4571,12 +4518,21 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
     let qk_size = num_heads * head_dim;
     let kv_size = num_kv_heads * head_dim;
 
-    let is_q8 = config.dtype == DType::Q8_0;
-    let is_q4 = config.dtype == DType::Q4_0;
-    let is_q4k = config.dtype == DType::Q4_K;
-    let is_q6k = config.dtype == DType::Q6_K;
+    use forgellm_frontend::ir::ProjCategory;
+    let pdt = config.effective_proj_dtypes();
+    let q_dtype = pdt.q;
+    let k_dtype = pdt.k;
+    let v_dtype = pdt.v;
+    let o_dtype = pdt.o;
+    let gate_dtype = pdt.gate;
+    let up_dtype = pdt.up;
+    let down_dtype = pdt.down;
+    // Batched-prefill dispatch is only enabled when projections are uniformly
+    // Q8_0 or Q4_0 (the kernel families that have batched specializations).
+    let is_q8 = config.dtype == DType::Q8_0 && pdt.is_uniform();
+    let is_q4 = config.dtype == DType::Q4_0 && pdt.is_uniform();
     // lm_head may use a different dtype than projections (see emit_forward_function).
-    let lm_dtype = config.lm_head_dtype.unwrap_or(config.dtype);
+    let lm_dtype = config.effective_dtype(ProjCategory::LmHead);
     let lm_is_q8 = lm_dtype == DType::Q8_0;
     let lm_is_q4 = lm_dtype == DType::Q4_0;
     let lm_is_q4k = lm_dtype == DType::Q4_K;
@@ -4688,87 +4644,21 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
     )?;
     writeln!(code)?;
     writeln!(code, "            // QKV projections")?;
-    if is_q8 {
-        writeln!(
-            code,
-            "            matmul_vec_q8_0_{hidden}x{qk_size}(&mut q, &normed, &lw.q_proj);",
-            hidden = hidden,
-            qk_size = qk_size
-        )?;
-        writeln!(
-            code,
-            "            matmul_vec_q8_0_{hidden}x{kv_size}(&mut k, &normed, &lw.k_proj);",
-            hidden = hidden,
-            kv_size = kv_size
-        )?;
-        writeln!(
-            code,
-            "            matmul_vec_q8_0_{hidden}x{kv_size}(&mut v, &normed, &lw.v_proj);",
-            hidden = hidden,
-            kv_size = kv_size
-        )?;
-    } else if is_q4 {
-        writeln!(
-            code,
-            "            matmul_vec_q4_0_{hidden}x{qk_size}(&mut q, &normed, &lw.q_proj);",
-            hidden = hidden,
-            qk_size = qk_size
-        )?;
-        writeln!(
-            code,
-            "            matmul_vec_q4_0_{hidden}x{kv_size}(&mut k, &normed, &lw.k_proj);",
-            hidden = hidden,
-            kv_size = kv_size
-        )?;
-        writeln!(
-            code,
-            "            matmul_vec_q4_0_{hidden}x{kv_size}(&mut v, &normed, &lw.v_proj);",
-            hidden = hidden,
-            kv_size = kv_size
-        )?;
-    } else if is_q4k {
-        writeln!(
-            code,
-            "            matmul_vec_q4_k_{hidden}x{qk_size}(&mut q, &normed, &lw.q_proj);",
-            hidden = hidden,
-            qk_size = qk_size
-        )?;
-        writeln!(
-            code,
-            "            matmul_vec_q4_k_{hidden}x{kv_size}(&mut k, &normed, &lw.k_proj);",
-            hidden = hidden,
-            kv_size = kv_size
-        )?;
-        writeln!(
-            code,
-            "            matmul_vec_q4_k_{hidden}x{kv_size}(&mut v, &normed, &lw.v_proj);",
-            hidden = hidden,
-            kv_size = kv_size
-        )?;
-    } else if is_q6k {
-        writeln!(code, "            matmul_vec_q6_k_{hidden}x{qk_size}(&mut q, &normed, &lw.q_proj);")?;
-        writeln!(code, "            matmul_vec_q6_k_{hidden}x{kv_size}(&mut k, &normed, &lw.k_proj);")?;
-        writeln!(code, "            matmul_vec_q6_k_{hidden}x{kv_size}(&mut v, &normed, &lw.v_proj);")?;
-    } else {
-        writeln!(
-            code,
-            "            matmul_vec_{hidden}x{qk_size}(&mut q, &normed, &lw.q_proj);",
-            hidden = hidden,
-            qk_size = qk_size
-        )?;
-        writeln!(
-            code,
-            "            matmul_vec_{hidden}x{kv_size}(&mut k, &normed, &lw.k_proj);",
-            hidden = hidden,
-            kv_size = kv_size
-        )?;
-        writeln!(
-            code,
-            "            matmul_vec_{hidden}x{kv_size}(&mut v, &normed, &lw.v_proj);",
-            hidden = hidden,
-            kv_size = kv_size
-        )?;
-    }
+    writeln!(
+        code,
+        "{}",
+        matmul_call(q_dtype, hidden, qk_size, "q", "normed", "lw.q_proj", "            ")
+    )?;
+    writeln!(
+        code,
+        "{}",
+        matmul_call(k_dtype, hidden, kv_size, "k", "normed", "lw.k_proj", "            ")
+    )?;
+    writeln!(
+        code,
+        "{}",
+        matmul_call(v_dtype, hidden, kv_size, "v", "normed", "lw.v_proj", "            ")
+    )?;
     // Optional QKV bias adds (Qwen2) — mirrors forward(), applied before RoPE.
     if config.qkv_bias {
         writeln!(code)?;
@@ -4846,37 +4736,19 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "            );")?;
     writeln!(code)?;
     writeln!(code, "            // Output projection + residual")?;
-    if is_q8 {
-        writeln!(
-            code,
-            "            matmul_vec_q8_0_{qk_size}x{hidden}(&mut attn_proj, &attn_out, &lw.o_proj);",
-            qk_size = qk_size,
-            hidden = hidden
-        )?;
-    } else if is_q4 {
-        writeln!(
-            code,
-            "            matmul_vec_q4_0_{qk_size}x{hidden}(&mut attn_proj, &attn_out, &lw.o_proj);",
-            qk_size = qk_size,
-            hidden = hidden
-        )?;
-    } else if is_q4k {
-        writeln!(
-            code,
-            "            matmul_vec_q4_k_{qk_size}x{hidden}(&mut attn_proj, &attn_out, &lw.o_proj);",
-            qk_size = qk_size,
-            hidden = hidden
-        )?;
-    } else if is_q6k {
-        writeln!(code, "            matmul_vec_q6_k_{qk_size}x{hidden}(&mut attn_proj, &attn_out, &lw.o_proj);")?;
-    } else {
-        writeln!(
-            code,
-            "            matmul_vec_{qk_size}x{hidden}(&mut attn_proj, &attn_out, &lw.o_proj);",
-            qk_size = qk_size,
-            hidden = hidden
-        )?;
-    }
+    writeln!(
+        code,
+        "{}",
+        matmul_call(
+            o_dtype,
+            qk_size,
+            hidden,
+            "attn_proj",
+            "attn_out",
+            "lw.o_proj",
+            "            "
+        )
+    )?;
     writeln!(
         code,
         "            residual_add(&mut hidden_state, &attn_proj);"
@@ -4889,94 +4761,46 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
     )?;
     writeln!(code)?;
     writeln!(code, "            // FFN: fused silu_mul")?;
-    if is_q8 {
-        writeln!(
-            code,
-            "            matmul_vec_q8_0_{hidden}x{intermediate}(&mut gate, &normed, &lw.gate_proj);",
-            hidden = hidden,
-            intermediate = intermediate
-        )?;
-        writeln!(
-            code,
-            "            matmul_vec_q8_0_{hidden}x{intermediate}(&mut up, &normed, &lw.up_proj);",
-            hidden = hidden,
-            intermediate = intermediate
-        )?;
-    } else if is_q4 {
-        writeln!(
-            code,
-            "            matmul_vec_q4_0_{hidden}x{intermediate}(&mut gate, &normed, &lw.gate_proj);",
-            hidden = hidden,
-            intermediate = intermediate
-        )?;
-        writeln!(
-            code,
-            "            matmul_vec_q4_0_{hidden}x{intermediate}(&mut up, &normed, &lw.up_proj);",
-            hidden = hidden,
-            intermediate = intermediate
-        )?;
-    } else if is_q4k {
-        writeln!(
-            code,
-            "            matmul_vec_q4_k_{hidden}x{intermediate}(&mut gate, &normed, &lw.gate_proj);",
-            hidden = hidden,
-            intermediate = intermediate
-        )?;
-        writeln!(
-            code,
-            "            matmul_vec_q4_k_{hidden}x{intermediate}(&mut up, &normed, &lw.up_proj);",
-            hidden = hidden,
-            intermediate = intermediate
-        )?;
-    } else if is_q6k {
-        writeln!(code, "            matmul_vec_q6_k_{hidden}x{intermediate}(&mut gate, &normed, &lw.gate_proj);")?;
-        writeln!(code, "            matmul_vec_q6_k_{hidden}x{intermediate}(&mut up, &normed, &lw.up_proj);")?;
-    } else {
-        writeln!(
-            code,
-            "            matmul_vec_{hidden}x{intermediate}(&mut gate, &normed, &lw.gate_proj);",
-            hidden = hidden,
-            intermediate = intermediate
-        )?;
-        writeln!(
-            code,
-            "            matmul_vec_{hidden}x{intermediate}(&mut up, &normed, &lw.up_proj);",
-            hidden = hidden,
-            intermediate = intermediate
-        )?;
-    }
+    writeln!(
+        code,
+        "{}",
+        matmul_call(
+            gate_dtype,
+            hidden,
+            intermediate,
+            "gate",
+            "normed",
+            "lw.gate_proj",
+            "            "
+        )
+    )?;
+    writeln!(
+        code,
+        "{}",
+        matmul_call(
+            up_dtype,
+            hidden,
+            intermediate,
+            "up",
+            "normed",
+            "lw.up_proj",
+            "            "
+        )
+    )?;
     writeln!(code, "            silu_mul(&mut ffn_hidden, &gate, &up);")?;
-    if is_q8 {
-        writeln!(
-            code,
-            "            matmul_vec_q8_0_{intermediate}x{hidden}(&mut ffn_out, &ffn_hidden, &lw.down_proj);",
-            intermediate = intermediate,
-            hidden = hidden
-        )?;
-    } else if is_q4 {
-        writeln!(
-            code,
-            "            matmul_vec_q4_0_{intermediate}x{hidden}(&mut ffn_out, &ffn_hidden, &lw.down_proj);",
-            intermediate = intermediate,
-            hidden = hidden
-        )?;
-    } else if is_q4k {
-        writeln!(
-            code,
-            "            matmul_vec_q4_k_{intermediate}x{hidden}(&mut ffn_out, &ffn_hidden, &lw.down_proj);",
-            intermediate = intermediate,
-            hidden = hidden
-        )?;
-    } else if is_q6k {
-        writeln!(code, "            matmul_vec_q6_k_{intermediate}x{hidden}(&mut ffn_out, &ffn_hidden, &lw.down_proj);")?;
-    } else {
-        writeln!(
-            code,
-            "            matmul_vec_{intermediate}x{hidden}(&mut ffn_out, &ffn_hidden, &lw.down_proj);",
-            intermediate = intermediate,
-            hidden = hidden
-        )?;
-    }
+    writeln!(
+        code,
+        "{}",
+        matmul_call(
+            down_dtype,
+            intermediate,
+            hidden,
+            "ffn_out",
+            "ffn_hidden",
+            "lw.down_proj",
+            "            "
+        )
+    )?;
     writeln!(
         code,
         "            residual_add(&mut hidden_state, &ffn_out);"
@@ -5685,6 +5509,7 @@ mod tests {
             rope_theta: 10000.0,
             dtype: DType::F16,
             lm_head_dtype: None,
+            proj_dtypes: None,
             sliding_window_size: None,
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,
@@ -5782,6 +5607,7 @@ mod tests {
         let config = ModelConfig {
             dtype: DType::Q8_0,
             lm_head_dtype: None,
+            proj_dtypes: None,
             ..tiny_config()
         };
         let graph = graph_builder::build_graph(&config).unwrap();
@@ -5819,6 +5645,7 @@ mod tests {
             rope_theta: 10000.0,
             dtype: DType::F16,
             lm_head_dtype: None,
+            proj_dtypes: None,
             sliding_window_size: None,
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,
@@ -5848,6 +5675,7 @@ mod tests {
             rope_theta: 10000.0,
             dtype: DType::BF16,
             lm_head_dtype: None,
+            proj_dtypes: None,
             sliding_window_size: None,
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,
@@ -6001,6 +5829,7 @@ mod tests {
             rope_theta: 1e6,
             dtype: DType::F16,
             lm_head_dtype: None,
+            proj_dtypes: None,
             sliding_window_size: None,
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,
@@ -6047,6 +5876,7 @@ mod tests {
             rope_theta: 10000.0,
             dtype: DType::F16,
             lm_head_dtype: None,
+            proj_dtypes: None,
             sliding_window_size: None,
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,
@@ -6126,6 +5956,7 @@ mod tests {
             rope_theta: 10000.0,
             dtype: DType::Q8_0,
             lm_head_dtype: None,
+            proj_dtypes: None,
             sliding_window_size: None,
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,
@@ -6256,6 +6087,7 @@ mod tests {
             rope_theta: 1_000_000.0,
             dtype: DType::F16,
             lm_head_dtype: None,
+            proj_dtypes: None,
             sliding_window_size: None,
             qkv_bias: true,
             hidden_activation: HiddenActivation::SiLU,
@@ -6348,6 +6180,7 @@ mod tests {
             rope_theta: 10000.0,
             dtype: DType::F16,
             lm_head_dtype: None,
+            proj_dtypes: None,
             sliding_window_size: Some(64),
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,
@@ -6406,6 +6239,7 @@ mod tests {
             rope_theta: 10000.0,
             dtype: DType::Q8_0,
             lm_head_dtype: None,
+            proj_dtypes: None,
             sliding_window_size: Some(32),
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,
@@ -6486,6 +6320,7 @@ mod tests {
             rope_theta: 10000.0,
             dtype: DType::Q4_0,
             lm_head_dtype: None,
+            proj_dtypes: None,
             sliding_window_size: None,
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,
@@ -6663,6 +6498,7 @@ mod tests {
             rope_theta: 10000.0,
             dtype: DType::F16,
             lm_head_dtype: None,
+            proj_dtypes: None,
             sliding_window_size: None,
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,
@@ -7066,6 +6902,7 @@ mod tests {
             rope_theta: 10000.0,
             dtype: DType::F16,
             lm_head_dtype: None,
+            proj_dtypes: None,
             sliding_window_size: None,
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,
@@ -7129,6 +6966,7 @@ mod tests {
             rope_theta: 10000.0,
             dtype: DType::F16,
             lm_head_dtype: None,
+            proj_dtypes: None,
             sliding_window_size: None,
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,

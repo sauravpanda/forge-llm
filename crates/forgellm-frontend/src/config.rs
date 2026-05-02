@@ -136,6 +136,7 @@ impl HFConfig {
             rope_theta: self.rope_theta.unwrap_or(10000.0) as f32,
             dtype,
             lm_head_dtype: None,
+            proj_dtypes: None,
             sliding_window_size,
             qkv_bias,
             hidden_activation,

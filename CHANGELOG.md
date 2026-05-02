@@ -2,6 +2,89 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.9.13] — 2026-05-02 — per-projection dtype mixing for native Q4_K_M GGUFs
+
+Drop-in support for real Q4_K_M GGUFs (mixed Q4_K + Q6_K storage per
+projection category) without `--force-*` flags.  Llama 3.2 1B
+Q4_K_M from bartowski now compiles, generates coherent text, and
+scores ppl 4.3469 — natively, no requantization round-trip required.
+
+Previously, mixed-dtype GGUFs forced you to either pick a uniform
+target dtype with `--force-q4k` (lossy: Q6_K v/down/lm_head got
+requantized down to Q4_K) or `--force-q6k` (wasteful: Q4_K
+projections got requantized up to Q6_K).  Now the codegen dispatches
+the right kernel per projection.
+
+### Added
+
+- **`ProjectionDTypes` + `ProjCategory`** in
+  `forgellm-frontend/src/ir.rs` — per-projection storage dtypes for
+  the 9 weight-tensor categories (embed, q, k, v, o, gate, up, down,
+  lm_head).  `ModelConfig::proj_dtypes: Option<ProjectionDTypes>`
+  is `None` for legacy uniform-dtype configs and `Some(...)` for
+  mixed-dtype GGUFs.  `effective_proj_dtypes()` /
+  `effective_dtype(category)` helpers route per-projection lookups
+  through the legacy `dtype` + `lm_head_dtype` fields when
+  `proj_dtypes` is unset.
+- **`load_from_file_mixed_per_tensor`** in
+  `forgellm-frontend/src/weight_loader.rs` — closure-driven
+  per-tensor target dtype.  Each tensor's HF-conventionalized name
+  is passed to the closure, which returns the desired storage
+  dtype.  The single-target entry point now delegates to this.
+- **`detect_gguf_proj_dtypes`** in `forgellm-cli/src/main.rs` —
+  scans GGUF tensor list, majority-picks dtype per category, and
+  returns a `ProjectionDTypes`.  Tie-break prefers higher precision
+  so Q4_K_M files where v/down split 50/50 between Q4_K and Q6_K
+  upgrade to Q6_K (preserving the higher-precision tensors).  When
+  the file has no separate `output.weight` (tied-weight models like
+  Llama-3.2-1B), the lm_head dtype mirrors `embed` so the runtime
+  kernel matches the bytes the exporter actually writes.
+- **Per-projection codegen dispatch** in
+  `forgellm-codegen-cpu/src/emit.rs` — replaced the 8 dispatch
+  sites (4 in `emit_forward_function`, 4 in `emit_prefill_function`,
+  one each for QKV / O / Gate-Up / Down) with a `matmul_call`
+  helper that emits the right `matmul_vec_q*_KxN` call per
+  projection.  Per-projection field types in the generated
+  `LayerWeights` struct (each of `q_proj` / `k_proj` / ... is
+  `Vec<u8>` for quantized, `Vec<f32>` for f32).
+- **`q4_k_matmul_shapes` / `q6_k_matmul_shapes`** filtered by
+  per-projection dtype usage — only emit kernels for shapes that
+  actually use the dtype.  For mixed Q4_K_M, Q4_K kernels are
+  emitted for q/k/o/gate/up shapes and Q6_K kernels for
+  v/down/embed/lm_head shapes.
+- **Per-projection row_bytes / weight_loading_code** in
+  `forgellm-codegen-cpu/src/project.rs` — `qp_bytes`, `kp_bytes`,
+  ... computed from the per-projection dtype.  Mixed-dtype GGUFs
+  produce a `quant_label` like `mixed(Q4_K/Q6_K)` instead of a
+  single dtype name.
+- **3 unit tests** in `forgellm-cli/src/main.rs` covering the
+  Q4_K_M layout (mixed v/down), uniform Q4_K (`is_uniform()`
+  short-circuit), and tied-weight lm_head inheritance from embed.
+
+### Result — Llama-3.2-1B-Q4_K_M (Bartowski) AOT-mixed validated
+
+Compiled directly from the Q4_K_M GGUF, no `--force-*` flag:
+
+| path                                  | ppl    | BPB    | tok/s |
+| ------------------------------------- | ------ | ------ | ----- |
+| AOT-Mixed (Q4_K + Q6_K) `--score-corpus` | 4.3469 | 0.4053 | 20    |
+| AOT-Q6_K (Q8_0 source)                | 4.2647 | 0.4000 | 13    |
+| AOT-Q4_K (Q8_0 source)                | 4.5733 | 0.4280 | 40    |
+
+Detection prints during compile and export:
+```
+Per-projection dtypes: q=Q4_K k=Q4_K v=Q6_K o=Q4_K gate=Q4_K up=Q4_K down=Q6_K embed=Q6_K lm_head=Q6_K
+```
+
+The mixed-dtype binary sits between uniform-Q4_K and uniform-Q6_K
+on perplexity, exactly as expected — Q6_K bytes preserved natively
+for v/down/embed/lm_head means we don't pay the Q4_K requant
+penalty on those tensors.  Throughput (20 tok/s) lands between
+Q4_K's NEON-fast path and Q6_K's scalar path because the mix
+includes both kernel families.
+
+All 339 existing tests pass; no regressions on uniform-dtype paths.
+
 ## [0.9.12] — 2026-05-01 — Q6_K codegen + AOT validation (closes the Q6_K arc)
 
 Builds on v0.9.11's foundation: emits a Q6_K dot kernel into AOT

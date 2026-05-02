@@ -210,6 +210,7 @@ mod tests {
             rope_theta: 10000.0,
             dtype: DType::F16,
             lm_head_dtype: None,
+            proj_dtypes: None,
             sliding_window_size: None,
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,

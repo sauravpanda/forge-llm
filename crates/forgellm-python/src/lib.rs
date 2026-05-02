@@ -126,6 +126,7 @@ fn config_from_gguf(path: &str) -> anyhow::Result<ModelConfig> {
         rope_theta,
         dtype: DType::F16,
         lm_head_dtype: None,
+        proj_dtypes: None,
         sliding_window_size,
         qkv_bias,
         hidden_activation: HiddenActivation::SiLU,

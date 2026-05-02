@@ -131,6 +131,28 @@ pub fn load_from_file_mixed_with_target(
     path: impl AsRef<std::path::Path>,
     target_dtype: Option<crate::ir::DType>,
 ) -> Result<(crate::gguf::GGUFFile, ModelWeightsRaw), WeightLoadError> {
+    load_from_file_mixed_per_tensor(path, |_hf_name| target_dtype)
+}
+
+/// Load all tensors from a GGUF file with a per-tensor target dtype hint.
+///
+/// `target_for` is called with each tensor's HF-conventionalized name
+/// (`gguf_name_to_hf`) and returns the desired storage dtype (or `None` to
+/// fall back to the default Q8_0 routing).  This is the entry point used for
+/// per-projection mixed dtype loading (Q4_K_M GGUFs that want Q4_K for most
+/// tensors and Q6_K for `attn_v` / `ffn_down` / `output`).
+///
+/// Per-tensor target rules (same as the single-target path, applied per
+/// tensor):
+/// - Norms / dense F-format tensors are always stored as F32.
+/// - `Some(Q4_K)` → Q4_KRaw (raw if source is Q4K, else dequant + requant);
+///   numel-not-multiple-of-256 falls back to Q8_0Raw.
+/// - `Some(Q6_K)` → Q6_KRaw (same pattern).
+/// - `None` or other → Q8_0Raw (Q8_0 / Q4_0 source bytes preserved verbatim).
+pub fn load_from_file_mixed_per_tensor(
+    path: impl AsRef<std::path::Path>,
+    target_for: impl Fn(&str) -> Option<crate::ir::DType>,
+) -> Result<(crate::gguf::GGUFFile, ModelWeightsRaw), WeightLoadError> {
     use crate::ir::DType;
     let file = std::fs::File::open(path.as_ref())?;
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
@@ -138,8 +160,6 @@ pub fn load_from_file_mixed_with_target(
 
     let gguf = crate::gguf::parse(&mut cursor)
         .map_err(|e| WeightLoadError::Io(std::io::Error::other(e)))?;
-
-    let want_q4k = target_dtype == Some(DType::Q4_K);
 
     let mut tensors = HashMap::with_capacity(gguf.tensors.len());
     for tensor_info in &gguf.tensors {
@@ -158,6 +178,7 @@ pub fn load_from_file_mixed_with_target(
 
         let raw = &mmap[start..end];
         let hf_name = gguf_name_to_hf(&tensor_info.name);
+        let target = target_for(&hf_name);
 
         // Norms / dense F-format tensors: always store as F32 regardless of
         // target, since the codegen expects F32 for these.
@@ -166,12 +187,10 @@ pub fn load_from_file_mixed_with_target(
             GGMLType::F32 | GGMLType::F16 | GGMLType::BF16
         );
 
-        let want_q6k = target_dtype == Some(DType::Q6_K);
-
         let weight_data = if is_dense {
             let f32_data = dequantize(raw, tensor_info.ggml_type, numel)?;
             WeightData::F32(f32_data)
-        } else if want_q4k {
+        } else if target == Some(DType::Q4_K) {
             // Q4_K target: prefer Q4_KRaw across all source formats.  If the
             // source is already Q4_K, keep bytes verbatim; otherwise dequant
             // to f32 and re-quantize through `quantize_f32_to_q4_k`.
@@ -186,7 +205,7 @@ pub fn load_from_file_mixed_with_target(
                 let f32_data = dequantize(raw, tensor_info.ggml_type, numel)?;
                 WeightData::Q8_0Raw(quantize_f32_to_q8_0(&f32_data))
             }
-        } else if want_q6k {
+        } else if target == Some(DType::Q6_K) {
             // Q6_K target — same pattern as Q4_K.
             if tensor_info.ggml_type == GGMLType::Q6K {
                 WeightData::Q6_KRaw(raw.to_vec())
@@ -199,9 +218,7 @@ pub fn load_from_file_mixed_with_target(
             }
         } else {
             // Default Q8_0 target.  Native Q8_0 / Q4_0 stay as raw bytes;
-            // everything else (including Q6_K — codegen still requires
-            // uniform Q8_0 / Q4_K projections in v0.9.11) dequants to f32
-            // and re-quantizes to Q8_0.
+            // everything else dequants to f32 and re-quantizes to Q8_0.
             match tensor_info.ggml_type {
                 GGMLType::Q8_0 => WeightData::Q8_0Raw(raw.to_vec()),
                 GGMLType::Q4_0 => WeightData::Q4_0Raw(raw.to_vec()),

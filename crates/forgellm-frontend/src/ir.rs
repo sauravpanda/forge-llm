@@ -330,6 +330,155 @@ pub enum HiddenActivation {
     GeluApprox,
 }
 
+/// Categories of weight tensors used to look up per-projection storage dtype.
+///
+/// Real GGUF Q4_K_M files mix dtypes per projection: most matmul weights are
+/// Q4_K, but `attn_v` and `ffn_down` are upgraded to Q6_K for accuracy, and
+/// `output.weight` is also typically Q6_K.  This enum names the buckets the
+/// codegen dispatches on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProjCategory {
+    Embed,
+    Q,
+    K,
+    V,
+    O,
+    Gate,
+    Up,
+    Down,
+    LmHead,
+}
+
+impl ProjCategory {
+    /// Map an HF-conventionalized tensor name (the keys produced by
+    /// `weight_loader::gguf_name_to_hf`, also used directly by the
+    /// SafeTensors loader) to a projection category, if one applies.
+    /// Returns `None` for norms / non-projection weights.
+    pub fn from_hf_name(name: &str) -> Option<Self> {
+        if name == "model.embed_tokens.weight" {
+            return Some(Self::Embed);
+        }
+        if name == "lm_head.weight" || name == "output.weight" {
+            return Some(Self::LmHead);
+        }
+        // model.layers.N.<suffix>
+        let suffix = name.strip_prefix("model.layers.")?;
+        let dot_pos = suffix.find('.')?;
+        let suffix = &suffix[dot_pos + 1..];
+        match suffix {
+            "self_attn.q_proj.weight" => Some(Self::Q),
+            "self_attn.k_proj.weight" => Some(Self::K),
+            "self_attn.v_proj.weight" => Some(Self::V),
+            "self_attn.o_proj.weight" => Some(Self::O),
+            "mlp.gate_proj.weight" => Some(Self::Gate),
+            "mlp.up_proj.weight" => Some(Self::Up),
+            "mlp.down_proj.weight" => Some(Self::Down),
+            _ => None,
+        }
+    }
+
+    /// Map a raw GGUF tensor name (`token_embd.weight`, `blk.N.attn_q.weight`,
+    /// `output.weight`, ...) to a projection category, if one applies.
+    pub fn from_gguf_name(name: &str) -> Option<Self> {
+        match name {
+            "token_embd.weight" => return Some(Self::Embed),
+            "output.weight" | "lm_head.weight" => return Some(Self::LmHead),
+            _ => {}
+        }
+        let rest = name.strip_prefix("blk.")?;
+        let dot_pos = rest.find('.')?;
+        let suffix = &rest[dot_pos + 1..];
+        match suffix {
+            "attn_q.weight" => Some(Self::Q),
+            "attn_k.weight" => Some(Self::K),
+            "attn_v.weight" => Some(Self::V),
+            "attn_output.weight" => Some(Self::O),
+            "ffn_gate.weight" => Some(Self::Gate),
+            "ffn_up.weight" => Some(Self::Up),
+            "ffn_down.weight" => Some(Self::Down),
+            _ => None,
+        }
+    }
+}
+
+/// Per-projection storage dtypes.
+///
+/// When `ModelConfig::proj_dtypes` is `Some`, each projection's matmul
+/// dispatches to the kernel matching its category here.  When `None`, all
+/// projections fall back to `ModelConfig::dtype` (with `lm_head_dtype` as the
+/// only override) — the legacy uniform-dtype path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectionDTypes {
+    pub embed: DType,
+    pub q: DType,
+    pub k: DType,
+    pub v: DType,
+    pub o: DType,
+    pub gate: DType,
+    pub up: DType,
+    pub down: DType,
+    pub lm_head: DType,
+}
+
+impl ProjectionDTypes {
+    /// Build a uniform projection-dtype set from a single dtype (and optional
+    /// lm_head override).  This is the shape `ModelConfig::effective_proj_dtypes`
+    /// returns when `proj_dtypes` is `None`.
+    pub fn uniform(dtype: DType, lm_head_dtype: Option<DType>) -> Self {
+        Self {
+            embed: dtype,
+            q: dtype,
+            k: dtype,
+            v: dtype,
+            o: dtype,
+            gate: dtype,
+            up: dtype,
+            down: dtype,
+            lm_head: lm_head_dtype.unwrap_or(dtype),
+        }
+    }
+
+    pub fn get(&self, category: ProjCategory) -> DType {
+        match category {
+            ProjCategory::Embed => self.embed,
+            ProjCategory::Q => self.q,
+            ProjCategory::K => self.k,
+            ProjCategory::V => self.v,
+            ProjCategory::O => self.o,
+            ProjCategory::Gate => self.gate,
+            ProjCategory::Up => self.up,
+            ProjCategory::Down => self.down,
+            ProjCategory::LmHead => self.lm_head,
+        }
+    }
+
+    /// True if any projection category stores its weights as `target`.
+    pub fn uses(&self, target: DType) -> bool {
+        self.embed == target
+            || self.q == target
+            || self.k == target
+            || self.v == target
+            || self.o == target
+            || self.gate == target
+            || self.up == target
+            || self.down == target
+            || self.lm_head == target
+    }
+
+    /// True if all categories use the same dtype.
+    pub fn is_uniform(&self) -> bool {
+        let d = self.q;
+        self.embed == d
+            && self.k == d
+            && self.v == d
+            && self.o == d
+            && self.gate == d
+            && self.up == d
+            && self.down == d
+            && self.lm_head == d
+    }
+}
+
 /// Configuration describing a transformer model's hyperparameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
@@ -351,6 +500,12 @@ pub struct ModelConfig {
     /// higher-precision kernel for the logits matmul.
     #[serde(default)]
     pub lm_head_dtype: Option<DType>,
+    /// Per-projection storage dtypes.  When `Some`, each matmul dispatches
+    /// to the kernel matching its category (Q4_K_M → Q4_K for most, Q6_K for
+    /// `attn_v` / `ffn_down` / `output`).  When `None`, all projections share
+    /// `dtype` (with `lm_head_dtype` as the only override).
+    #[serde(default)]
+    pub proj_dtypes: Option<ProjectionDTypes>,
     /// Sliding window attention size. `None` means full attention (Llama).
     /// `Some(n)` means each token only attends to the last `n` tokens (Mistral SWA).
     #[serde(default)]
@@ -364,6 +519,19 @@ pub struct ModelConfig {
 }
 
 impl ModelConfig {
+    /// Return the per-projection dtype set for this config.  When
+    /// `proj_dtypes` is `Some`, returns it directly; otherwise builds a
+    /// uniform `ProjectionDTypes` from `dtype` (+ `lm_head_dtype`).
+    pub fn effective_proj_dtypes(&self) -> ProjectionDTypes {
+        self.proj_dtypes
+            .unwrap_or_else(|| ProjectionDTypes::uniform(self.dtype, self.lm_head_dtype))
+    }
+
+    /// Storage dtype for a single projection category.
+    pub fn effective_dtype(&self, category: ProjCategory) -> DType {
+        self.effective_proj_dtypes().get(category)
+    }
+
     /// Validate that model dimensions are consistent.
     pub fn validate(&self) -> Result<(), String> {
         if self.hidden_size == 0 {
@@ -673,6 +841,7 @@ mod tests {
             rope_theta: 10000.0,
             dtype: DType::F16,
             lm_head_dtype: None,
+            proj_dtypes: None,
             sliding_window_size: None,
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,
@@ -701,6 +870,7 @@ mod tests {
             rope_theta: 10000.0,
             dtype: DType::F16,
             lm_head_dtype: None,
+            proj_dtypes: None,
             sliding_window_size: Some(4096),
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,
@@ -729,6 +899,7 @@ mod tests {
             rope_theta: 1_000_000.0,
             dtype: DType::BF16,
             lm_head_dtype: None,
+            proj_dtypes: None,
             sliding_window_size: None,
             qkv_bias: true,
             hidden_activation: HiddenActivation::SiLU,
@@ -755,6 +926,7 @@ mod tests {
             rope_theta: 10000.0,
             dtype: DType::F16,
             lm_head_dtype: None,
+            proj_dtypes: None,
             sliding_window_size: None,
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,

@@ -169,18 +169,30 @@ fn generate_main(config: &ModelConfig) -> String {
     let num_layers = config.num_layers;
     let qk_size = num_heads * head_dim;
     let kv_size = num_kv_heads * head_dim;
-    let is_q8 = config.dtype == DType::Q8_0;
-    let is_q4 = config.dtype == DType::Q4_0;
-    let is_q4k = config.dtype == DType::Q4_K;
-    let is_q6k = config.dtype == DType::Q6_K;
-    // lm_head may use a different dtype than projections — compute its byte
-    // size separately (Q4_K_M → Q4_K proj + Q8_0 lm_head is the common case).
-    let lm_dtype = config.lm_head_dtype.unwrap_or(config.dtype);
+    use forgellm_frontend::ir::ProjCategory;
+    let pdt = config.effective_proj_dtypes();
+    let q_dtype = pdt.q;
+    let k_dtype = pdt.k;
+    let v_dtype = pdt.v;
+    let o_dtype = pdt.o;
+    let gate_dtype = pdt.gate;
+    let up_dtype = pdt.up;
+    let down_dtype = pdt.down;
+    let lm_dtype = config.effective_dtype(ProjCategory::LmHead);
+    let is_q8 = config.dtype == DType::Q8_0 && pdt.is_uniform();
+    let is_q4 = config.dtype == DType::Q4_0 && pdt.is_uniform();
     let lm_is_q8 = lm_dtype == DType::Q8_0;
     let lm_is_q4k = lm_dtype == DType::Q4_K;
     let lm_is_q6k = lm_dtype == DType::Q6_K;
+    // Whether any projection (or lm_head) stores raw bytes — controls
+    // whether we emit the load_weights_raw path (always true today since
+    // every supported projection dtype is byte-storage).
+    let any_quantized = pdt.uses(DType::Q8_0)
+        || pdt.uses(DType::Q4_0)
+        || pdt.uses(DType::Q4_K)
+        || pdt.uses(DType::Q6_K);
 
-    // Pre-compute row byte sizes per dtype.
+    // Per-dtype row-byte helpers (numel → bytes).
     let q8_row_bytes = |numel: usize| -> usize { numel.div_ceil(32) * 34 };
     let q4_row_bytes = |numel: usize| -> usize { numel.div_ceil(32) * 18 };
     // Q4_K: 144 bytes per 256-element super-block.
@@ -188,37 +200,28 @@ fn generate_main(config: &ModelConfig) -> String {
     // Q6_K: 210 bytes per 256-element super-block.
     let q6k_row_bytes = |numel: usize| -> usize { numel.div_ceil(256) * 210 };
 
-    // Byte sizes for projection weight tensors (Q8_0 / Q4_0 / Q4_K / Q6_K).
-    let proj_row_bytes: fn(usize) -> usize = if is_q6k {
-        |n| n.div_ceil(256) * 210
-    } else if is_q4k {
-        |n| n.div_ceil(256) * 144
-    } else if is_q8 {
-        |n| n.div_ceil(32) * 34
-    } else {
-        |n| n.div_ceil(32) * 18
+    // Per-projection row_bytes — dispatches per dtype.
+    let row_bytes_for = |dtype: DType, numel: usize| -> usize {
+        match dtype {
+            DType::Q8_0 => q8_row_bytes(numel),
+            DType::Q4_0 => q4_row_bytes(numel),
+            DType::Q4_K => q4k_row_bytes(numel),
+            DType::Q6_K => q6k_row_bytes(numel),
+            _ => numel * 4, // f32 fallback
+        }
     };
     let (qp_bytes, kp_bytes, vp_bytes, op_bytes, gp_bytes, up_bytes, dp_bytes) = (
-        qk_size * proj_row_bytes(hidden),
-        kv_size * proj_row_bytes(hidden),
-        kv_size * proj_row_bytes(hidden),
-        hidden * proj_row_bytes(qk_size),
-        inter * proj_row_bytes(hidden),
-        inter * proj_row_bytes(hidden),
-        hidden * proj_row_bytes(inter),
+        qk_size * row_bytes_for(q_dtype, hidden),
+        kv_size * row_bytes_for(k_dtype, hidden),
+        kv_size * row_bytes_for(v_dtype, hidden),
+        hidden * row_bytes_for(o_dtype, qk_size),
+        inter * row_bytes_for(gate_dtype, hidden),
+        inter * row_bytes_for(up_dtype, hidden),
+        hidden * row_bytes_for(down_dtype, inter),
     );
-    // lm_head byte size depends on lm_head_dtype, not projection dtype.
-    let lmh_bytes = if lm_is_q8 {
-        vocab * q8_row_bytes(hidden)
-    } else if lm_is_q4k {
-        vocab * q4k_row_bytes(hidden)
-    } else if lm_is_q6k {
-        vocab * q6k_row_bytes(hidden)
-    } else {
-        vocab * q4_row_bytes(hidden)
-    };
+    let lmh_bytes = vocab * row_bytes_for(lm_dtype, hidden);
 
-    let weight_loading_code = if is_q8 || is_q4 || is_q4k || is_q6k {
+    let weight_loading_code = if any_quantized {
         // Quantized: load raw bytes; norm/embed are still f32
         r##"fn load_weights_raw(path: &str) -> Vec<u8> {
     let file = std::fs::File::open(path).expect("failed to open weights");
@@ -248,16 +251,32 @@ fn generate_main(config: &ModelConfig) -> String {
         .to_string()
     };
 
-    let weight_slice_code = if is_q8 || is_q4 || is_q4k || is_q6k {
+    let weight_slice_code = if any_quantized {
         // Quantized: byte offsets for projection weights, f32 element offsets for norm/embed
-        let quant_label = if is_q8 {
-            "Q8_0"
-        } else if is_q4k {
-            "Q4_K"
-        } else if is_q6k {
-            "Q6_K"
+        let quant_label = if pdt.is_uniform() {
+            match config.dtype {
+                DType::Q8_0 => "Q8_0".to_string(),
+                DType::Q4_0 => "Q4_0".to_string(),
+                DType::Q4_K => "Q4_K".to_string(),
+                DType::Q6_K => "Q6_K".to_string(),
+                _ => format!("{:?}", config.dtype),
+            }
         } else {
-            "Q4_0"
+            // Mixed-dtype: list the unique dtypes used across projections.
+            let mut dtypes_used: Vec<&'static str> = Vec::new();
+            for d in [DType::Q8_0, DType::Q4_0, DType::Q4_K, DType::Q6_K] {
+                if pdt.uses(d) {
+                    let label = match d {
+                        DType::Q8_0 => "Q8_0",
+                        DType::Q4_0 => "Q4_0",
+                        DType::Q4_K => "Q4_K",
+                        DType::Q6_K => "Q6_K",
+                        _ => "?",
+                    };
+                    dtypes_used.push(label);
+                }
+            }
+            format!("mixed({})", dtypes_used.join("/"))
         };
 
         // Qwen2 QKV bias (F32) — read from weights.bin when enabled. Each bias
@@ -786,48 +805,46 @@ fn generate_main_embedded(config: &ModelConfig) -> String {
     let num_layers = config.num_layers;
     let qk_size = num_heads * head_dim;
     let kv_size = num_kv_heads * head_dim;
-    let is_q8 = config.dtype == DType::Q8_0;
-    let is_q4 = config.dtype == DType::Q4_0;
-    let is_q4k = config.dtype == DType::Q4_K;
-    let is_q6k = config.dtype == DType::Q6_K;
-    let lm_dtype = config.lm_head_dtype.unwrap_or(config.dtype);
-    let lm_is_q8 = lm_dtype == DType::Q8_0;
-    let lm_is_q4k = lm_dtype == DType::Q4_K;
-    let lm_is_q6k = lm_dtype == DType::Q6_K;
+    use forgellm_frontend::ir::ProjCategory;
+    let pdt = config.effective_proj_dtypes();
+    let q_dtype = pdt.q;
+    let k_dtype = pdt.k;
+    let v_dtype = pdt.v;
+    let o_dtype = pdt.o;
+    let gate_dtype = pdt.gate;
+    let up_dtype = pdt.up;
+    let down_dtype = pdt.down;
+    let lm_dtype = config.effective_dtype(ProjCategory::LmHead);
+    let any_quantized = pdt.uses(DType::Q8_0)
+        || pdt.uses(DType::Q4_0)
+        || pdt.uses(DType::Q4_K)
+        || pdt.uses(DType::Q6_K);
 
     let q8_row_bytes = |numel: usize| -> usize { numel.div_ceil(32) * 34 };
     let q4_row_bytes = |numel: usize| -> usize { numel.div_ceil(32) * 18 };
     let q4k_row_bytes = |numel: usize| -> usize { numel.div_ceil(256) * 144 };
     let q6k_row_bytes = |numel: usize| -> usize { numel.div_ceil(256) * 210 };
-    let proj_row_bytes: fn(usize) -> usize = if is_q6k {
-        |n| n.div_ceil(256) * 210
-    } else if is_q4k {
-        |n| n.div_ceil(256) * 144
-    } else if is_q8 {
-        |n| n.div_ceil(32) * 34
-    } else {
-        |n| n.div_ceil(32) * 18
+    let row_bytes_for = |dtype: DType, numel: usize| -> usize {
+        match dtype {
+            DType::Q8_0 => q8_row_bytes(numel),
+            DType::Q4_0 => q4_row_bytes(numel),
+            DType::Q4_K => q4k_row_bytes(numel),
+            DType::Q6_K => q6k_row_bytes(numel),
+            _ => numel * 4,
+        }
     };
     let (qp_bytes, kp_bytes, vp_bytes, op_bytes, gp_bytes, up_bytes, dp_bytes) = (
-        qk_size * proj_row_bytes(hidden),
-        kv_size * proj_row_bytes(hidden),
-        kv_size * proj_row_bytes(hidden),
-        hidden * proj_row_bytes(qk_size),
-        inter * proj_row_bytes(hidden),
-        inter * proj_row_bytes(hidden),
-        hidden * proj_row_bytes(inter),
+        qk_size * row_bytes_for(q_dtype, hidden),
+        kv_size * row_bytes_for(k_dtype, hidden),
+        kv_size * row_bytes_for(v_dtype, hidden),
+        hidden * row_bytes_for(o_dtype, qk_size),
+        inter * row_bytes_for(gate_dtype, hidden),
+        inter * row_bytes_for(up_dtype, hidden),
+        hidden * row_bytes_for(down_dtype, inter),
     );
-    let lmh_bytes = if lm_is_q8 {
-        vocab * q8_row_bytes(hidden)
-    } else if lm_is_q4k {
-        vocab * q4k_row_bytes(hidden)
-    } else if lm_is_q6k {
-        vocab * q6k_row_bytes(hidden)
-    } else {
-        vocab * q4_row_bytes(hidden)
-    };
+    let lmh_bytes = vocab * row_bytes_for(lm_dtype, hidden);
 
-    let bytes_helper = if is_q8 || is_q4 || is_q4k || is_q6k {
+    let bytes_helper = if any_quantized {
         // For quantized models, we only need the bytes_to_f32 helper for norm/embed extraction
         r##"fn bytes_to_f32_slice(bytes: &[u8]) -> Vec<f32> {
     let n = bytes.len() / 4;
@@ -854,17 +871,32 @@ fn generate_main_embedded(config: &ModelConfig) -> String {
         .to_string()
     };
 
-    let quant_label = if is_q8 {
-        "Q8_0"
-    } else if is_q4k {
-        "Q4_K"
-    } else if is_q6k {
-        "Q6_K"
+    let quant_label: String = if pdt.is_uniform() {
+        match config.dtype {
+            DType::Q8_0 => "Q8_0".to_string(),
+            DType::Q4_0 => "Q4_0".to_string(),
+            DType::Q4_K => "Q4_K".to_string(),
+            DType::Q6_K => "Q6_K".to_string(),
+            _ => format!("{:?}", config.dtype),
+        }
     } else {
-        "Q4_0"
+        let mut dtypes_used: Vec<&'static str> = Vec::new();
+        for d in [DType::Q8_0, DType::Q4_0, DType::Q4_K, DType::Q6_K] {
+            if pdt.uses(d) {
+                let label = match d {
+                    DType::Q8_0 => "Q8_0",
+                    DType::Q4_0 => "Q4_0",
+                    DType::Q4_K => "Q4_K",
+                    DType::Q6_K => "Q6_K",
+                    _ => "?",
+                };
+                dtypes_used.push(label);
+            }
+        }
+        format!("mixed({})", dtypes_used.join("/"))
     };
 
-    let weight_slice_code_embedded = if is_q8 || is_q4 || is_q4k || is_q6k {
+    let weight_slice_code_embedded = if any_quantized {
         format!(
             r##"    let w: &[u8] = WEIGHTS_BYTES;
     let mut boff = 0usize;
@@ -1224,6 +1256,7 @@ mod tests {
             rope_theta: 10000.0,
             dtype: DType::F16,
             lm_head_dtype: None,
+            proj_dtypes: None,
             sliding_window_size: None,
             qkv_bias: false,
             hidden_activation: HiddenActivation::SiLU,

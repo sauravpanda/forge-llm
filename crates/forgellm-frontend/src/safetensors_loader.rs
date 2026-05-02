@@ -224,6 +224,7 @@ pub fn infer_model_config(
         rope_theta: 10000.0,
         dtype,
         lm_head_dtype: None,
+        proj_dtypes: None,
         sliding_window_size: None,
         qkv_bias,
         hidden_activation: crate::ir::HiddenActivation::SiLU,

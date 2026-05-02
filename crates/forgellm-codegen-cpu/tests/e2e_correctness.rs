@@ -36,6 +36,7 @@ fn tiny_deterministic_config() -> ModelConfig {
         rope_theta: 10000.0,
         dtype: DType::F32,
         lm_head_dtype: None,
+        proj_dtypes: None,
         sliding_window_size: None,
         qkv_bias: false,
         hidden_activation: HiddenActivation::SiLU,
