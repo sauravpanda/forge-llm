@@ -2,6 +2,68 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.9.14] — 2026-05-12 — correctness gaps surfaced by the v0.9.13 per-projection arc
+
+Bug bundle closing three latent correctness gaps uncovered by an
+independent code review of v0.9.13's per-projection dtype mixing.
+None of these reproduce on the GGUFs that v0.9.13 was shipped
+against (Bartowski Llama-3.2-1B Q4_K_M still produces the exact
+same `ppl 4.3469`), but each fixes a defined wrong-output or
+build-failure path on adjacent architectures / quantization layouts.
+
+### Fixed
+
+- **#214 — Phi-3 fused QKV escapes per-projection dtype detection.**
+  `attn_qkv.weight` (the single fused Q|K|V tensor in Phi-3 GGUFs)
+  wasn't recognized by `ProjCategory::from_gguf_name` /
+  `from_hf_name`, so `detect_gguf_proj_dtypes` found zero tensors
+  for the Q/K/V categories and silently fell back to the
+  file-level majority — producing the wrong kernel dispatch for
+  mixed-dtype Phi-3 GGUFs.  Added a `FusedQkv` variant; detection
+  now counts fused tensors toward Q/K/V votes; `pdt.get(FusedQkv)`
+  returns `pdt.q` (Q/K/V share dtype by construction when fused).
+  Phi-3.1-mini Q8_0 still runs end-to-end after the change.
+- **#215 — `Vec<u8>` / `Vec<f32>` mismatch in mixed F16+quant
+  configs.**  `emit.rs` declared per-projection field types
+  (`Vec<u8>` for byte-storage, `Vec<f32>` for f32/f16), but
+  `project.rs`'s weight slicer wrote `let qp = w[..].to_vec();`
+  for every projection when `any_quantized`, producing `Vec<u8>`
+  unconditionally — the generated crate failed to type-check when
+  any projection was f32/f16 (e.g. an F16 lm_head alongside Q4_K
+  projections).  Per-projection `proj_slice` helper in `project.rs`
+  now dispatches per dtype, matching the field declarations.
+  Applied in both the file-loader path and the embedded-weights
+  (`--embed-weights`) path.
+- **#213 — Export path gated on `config.dtype` instead of effective
+  projection dtypes.**  `cmd_export_weights_impl` checked
+  `config.dtype in {Q8_0,Q4_0,Q4_K,Q6_K}` to decide between the
+  quantized export path and the f32 export path, but `config.dtype`
+  is the file-level majority and can be F16 even when
+  `proj_dtypes` holds Q-storage per projection.  Gate now checks
+  `effective_proj_dtypes().uses(Qx)` for any byte-storage dtype, so
+  the export and codegen layouts always agree.  No real GGUF in the
+  wild trips the old gate today; this is defensive against future
+  format combinations.
+
+### Validation
+
+- Bartowski Llama-3.2-1B Q4_K_M — compile + export + cargo build +
+  inference end-to-end.  Decodes "The capital of France is Paris..."
+  at 24.8 tok/s.  Same baseline as v0.9.13.
+- Bartowski Phi-3.1-mini-4k-instruct Q8_0 — compile + export + cargo
+  build + inference end-to-end after the FusedQkv detection change.
+  Decodes correctly at 18.8 tok/s.
+- All workspace tests pass, including two new Phi-3-shaped
+  `detect_gguf_proj_dtypes` fixtures (mixed and uniform).
+
+### Known limitations not addressed in this release
+
+- `--embed-weights` is currently broken on the embedded-codegen path
+  by an unrelated `fn sample` arity bug (defined without `top_p`,
+  called with `top_p`).  Out of scope for this bundle.
+- F16-majority + Q4_K projection mix is not exercised by any GGUF
+  the project ships against today.  The #213 fix is defensive.
+
 ## [0.9.13] — 2026-05-02 — per-projection dtype mixing for native Q4_K_M GGUFs
 
 Drop-in support for real Q4_K_M GGUFs (mixed Q4_K + Q6_K storage per

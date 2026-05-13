@@ -251,6 +251,38 @@ fn generate_main(config: &ModelConfig) -> String {
         .to_string()
     };
 
+    // Per-projection slicer: byte-storage dtypes (Q4_K/Q6_K/Q8_0/Q4_0) emit
+    // `.to_vec()` producing a `Vec<u8>`; non-byte-storage (F32/F16/BF16) emit
+    // the reinterpret-as-f32 pattern producing a `Vec<f32>`.  This must match
+    // the per-field types in `emit.rs::proj_type_for`, otherwise the generated
+    // crate fails to type-check in mixed F16+quant configs (#215).
+    let dtype_is_bytes = |d: DType| {
+        matches!(d, DType::Q8_0 | DType::Q4_0 | DType::Q4_K | DType::Q6_K)
+    };
+    let proj_slice = |var: &str, byte_size_expr: &str, dtype: DType, indent: &str| -> String {
+        if dtype_is_bytes(dtype) {
+            format!(
+                "{indent}let {var} = w[boff..boff+{byte_size_expr}].to_vec(); boff += {byte_size_expr};\n"
+            )
+        } else {
+            format!(
+                r##"{indent}// {var}: f32 (dtype={dtype:?}), interpreted from raw bytes
+{indent}let {var}_bytes = {byte_size_expr};
+{indent}let {var}: Vec<f32> = {{
+{indent}    let n = {var}_bytes / 4;
+{indent}    let mut v = Vec::<f32>::with_capacity(n);
+{indent}    unsafe {{
+{indent}        std::ptr::copy_nonoverlapping(w[boff..boff+{var}_bytes].as_ptr() as *const f32, v.as_mut_ptr(), n);
+{indent}        v.set_len(n);
+{indent}    }}
+{indent}    v
+{indent}}};
+{indent}boff += {var}_bytes;
+"##
+            )
+        }
+    };
+
     let weight_slice_code = if any_quantized {
         // Quantized: byte offsets for projection weights, f32 element offsets for norm/embed
         let quant_label = if pdt.is_uniform() {
@@ -338,6 +370,23 @@ fn generate_main(config: &ModelConfig) -> String {
             (String::new(), String::new(), String::new(), String::new())
         };
 
+        let qp_size_expr = format!("{qp_bytes}");
+        let kp_size_expr = format!("{kp_bytes}");
+        let vp_size_expr = format!("{vp_bytes}");
+        let op_size_expr = format!("{op_bytes}");
+        let gp_size_expr = format!("{gp_bytes}");
+        let up_size_expr = format!("{up_bytes}");
+        let dp_size_expr = format!("{dp_bytes}");
+        let lmh_size_expr = format!("{lmh_bytes}");
+        let qp_slice = proj_slice("qp", &qp_size_expr, q_dtype, "        ");
+        let kp_slice = proj_slice("kp", &kp_size_expr, k_dtype, "        ");
+        let vp_slice = proj_slice("vp", &vp_size_expr, v_dtype, "        ");
+        let op_slice = proj_slice("op", &op_size_expr, o_dtype, "        ");
+        let gp_slice = proj_slice("gp", &gp_size_expr, gate_dtype, "        ");
+        let up_slice = proj_slice("up", &up_size_expr, up_dtype, "        ");
+        let dp_slice = proj_slice("dp", &dp_size_expr, down_dtype, "        ");
+        let lmh_slice = proj_slice("lmh", &lmh_size_expr, lm_dtype, "    ");
+
         format!(
             r##"    let w = load_weights_raw(weights_path);
     let mut boff = 0usize;  // byte offset into raw buffer
@@ -368,12 +417,10 @@ fn generate_main(config: &ModelConfig) -> String {
             v
         }};
         boff += an_bytes;
-        // Projection weights: {quant_label} raw bytes (Q, K, V as a contiguous triplet)
-        let qp = w[boff..boff+{qp_bytes}].to_vec(); boff += {qp_bytes};
-        let kp = w[boff..boff+{kp_bytes}].to_vec(); boff += {kp_bytes};
-        let vp = w[boff..boff+{vp_bytes}].to_vec(); boff += {vp_bytes};
-{q_bias_read}{k_bias_read}{v_bias_read}        let op = w[boff..boff+{op_bytes}].to_vec(); boff += {op_bytes};
-        // ffn_norm: f32
+        // Projection weights: per-dtype slicing — byte-storage dtypes slice as
+        // Vec<u8>, others reinterpret as Vec<f32>.  Field types in model.rs
+        // must agree (see emit.rs::proj_type_for).
+{qp_slice}{kp_slice}{vp_slice}{q_bias_read}{k_bias_read}{v_bias_read}{op_slice}        // ffn_norm: f32
         let fn_bytes = {hidden} * 4;
         let fn_: Vec<f32> = {{
             let n = fn_bytes / 4;
@@ -385,10 +432,7 @@ fn generate_main(config: &ModelConfig) -> String {
             v
         }};
         boff += fn_bytes;
-        let gp = w[boff..boff+{gp_bytes}].to_vec(); boff += {gp_bytes};
-        let up = w[boff..boff+{up_bytes}].to_vec(); boff += {up_bytes};
-        let dp = w[boff..boff+{dp_bytes}].to_vec(); boff += {dp_bytes};
-        layers.push(model::LayerWeights {{ attn_norm: an, q_proj: qp, k_proj: kp, v_proj: vp, o_proj: op, ffn_norm: fn_, gate_proj: gp, up_proj: up, down_proj: dp{layer_fields} }});
+{gp_slice}{up_slice}{dp_slice}        layers.push(model::LayerWeights {{ attn_norm: an, q_proj: qp, k_proj: kp, v_proj: vp, o_proj: op, ffn_norm: fn_, gate_proj: gp, up_proj: up, down_proj: dp{layer_fields} }});
     }}
     // final_norm: f32
     let fnorm_bytes = {hidden} * 4;
@@ -402,9 +446,8 @@ fn generate_main(config: &ModelConfig) -> String {
         v
     }};
     boff += fnorm_bytes;
-    // lm_head: {quant_label} raw bytes
-    let lmh = w[boff..boff+{lmh_bytes}].to_vec();
-    let weights = model::Weights {{ embed_tokens: embed, layers, final_norm: fnorm, lm_head: lmh }};"##
+    // lm_head: per-dtype (matches lm_head field type in model.rs)
+{lmh_slice}    let weights = model::Weights {{ embed_tokens: embed, layers, final_norm: fnorm, lm_head: lmh }};"##
         )
     } else {
         // Qwen2 QKV bias (F32) — f32 path. Each bias is qk_size or kv_size floats.
@@ -896,7 +939,32 @@ fn generate_main_embedded(config: &ModelConfig) -> String {
         format!("mixed({})", dtypes_used.join("/"))
     };
 
+    // Per-projection slicer for the embedded path — same contract as the
+    // non-embedded path (see proj_slice in generate_main).
+    let dtype_is_bytes = |d: DType| {
+        matches!(d, DType::Q8_0 | DType::Q4_0 | DType::Q4_K | DType::Q6_K)
+    };
+    let proj_slice_emb = |var: &str, byte_size_expr: &str, dtype: DType, indent: &str| -> String {
+        if dtype_is_bytes(dtype) {
+            format!(
+                "{indent}let {var} = w[boff..boff+{byte_size_expr}].to_vec(); boff += {byte_size_expr};\n"
+            )
+        } else {
+            format!(
+                "{indent}let {var}_bytes = {byte_size_expr};\n{indent}let {var} = bytes_to_f32_slice(&w[boff..boff+{var}_bytes]); boff += {var}_bytes;\n"
+            )
+        }
+    };
+
     let weight_slice_code_embedded = if any_quantized {
+        let qp_slice = proj_slice_emb("qp", &format!("{qp_bytes}"), q_dtype, "        ");
+        let kp_slice = proj_slice_emb("kp", &format!("{kp_bytes}"), k_dtype, "        ");
+        let vp_slice = proj_slice_emb("vp", &format!("{vp_bytes}"), v_dtype, "        ");
+        let op_slice = proj_slice_emb("op", &format!("{op_bytes}"), o_dtype, "        ");
+        let gp_slice = proj_slice_emb("gp", &format!("{gp_bytes}"), gate_dtype, "        ");
+        let up_slice = proj_slice_emb("up", &format!("{up_bytes}"), up_dtype, "        ");
+        let dp_slice = proj_slice_emb("dp", &format!("{dp_bytes}"), down_dtype, "        ");
+        let lmh_slice = proj_slice_emb("lmh", &format!("{lmh_bytes}"), lm_dtype, "    ");
         format!(
             r##"    let w: &[u8] = WEIGHTS_BYTES;
     let mut boff = 0usize;
@@ -908,23 +976,15 @@ fn generate_main_embedded(config: &ModelConfig) -> String {
     for _ in 0..{num_layers} {{
         let an_bytes = {hidden} * 4;
         let an = bytes_to_f32_slice(&w[boff..boff+an_bytes]); boff += an_bytes;
-        // Projection weights: {quant_label} raw bytes
-        let qp = w[boff..boff+{qp_bytes}].to_vec(); boff += {qp_bytes};
-        let kp = w[boff..boff+{kp_bytes}].to_vec(); boff += {kp_bytes};
-        let vp = w[boff..boff+{vp_bytes}].to_vec(); boff += {vp_bytes};
-        let op = w[boff..boff+{op_bytes}].to_vec(); boff += {op_bytes};
-        let fn_bytes = {hidden} * 4;
+        // Projection weights: per-dtype slicing (see proj_slice_emb)
+{qp_slice}{kp_slice}{vp_slice}{op_slice}        let fn_bytes = {hidden} * 4;
         let fn_ = bytes_to_f32_slice(&w[boff..boff+fn_bytes]); boff += fn_bytes;
-        let gp = w[boff..boff+{gp_bytes}].to_vec(); boff += {gp_bytes};
-        let up = w[boff..boff+{up_bytes}].to_vec(); boff += {up_bytes};
-        let dp = w[boff..boff+{dp_bytes}].to_vec(); boff += {dp_bytes};
-        layers.push(model::LayerWeights {{ attn_norm: an, q_proj: qp, k_proj: kp, v_proj: vp, o_proj: op, ffn_norm: fn_, gate_proj: gp, up_proj: up, down_proj: dp }});
+{gp_slice}{up_slice}{dp_slice}        layers.push(model::LayerWeights {{ attn_norm: an, q_proj: qp, k_proj: kp, v_proj: vp, o_proj: op, ffn_norm: fn_, gate_proj: gp, up_proj: up, down_proj: dp }});
     }}
     let fnorm_bytes = {hidden} * 4;
     let fnorm = bytes_to_f32_slice(&w[boff..boff+fnorm_bytes]); boff += fnorm_bytes;
-    // lm_head: {quant_label} raw bytes
-    let lmh = w[boff..boff+{lmh_bytes}].to_vec();
-    let weights = model::Weights {{ embed_tokens: embed, layers, final_norm: fnorm, lm_head: lmh }};"##
+    // lm_head: per-dtype
+{lmh_slice}    let weights = model::Weights {{ embed_tokens: embed, layers, final_norm: fnorm, lm_head: lmh }};"##
         )
     } else {
         format!(

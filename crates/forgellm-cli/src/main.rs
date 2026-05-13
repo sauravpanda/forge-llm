@@ -643,7 +643,17 @@ fn detect_gguf_proj_dtypes(
     let pick = |cat: ProjCategory| -> DType {
         let mut counts: HashMap<DType, usize> = HashMap::new();
         for t in &gguf_file.tensors {
-            if ProjCategory::from_gguf_name(&t.name) != Some(cat) {
+            let tcat = ProjCategory::from_gguf_name(&t.name);
+            // Phi-3-style fused `attn_qkv.weight` post-splits into Q/K/V
+            // shards that inherit the fused tensor's dtype, so its dtype
+            // votes for all three categories.
+            let matches = match cat {
+                ProjCategory::Q | ProjCategory::K | ProjCategory::V => {
+                    tcat == Some(cat) || tcat == Some(ProjCategory::FusedQkv)
+                }
+                _ => tcat == Some(cat),
+            };
+            if !matches {
                 continue;
             }
             if let Some(dt) = ggml_type_storage_dtype(t.ggml_type) {
@@ -670,6 +680,9 @@ fn detect_gguf_proj_dtypes(
             ProjCategory::Up => dtypes.up = dt,
             ProjCategory::Down => dtypes.down = dt,
             ProjCategory::LmHead => dtypes.lm_head = dt,
+            // Fused QKV is not in the picking set — its dtype propagates
+            // through the Q/K/V votes via the `matches` arm above.
+            ProjCategory::FusedQkv => {}
         }
     }
     // Tied-weight models (e.g. Llama-3.2-1B) have no separate `output.weight`
@@ -2536,18 +2549,30 @@ fn cmd_export_weights_impl(
         config.proj_dtypes = None;
     }
 
+    // Quantized-path gate: trigger if *any* projection in the effective dtype
+    // set is byte-storage (Q8_0/Q4_0/Q4_K/Q6_K), not just the file-level
+    // majority `config.dtype`.  `config.dtype` falls back to F16 when no
+    // single dtype has a strict majority, but `proj_dtypes` can still hold
+    // quantized per-projection dtypes in that case.  Without this gate,
+    // F16-majority + mixed-quant GGUFs would take the f32 export path while
+    // the codegen emits Q*-byte slice sizes → layout mismatch (#213).
+    let pdt_for_gate = config.effective_proj_dtypes();
+    let any_quantized = pdt_for_gate.uses(DType::Q8_0)
+        || pdt_for_gate.uses(DType::Q4_0)
+        || pdt_for_gate.uses(DType::Q4_K)
+        || pdt_for_gate.uses(DType::Q6_K);
     let is_q8 = config.dtype == DType::Q8_0;
     let is_q4 = config.dtype == DType::Q4_0;
     let is_q4k = config.dtype == DType::Q4_K;
     let is_q6k = config.dtype == DType::Q6_K;
 
-    if is_q8 || is_q4 || is_q4k || is_q6k {
+    if any_quantized {
         let quant_label = match config.dtype {
             DType::Q8_0 => "Q8_0",
             DType::Q4_0 => "Q4_0",
             DType::Q4_K => "Q4_K",
             DType::Q6_K => "Q6_K",
-            _ => "?",
+            _ => "mixed",
         };
         if lora_path.is_some() {
             eprintln!(
@@ -3068,5 +3093,57 @@ mod tests {
         let pdt = detect_gguf_proj_dtypes(&gguf, DType::Q4_K);
         assert_eq!(pdt.embed, DType::Q6_K);
         assert_eq!(pdt.lm_head, DType::Q6_K);
+    }
+
+    #[test]
+    fn proj_dtypes_phi3_fused_qkv_routes_to_qkv() {
+        // Phi-3 GGUFs store Q/K/V as a single fused `attn_qkv.weight` tensor.
+        // The fused tensor's dtype should propagate to Q/K/V categories so
+        // the post-split shards' codegen kernels match the loader output.
+        // Mixed: fused QKV at Q6_K, everything else Q4_K.
+        let gguf = make_gguf_with_types(&[
+            ("token_embd.weight", GGMLType::Q4K),
+            ("blk.0.attn_qkv.weight", GGMLType::Q6K),
+            ("blk.0.attn_output.weight", GGMLType::Q4K),
+            ("blk.0.ffn_gate.weight", GGMLType::Q4K),
+            ("blk.0.ffn_up.weight", GGMLType::Q4K),
+            ("blk.0.ffn_down.weight", GGMLType::Q4K),
+            ("blk.1.attn_qkv.weight", GGMLType::Q6K),
+            ("blk.1.attn_output.weight", GGMLType::Q4K),
+            ("blk.1.ffn_gate.weight", GGMLType::Q4K),
+            ("blk.1.ffn_up.weight", GGMLType::Q4K),
+            ("blk.1.ffn_down.weight", GGMLType::Q4K),
+            ("output.weight", GGMLType::Q4K),
+        ]);
+        let pdt = detect_gguf_proj_dtypes(&gguf, DType::Q4_K);
+        assert_eq!(pdt.q, DType::Q6_K);
+        assert_eq!(pdt.k, DType::Q6_K);
+        assert_eq!(pdt.v, DType::Q6_K);
+        assert_eq!(pdt.o, DType::Q4_K);
+        assert_eq!(pdt.gate, DType::Q4_K);
+        assert_eq!(pdt.up, DType::Q4_K);
+        assert_eq!(pdt.down, DType::Q4_K);
+        assert_eq!(pdt.lm_head, DType::Q4_K);
+        assert!(!pdt.is_uniform());
+    }
+
+    #[test]
+    fn proj_dtypes_phi3_fused_qkv_uniform_q4k() {
+        // Uniform Phi-3: fused QKV + everything else all Q4_K → is_uniform()
+        // returns true, so the codegen takes the legacy single-dtype path.
+        let gguf = make_gguf_with_types(&[
+            ("token_embd.weight", GGMLType::Q4K),
+            ("blk.0.attn_qkv.weight", GGMLType::Q4K),
+            ("blk.0.attn_output.weight", GGMLType::Q4K),
+            ("blk.0.ffn_gate.weight", GGMLType::Q4K),
+            ("blk.0.ffn_up.weight", GGMLType::Q4K),
+            ("blk.0.ffn_down.weight", GGMLType::Q4K),
+            ("output.weight", GGMLType::Q4K),
+        ]);
+        let pdt = detect_gguf_proj_dtypes(&gguf, DType::Q4_K);
+        assert!(pdt.is_uniform());
+        assert_eq!(pdt.q, DType::Q4_K);
+        assert_eq!(pdt.k, DType::Q4_K);
+        assert_eq!(pdt.v, DType::Q4_K);
     }
 }

@@ -347,6 +347,11 @@ pub enum ProjCategory {
     Up,
     Down,
     LmHead,
+    /// Phi-3-style fused Q|K|V tensor that the loader splits into Q/K/V
+    /// shards post-read.  All three shards inherit the fused tensor's storage
+    /// dtype, so this category routes to `self.q` (with the contract that
+    /// `q == k == v` whenever the model has a fused tensor).
+    FusedQkv,
 }
 
 impl ProjCategory {
@@ -369,6 +374,7 @@ impl ProjCategory {
             "self_attn.q_proj.weight" => Some(Self::Q),
             "self_attn.k_proj.weight" => Some(Self::K),
             "self_attn.v_proj.weight" => Some(Self::V),
+            "self_attn.qkv_proj.weight" => Some(Self::FusedQkv),
             "self_attn.o_proj.weight" => Some(Self::O),
             "mlp.gate_proj.weight" => Some(Self::Gate),
             "mlp.up_proj.weight" => Some(Self::Up),
@@ -392,6 +398,7 @@ impl ProjCategory {
             "attn_q.weight" => Some(Self::Q),
             "attn_k.weight" => Some(Self::K),
             "attn_v.weight" => Some(Self::V),
+            "attn_qkv.weight" => Some(Self::FusedQkv),
             "attn_output.weight" => Some(Self::O),
             "ffn_gate.weight" => Some(Self::Gate),
             "ffn_up.weight" => Some(Self::Up),
@@ -449,6 +456,10 @@ impl ProjectionDTypes {
             ProjCategory::Up => self.up,
             ProjCategory::Down => self.down,
             ProjCategory::LmHead => self.lm_head,
+            // Fused QKV shares one storage dtype across Q/K/V — detection
+            // counts the fused tensor toward all three, so `self.q` is the
+            // canonical answer.
+            ProjCategory::FusedQkv => self.q,
         }
     }
 
