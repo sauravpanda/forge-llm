@@ -68,6 +68,7 @@ pub fn generate(graph: &Graph) -> Result<String, CodegenError> {
     }
     if needs_q4k {
         emit_specialized_q4_k_matmul_functions(&mut code, config)?;
+        emit_specialized_q4_k_matmul_batched_functions(&mut code, config)?;
     }
     if needs_q6k {
         // Q6_K reuses `f16_bits_to_f32` and `quantize_to_q8_0_blocks_into`.
@@ -85,11 +86,17 @@ pub fn generate(graph: &Graph) -> Result<String, CodegenError> {
     }
     if needs_q6k {
         emit_specialized_q6_k_matmul_functions(&mut code, config)?;
+        emit_specialized_q6_k_matmul_batched_functions(&mut code, config)?;
     }
     emit_specialized_matmul_functions(&mut code, config)?;
     emit_forward_function(&mut code, graph, config)?;
     emit_prefill_function(&mut code, config)?;
-    if config.dtype == DType::Q8_0 || config.dtype == DType::Q4_0 {
+    // Batched prefill: emitted whenever any projection uses a byte-storage
+    // dtype (Q8_0 / Q4_0 / Q4_K / Q6_K).  Per-projection dispatch inside
+    // `forward_prefill_batched` picks the right matmul_mat_* per category,
+    // so mixed Q4_K_M GGUFs (Q4_K + Q6_K) get batched prefill too.
+    let needs_batched_prefill = needs_q8 || needs_q4 || needs_q4k || needs_q6k;
+    if needs_batched_prefill {
         emit_prefill_batched_function(&mut code, config)?;
         if use_flash_attention(config) {
             emit_flash_attention_batched_function(&mut code)?;
@@ -3335,6 +3342,32 @@ fn matmul_call(
     format!("{indent}{prefix}{k}x{n}(&mut {dst}, &{src}, &{weight});")
 }
 
+/// Per-projection dispatch for batched (m≥1) matmul kernels.  Mirrors
+/// `matmul_call` but emits `matmul_mat_*_KxN(&mut dst, m, &src, &weight)`
+/// signatures.
+fn matmul_call_mat(
+    dtype: DType,
+    k: usize,
+    n: usize,
+    dst: &str,
+    m: &str,
+    src: &str,
+    weight: &str,
+    indent: &str,
+) -> String {
+    let prefix = match dtype {
+        DType::Q8_0 => "matmul_mat_q8_0_",
+        DType::Q4_0 => "matmul_mat_q4_0_",
+        DType::Q4_K => "matmul_mat_q4_k_",
+        DType::Q6_K => "matmul_mat_q6_k_",
+        _ => unreachable!(
+            "matmul_call_mat: non-byte-storage projection dtype {:?} not supported",
+            dtype
+        ),
+    };
+    format!("{indent}{prefix}{k}x{n}(&mut {dst}, {m}, &{src}, &{weight});")
+}
+
 /// Shapes for which to emit specialized matmul kernels for `target` dtype.
 ///
 /// With per-projection dtype mixing (`config.proj_dtypes`), each projection
@@ -3488,6 +3521,150 @@ fn emit_specialized_q4_k_matmul_functions(
         writeln!(code)?;
     }
 
+    Ok(())
+}
+
+/// Emit `matmul_mat_q4_k_KxN(output, m, input, weight)` — batched Q4_K matmul.
+///
+/// Quantizes all `m` input rows to Q8_0 once, then iterates weight rows in
+/// outer position (chunks of 4 via `dot4_q4_k_q8_0` on AArch64; scalar tail).
+/// Inner `for r in 0..m` reuses each weight row across all M tokens, so the
+/// per-row Q4_K scale / min unpack cost is paid once for M dot products
+/// instead of M times — the headline batched-prefill bandwidth amortization.
+///
+/// Output layout matches the per-token `matmul_vec_q4_k_KxN`: row-major `[m * N]`.
+/// Non-AArch64 fallback loops the per-token matmul (no batched benefit but the
+/// signature stays portable so the codegen dispatch site is target-agnostic).
+fn emit_specialized_q4_k_matmul_batched_functions(
+    code: &mut String,
+    config: &ModelConfig,
+) -> Result<(), CodegenError> {
+    writeln!(
+        code,
+        "// --- Shape-specialized Q4_K batched matmul functions (m>=1, weight is &[u8]) ---"
+    )?;
+    writeln!(code)?;
+
+    for &(k, n) in &q4_k_matmul_shapes(config) {
+        let row_bytes = k.div_ceil(256) * 144;
+        let q8_bytes = k.div_ceil(32) * 34;
+        writeln!(
+            code,
+            "/// Q4_K batched matmul: [m, {k}] x [{n}, {k}]^T -> [m, {n}] (row-major; weight raw Q4_K bytes)"
+        )?;
+        writeln!(code, "#[cfg(target_arch = \"aarch64\")]")?;
+        writeln!(
+            code,
+            "fn matmul_mat_q4_k_{k}x{n}(output: &mut [f32], m: usize, input: &[f32], weight: &[u8]) {{"
+        )?;
+        // Quantize all M inputs to Q8_0 once.  Static row_bytes lets us slice
+        // exactly.
+        writeln!(code, "    let mut input_q8 = vec![0u8; m * {q8_bytes}];")?;
+        writeln!(code, "    for r in 0..m {{")?;
+        writeln!(
+            code,
+            "        quantize_to_q8_0_blocks_into(&input[r*{k}..(r+1)*{k}], &mut input_q8[r*{q8_bytes}..(r+1)*{q8_bytes}]);"
+        )?;
+        writeln!(code, "    }}")?;
+
+        let n_chunks4 = n / 4;
+        let n_rem4 = n % 4;
+        writeln!(code, "    let out_addr = output.as_mut_ptr() as usize;")?;
+        writeln!(code, "    let input_q8_ref: &[u8] = &input_q8;")?;
+        if n_chunks4 > 0 {
+            // Parallelize the n-outer loop in chunks of 4 weight rows.
+            // Different n_blocks write to disjoint output[r*N + j0..j0+4]
+            // ranges, so workers never alias.  The `usize` address keeps the
+            // pointer Send across threads.
+            writeln!(
+                code,
+                "    (0..{n_chunks4}).into_par_iter().for_each(|n_block| {{"
+            )?;
+            writeln!(code, "        let j0 = n_block * 4;")?;
+            writeln!(
+                code,
+                "        let w0 = &weight[(j0+0)*{row_bytes}..(j0+1)*{row_bytes}];"
+            )?;
+            writeln!(
+                code,
+                "        let w1 = &weight[(j0+1)*{row_bytes}..(j0+2)*{row_bytes}];"
+            )?;
+            writeln!(
+                code,
+                "        let w2 = &weight[(j0+2)*{row_bytes}..(j0+3)*{row_bytes}];"
+            )?;
+            writeln!(
+                code,
+                "        let w3 = &weight[(j0+3)*{row_bytes}..(j0+4)*{row_bytes}];"
+            )?;
+            writeln!(code, "        for r in 0..m {{")?;
+            writeln!(
+                code,
+                "            let input_q = &input_q8_ref[r*{q8_bytes}..(r+1)*{q8_bytes}];"
+            )?;
+            writeln!(
+                code,
+                "            let (d0, d1, d2, d3) = dot4_q4_k_q8_0(w0, w1, w2, w3, input_q, {k});"
+            )?;
+            writeln!(code, "            unsafe {{")?;
+            writeln!(code, "                let base = r * {n} + j0;")?;
+            writeln!(
+                code,
+                "                let p = (out_addr as *mut f32).add(base);"
+            )?;
+            writeln!(code, "                *p.add(0) = d0;")?;
+            writeln!(code, "                *p.add(1) = d1;")?;
+            writeln!(code, "                *p.add(2) = d2;")?;
+            writeln!(code, "                *p.add(3) = d3;")?;
+            writeln!(code, "            }}")?;
+            writeln!(code, "        }}")?;
+            writeln!(code, "    }});")?;
+        }
+        if n_rem4 > 0 {
+            let tail_base = n_chunks4 * 4;
+            writeln!(code, "    // Scalar tail (N % 4 remainder)")?;
+            writeln!(code, "    for r in 0..m {{")?;
+            writeln!(
+                code,
+                "        let input_q = &input_q8[r*{q8_bytes}..(r+1)*{q8_bytes}];"
+            )?;
+            for j in 0..n_rem4 {
+                let col = tail_base + j;
+                writeln!(
+                    code,
+                    "        output[r*{n} + {col}] = dot_q4_k_q8_0(&weight[{col}*{row_bytes}..({col}+1)*{row_bytes}], input_q, {k});"
+                )?;
+            }
+            writeln!(code, "    }}")?;
+        }
+        writeln!(code, "}}")?;
+        writeln!(code)?;
+
+        // Non-AArch64 fallback: loop per-token matmul_vec (no batch win but
+        // portable; CPU prefill on x86 is rare enough that the vec path is fine).
+        writeln!(code, "#[cfg(not(target_arch = \"aarch64\"))]")?;
+        writeln!(
+            code,
+            "fn matmul_mat_q4_k_{k}x{n}(output: &mut [f32], m: usize, input: &[f32], weight: &[u8]) {{"
+        )?;
+        writeln!(code, "    for r in 0..m {{")?;
+        writeln!(code, "        let mut out_row = [0.0f32; {n}];")?;
+        writeln!(
+            code,
+            "        let in_row: &[f32; {k}] = input[r*{k}..(r+1)*{k}].try_into().unwrap();"
+        )?;
+        writeln!(
+            code,
+            "        matmul_vec_q4_k_{k}x{n}(&mut out_row, in_row, weight);"
+        )?;
+        writeln!(
+            code,
+            "        output[r*{n}..(r+1)*{n}].copy_from_slice(&out_row);"
+        )?;
+        writeln!(code, "    }}")?;
+        writeln!(code, "}}")?;
+        writeln!(code)?;
+    }
     Ok(())
 }
 
@@ -3653,6 +3830,82 @@ fn emit_specialized_q6_k_matmul_functions(
         writeln!(code)?;
     }
 
+    Ok(())
+}
+
+/// Emit `matmul_mat_q6_k_KxN(output, m, input, weight)` — batched Q6_K matmul.
+///
+/// Same shape as the Q4_K batched emitter (Q8_0-quantize all M inputs once,
+/// iterate weight rows outer / tokens inner), but the inner kernel is the
+/// scalar `dot_q6_k_q8_0` since Q6_K has no `dot4` / `dot8` NEON helper yet.
+/// The cross-token cache amortization is still meaningful: each Q6_K weight
+/// row (210 bytes / 256 elems) is fetched once and reused for M dot products
+/// instead of M times.
+///
+/// For longer-term ILP, adding `dot4_q6_k_q8_0` (4-row sdot cascade) is the
+/// next step; this scalar inner suffices for the v0.9.15 first cut.
+fn emit_specialized_q6_k_matmul_batched_functions(
+    code: &mut String,
+    config: &ModelConfig,
+) -> Result<(), CodegenError> {
+    writeln!(
+        code,
+        "// --- Shape-specialized Q6_K batched matmul functions (m>=1, weight is &[u8]) ---"
+    )?;
+    writeln!(code)?;
+
+    for &(k, n) in &q6_k_matmul_shapes(config) {
+        let row_bytes = k.div_ceil(256) * 210;
+        let q8_bytes = k.div_ceil(32) * 34;
+        writeln!(
+            code,
+            "/// Q6_K batched matmul: [m, {k}] x [{n}, {k}]^T -> [m, {n}] (row-major; weight raw Q6_K bytes)"
+        )?;
+        writeln!(
+            code,
+            "fn matmul_mat_q6_k_{k}x{n}(output: &mut [f32], m: usize, input: &[f32], weight: &[u8]) {{"
+        )?;
+        writeln!(code, "    let mut input_q8 = vec![0u8; m * {q8_bytes}];")?;
+        writeln!(code, "    for r in 0..m {{")?;
+        writeln!(
+            code,
+            "        quantize_to_q8_0_blocks_into(&input[r*{k}..(r+1)*{k}], &mut input_q8[r*{q8_bytes}..(r+1)*{q8_bytes}]);"
+        )?;
+        writeln!(code, "    }}")?;
+
+        writeln!(code, "    let out_addr = output.as_mut_ptr() as usize;")?;
+        writeln!(code, "    let input_q8_ref: &[u8] = &input_q8;")?;
+        // Parallelize over output columns.  Each worker owns one column j;
+        // the inner per-token loop reuses the single weight row across all m.
+        writeln!(
+            code,
+            "    (0..{n}).into_par_iter().for_each(|j| {{"
+        )?;
+        writeln!(
+            code,
+            "        let w = &weight[j*{row_bytes}..(j+1)*{row_bytes}];"
+        )?;
+        writeln!(code, "        for r in 0..m {{")?;
+        writeln!(
+            code,
+            "            let input_q = &input_q8_ref[r*{q8_bytes}..(r+1)*{q8_bytes}];"
+        )?;
+        writeln!(
+            code,
+            "            let d = dot_q6_k_q8_0(w, input_q, {k});"
+        )?;
+        writeln!(code, "            unsafe {{")?;
+        writeln!(
+            code,
+            "                let p = (out_addr as *mut f32).add(r * {n} + j);"
+        )?;
+        writeln!(code, "                *p = d;")?;
+        writeln!(code, "            }}")?;
+        writeln!(code, "        }}")?;
+        writeln!(code, "    }});")?;
+        writeln!(code, "}}")?;
+        writeln!(code)?;
+    }
     Ok(())
 }
 
@@ -4527,10 +4780,16 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
     let gate_dtype = pdt.gate;
     let up_dtype = pdt.up;
     let down_dtype = pdt.down;
-    // Batched-prefill dispatch is only enabled when projections are uniformly
-    // Q8_0 or Q4_0 (the kernel families that have batched specializations).
+    // Batched-prefill dispatch is enabled whenever any projection uses a
+    // byte-storage dtype.  Per-projection dispatch inside
+    // `forward_prefill_batched` picks the right matmul_mat_* per category,
+    // supporting uniform Q8_0/Q4_0/Q4_K/Q6_K and mixed Q4_K_M (Q4_K + Q6_K).
     let is_q8 = config.dtype == DType::Q8_0 && pdt.is_uniform();
     let is_q4 = config.dtype == DType::Q4_0 && pdt.is_uniform();
+    let has_batched_prefill = pdt.uses(DType::Q8_0)
+        || pdt.uses(DType::Q4_0)
+        || pdt.uses(DType::Q4_K)
+        || pdt.uses(DType::Q6_K);
     // lm_head may use a different dtype than projections (see emit_forward_function).
     let lm_dtype = config.effective_dtype(ProjCategory::LmHead);
     let lm_is_q8 = lm_dtype == DType::Q8_0;
@@ -4557,8 +4816,9 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
     // Dispatch to the batched prefill path when the prompt is long enough
     // to amortize heap allocation + batched-matmul overhead.  Below the
     // threshold, the per-token stack path has lower fixed cost.  Emitted
-    // for Q8_0 and Q4_0 (f32 falls through to per-token).
-    if is_q8 || is_q4 {
+    // for any byte-storage projection set (Q8_0 / Q4_0 / Q4_K / Q6_K /
+    // mixed Q4_K_M); f32-only configs fall through to per-token.
+    if has_batched_prefill {
         writeln!(
             code,
             "    // Long prompts: batched matmul path amortizes weight loads across M tokens."
@@ -5076,29 +5336,20 @@ fn emit_prefill_batched_function(
     let head_dim = config.head_dim;
     let qk_size = num_heads * head_dim;
     let kv_size = num_kv_heads * head_dim;
-    // Projection dispatch — `matmul_mat_{mm_kind}_KxN` for per-layer weights.
-    let mm_kind = match config.dtype {
-        DType::Q8_0 => "q8_0",
-        DType::Q4_0 => "q4_0",
-        _ => unreachable!("forward_prefill_batched only emitted for Q8_0 / Q4_0"),
-    };
-    // lm_head dispatch — may differ from projections (e.g. Q4_K_M → Q4_0 proj + Q8_0 lm_head).
-    let lm_dtype = config.lm_head_dtype.unwrap_or(config.dtype);
-    let (lm_row_bytes, lm_dot8, lm_dot, lm_scalar_dot) = match lm_dtype {
-        DType::Q8_0 => (
-            hidden.div_ceil(32) * 34,
-            "dot8_q8_0_q8_0",
-            "dot_q8_0_q8_0",
-            "dot_q8_0",
-        ),
-        DType::Q4_0 => (
-            hidden.div_ceil(32) * 18,
-            "dot8_q4_0_q8_0",
-            "dot_q4_0_q8_0",
-            "dot_q4_0",
-        ),
-        _ => unreachable!("forward_prefill_batched lm_head only supports Q8_0 / Q4_0"),
-    };
+    let vocab = config.vocab_size;
+    // Per-projection dispatch — picks matmul_mat_{q*}_KxN per projection
+    // category.  Supports mixed Q4_K_M (Q4_K + Q6_K projections in the same
+    // model).
+    use forgellm_frontend::ir::ProjCategory;
+    let pdt = config.effective_proj_dtypes();
+    let q_dtype = pdt.q;
+    let k_dtype = pdt.k;
+    let v_dtype = pdt.v;
+    let o_dtype = pdt.o;
+    let gate_dtype = pdt.gate;
+    let up_dtype = pdt.up;
+    let down_dtype = pdt.down;
+    let lm_dtype = config.effective_dtype(ProjCategory::LmHead);
 
     writeln!(code)?;
     writeln!(
@@ -5208,15 +5459,18 @@ fn emit_prefill_batched_function(
     )?;
     writeln!(
         code,
-        "        matmul_mat_{mm_kind}_{hidden}x{qk_size}(&mut q_batch, m, &normed_batch, &lw.q_proj);"
+        "{}",
+        matmul_call_mat(q_dtype, hidden, qk_size, "q_batch", "m", "normed_batch", "lw.q_proj", "        ")
     )?;
     writeln!(
         code,
-        "        matmul_mat_{mm_kind}_{hidden}x{kv_size}(&mut k_batch, m, &normed_batch, &lw.k_proj);"
+        "{}",
+        matmul_call_mat(k_dtype, hidden, kv_size, "k_batch", "m", "normed_batch", "lw.k_proj", "        ")
     )?;
     writeln!(
         code,
-        "        matmul_mat_{mm_kind}_{hidden}x{kv_size}(&mut v_batch, m, &normed_batch, &lw.v_proj);"
+        "{}",
+        matmul_call_mat(v_dtype, hidden, kv_size, "v_batch", "m", "normed_batch", "lw.v_proj", "        ")
     )?;
     writeln!(code)?;
 
@@ -5377,7 +5631,8 @@ fn emit_prefill_batched_function(
     )?;
     writeln!(
         code,
-        "        matmul_mat_{mm_kind}_{qk_size}x{hidden}(&mut attn_proj_batch, m, &attn_out_batch, &lw.o_proj);"
+        "{}",
+        matmul_call_mat(o_dtype, qk_size, hidden, "attn_proj_batch", "m", "attn_out_batch", "lw.o_proj", "        ")
     )?;
     writeln!(code, "        for r in 0..m {{")?;
     writeln!(
@@ -5402,11 +5657,13 @@ fn emit_prefill_batched_function(
     )?;
     writeln!(
         code,
-        "        matmul_mat_{mm_kind}_{hidden}x{intermediate}(&mut gate_batch, m, &normed_batch, &lw.gate_proj);"
+        "{}",
+        matmul_call_mat(gate_dtype, hidden, intermediate, "gate_batch", "m", "normed_batch", "lw.gate_proj", "        ")
     )?;
     writeln!(
         code,
-        "        matmul_mat_{mm_kind}_{hidden}x{intermediate}(&mut up_batch, m, &normed_batch, &lw.up_proj);"
+        "{}",
+        matmul_call_mat(up_dtype, hidden, intermediate, "up_batch", "m", "normed_batch", "lw.up_proj", "        ")
     )?;
     writeln!(code, "        for r in 0..m {{")?;
     // Match architecture-dependent activation: existing forward_prefill uses silu_mul.
@@ -5418,7 +5675,8 @@ fn emit_prefill_batched_function(
     writeln!(code, "        // Batched down matmul + per-token residual")?;
     writeln!(
         code,
-        "        matmul_mat_{mm_kind}_{intermediate}x{hidden}(&mut ffn_out_batch, m, &ffn_hidden_batch, &lw.down_proj);"
+        "{}",
+        matmul_call_mat(down_dtype, intermediate, hidden, "ffn_out_batch", "m", "ffn_hidden_batch", "lw.down_proj", "        ")
     )?;
     writeln!(code, "        for r in 0..m {{")?;
     writeln!(
@@ -5429,9 +5687,10 @@ fn emit_prefill_batched_function(
     writeln!(code, "    }}")?;
     writeln!(code)?;
 
-    // Final norm + lm_head on last token only.  Dtype-specific kernels:
-    // Q8_0 uses dot8_q8_0_q8_0 / dot_q8_0_q8_0 on 34-byte rows;
-    // Q4_0 uses dot8_q4_0_q8_0 / dot_q4_0_q8_0 on 18-byte rows.
+    // Final norm + lm_head on the last token only.  Dispatch through the
+    // shape-specialized matmul_vec for the lm_head's projection dtype — that
+    // function already handles parallelization + dot4/dot8 ILP per dtype, so
+    // we don't need to duplicate the row-chunked dispatch here.
     writeln!(
         code,
         "    // Final rms_norm + lm_head on the last token (matches forward_prefill)"
@@ -5441,46 +5700,25 @@ fn emit_prefill_batched_function(
         code,
         "    rms_norm(&mut normed, &hidden_batch[(m-1)*{hidden}..m*{hidden}], &weights.final_norm, RMS_NORM_EPS);"
     )?;
-    writeln!(code, "    let mut last_logits = vec![0.0f32; VOCAB_SIZE];")?;
-    writeln!(code, "    #[cfg(target_arch = \"aarch64\")]")?;
-    writeln!(
-        code,
-        "    let normed_q8 = quantize_to_q8_0_blocks(&normed[..]);"
-    )?;
-    writeln!(
-        code,
-        "    last_logits.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, out)| {{"
-    )?;
-    writeln!(code, "        let base = chunk_idx * 256;")?;
-    writeln!(code, "        #[cfg(target_arch = \"aarch64\")] {{")?;
-    writeln!(code, "            let chunks8 = out.len() / 8;")?;
-    writeln!(code, "            for c in 0..chunks8 {{")?;
-    writeln!(code, "                let r = base + c * 8;")?;
-    writeln!(
-        code,
-        "                let (d0,d1,d2,d3,d4,d5,d6,d7) = {lm_dot8}(&normed_q8, &weights.lm_head[r*{lm_row_bytes}..(r+1)*{lm_row_bytes}], &weights.lm_head[(r+1)*{lm_row_bytes}..(r+2)*{lm_row_bytes}], &weights.lm_head[(r+2)*{lm_row_bytes}..(r+3)*{lm_row_bytes}], &weights.lm_head[(r+3)*{lm_row_bytes}..(r+4)*{lm_row_bytes}], &weights.lm_head[(r+4)*{lm_row_bytes}..(r+5)*{lm_row_bytes}], &weights.lm_head[(r+5)*{lm_row_bytes}..(r+6)*{lm_row_bytes}], &weights.lm_head[(r+6)*{lm_row_bytes}..(r+7)*{lm_row_bytes}], &weights.lm_head[(r+7)*{lm_row_bytes}..(r+8)*{lm_row_bytes}], {hidden});"
-    )?;
-    writeln!(code, "                out[c*8] = d0; out[c*8+1] = d1; out[c*8+2] = d2; out[c*8+3] = d3; out[c*8+4] = d4; out[c*8+5] = d5; out[c*8+6] = d6; out[c*8+7] = d7;")?;
-    writeln!(code, "            }}")?;
-    writeln!(code, "            let tail8 = chunks8 * 8;")?;
-    writeln!(code, "            for i in tail8..out.len() {{")?;
-    writeln!(code, "                let j = base + i;")?;
-    writeln!(
-        code,
-        "                out[i] = {lm_dot}(&normed_q8, &weights.lm_head[j*{lm_row_bytes}..(j+1)*{lm_row_bytes}], {hidden});"
-    )?;
-    writeln!(code, "            }}")?;
-    writeln!(code, "        }}")?;
-    writeln!(code, "        #[cfg(not(target_arch = \"aarch64\"))]")?;
-    writeln!(code, "        for r in 0..out.len() {{")?;
-    writeln!(code, "            let j = base + r;")?;
-    writeln!(
-        code,
-        "            out[r] = {lm_scalar_dot}(&normed[..], &weights.lm_head[j*{lm_row_bytes}..(j+1)*{lm_row_bytes}], {hidden});"
-    )?;
-    writeln!(code, "        }}")?;
-    writeln!(code, "    }});")?;
-    writeln!(code)?;
+    // last_logits as Vec<f32> for the return signature, but the matmul_vec
+    // kernels expect &mut [f32; VOCAB] — slice it with try_into at the call.
+    writeln!(code, "    let mut last_logits = vec![0.0f32; {vocab}];")?;
+    {
+        let lm_prefix = match lm_dtype {
+            DType::Q8_0 => "matmul_vec_q8_0_",
+            DType::Q4_0 => "matmul_vec_q4_0_",
+            DType::Q4_K => "matmul_vec_q4_k_",
+            DType::Q6_K => "matmul_vec_q6_k_",
+            _ => unreachable!(
+                "forward_prefill_batched lm_head: non-byte-storage dtype {:?}",
+                lm_dtype
+            ),
+        };
+        writeln!(
+            code,
+            "    {{ let logits_arr: &mut [f32; {vocab}] = (&mut last_logits[..]).try_into().unwrap(); {lm_prefix}{hidden}x{vocab}(logits_arr, &normed, &weights.lm_head); }}"
+        )?;
+    }
     writeln!(code, "    cache.len += m;")?;
     writeln!(code, "    last_logits")?;
     writeln!(code, "}}")?;

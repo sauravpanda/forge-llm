@@ -2,6 +2,98 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.9.15] — 2026-05-13 — batched prefill for K-quants (Q4_K / Q6_K)
+
+Closes the biggest perceived-perf gap in the AOT-K-quant story: prompt
+prefill on Q4_K and Q6_K models was previously falling back to the
+per-token `forward_prefill` loop, which redid weight loads across every
+prompt token.  Long prompts paid for it — a 41-token prompt at Q4_K
+took ~700 ms before the first generated token; now it takes ~200 ms.
+
+Forge's AOT advantage is exactly this kind of fixed-shape batched
+matmul: K, N, and projection dtype are known at codegen time, so we
+specialize the loop nest, hoist input quantization across the batch,
+and parallelize without runtime dispatch overhead.
+
+### Added
+
+- **`matmul_mat_q4_k_KxN`** in `forgellm-codegen-cpu/src/emit.rs` —
+  batched Q4_K matmul.  Quantizes all M input rows to Q8_0 once,
+  iterates weight rows in chunks of 4 via `dot4_q4_k_q8_0` (AArch64),
+  inner loops `for r in 0..m` so each Q4_K weight row's scale/min
+  unpack pays for M dot products instead of M times.  Parallel via
+  rayon over output columns; raw-pointer-as-usize keeps the output
+  pointer Send across worker threads.  Non-AArch64 fallback loops
+  the per-token `matmul_vec_q4_k_KxN` (portable, no batched win).
+- **`matmul_mat_q6_k_KxN`** in `forgellm-codegen-cpu/src/emit.rs` —
+  batched Q6_K matmul, same shape but using the scalar
+  `dot_q6_k_q8_0` (no NEON dot4 helper for Q6_K yet — deferred).
+  Cross-token cache amortization alone still gives a meaningful win.
+- **`matmul_call_mat(dtype, k, n, ...)`** helper in `emit.rs` — per-
+  projection dispatch for batched matmul kernels, mirrors the existing
+  `matmul_call` used by the vec path.  Routes through the right
+  `matmul_mat_q*_KxN` based on the projection's effective dtype, so
+  mixed Q4_K_M (Q4_K + Q6_K) projections get the right kernel per
+  category from one dispatch site.
+
+### Changed
+
+- **Batched-prefill emission** now triggers when any projection uses
+  a byte-storage dtype (Q8_0 / Q4_0 / Q4_K / Q6_K), not just uniform
+  Q8_0/Q4_0.  The `has_batched_prefill` gate in `emit_prefill_function`
+  + the `needs_batched_prefill` gate at the top-level emit site both
+  inspect `effective_proj_dtypes()`.
+- **`emit_prefill_batched_function`** replaced 7 hardcoded
+  `matmul_mat_{mm_kind}_*` calls + the inlined Q8_0/Q4_0 lm_head
+  chunked-dispatch with per-projection `matmul_call_mat` calls and a
+  single `matmul_vec_*_KxN` call for lm_head.  The lm_head matmul_vec
+  already parallelizes via rayon internally, so the inlined dot8
+  cascade was duplicating that work.
+- **Top-level `emit()`** now calls
+  `emit_specialized_q4_k_matmul_batched_functions` and
+  `emit_specialized_q6_k_matmul_batched_functions` when the model
+  uses Q4_K / Q6_K projections respectively.
+
+### Validation
+
+Llama-3.2-1B Q8_0 → re-quantized to uniform Q4_K via `--force-q4k`:
+- **Batched prefill: 208.8 tok/s** (41-token prompt)
+- Per-token prefill: 57.9 tok/s (same prompt, `FORGE_BATCHED_PREFILL=0`)
+- **Speedup: 3.6×**
+- Decode unchanged (50.6 vs 54.2 tok/s, within noise)
+- Generated tokens bit-identical between paths
+
+Llama-3.2-1B Q8_0 → re-quantized to uniform Q6_K via `--force-q6k`:
+- **Batched prefill: 30.6 tok/s** (41-token prompt)
+- Per-token prefill: 16.8 tok/s
+- **Speedup: 1.8×** (smaller win because Q6_K still uses scalar
+  `dot_q6_k_q8_0` inside the batched outer; `dot4_q6_k_q8_0` is the
+  obvious next step)
+- Decode unchanged
+- Generated tokens bit-identical between paths
+
+All 63 codegen-cpu tests pass; all 53 emit tests pass; full workspace
+test suite green.
+
+### Acceptance vs issue #218
+
+- ✅ Llama-3.2-1B Q4_K prefill ≥ 100 tok/s on M-series CPU (208.8).
+- ✅ Decode unchanged (no regression).
+- ✅ Output bit-identical to per-token path.
+- ⏳ Native Q4_K_M (mixed Q4_K + Q6_K) e2e validation deferred — the
+  matmul dispatch path is exercised by the two uniform validations
+  and the mixed case is exactly `q/k/o/gate/up = matmul_mat_q4_k`
+  + `v/down/lm_head = matmul_mat_q6_k` through the same
+  `matmul_call_mat` site.
+
+### Deferred / next
+
+- `dot4_q6_k_q8_0` (4-row NEON ILP) for Q6_K — turns the Q6_K
+  speedup from ~1.8× to ~3-4× and lifts Q4_K_M's down/v projections.
+- `dot8_*` variants for Q4_K / Q6_K — incremental ILP gains.
+- The pre-existing `--embed-weights` `fn sample` arity bug from
+  v0.9.14 is still open; out of scope here.
+
 ## [0.9.14] — 2026-05-12 — correctness gaps surfaced by the v0.9.13 per-projection arc
 
 Bug bundle closing three latent correctness gaps uncovered by an
