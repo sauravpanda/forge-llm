@@ -3788,6 +3788,143 @@ fn dot_q6_k_q8_0(weight_q6k: &[u8], input_q8: &[u8], k: usize) -> f32 {
 }
 "#,
     );
+
+    // dot4 variant — 4 weight rows × shared Q8_0 input, NEON sdot.
+    //
+    // The Q6_K decode is variable-shift (`nibble_shift` ∈ {0,4},
+    // `qh_shift` ∈ {0,2,4,6}), but NEON's compile-time shift intrinsics need
+    // constants.  We use `vshlq_u8(value, neg_count_vec)` which shifts by a
+    // runtime amount with the same cost as the const-shift form on Apple/ARM.
+    //
+    // For each Q8_0 block within a Q6_K super-block:
+    //   • Load shared input 32 i8 → (x_lo, x_hi) once across all 4 weight rows
+    //   • Per weight row r:
+    //       - Decode 32 q6 quants from ql[ql_off..ql_off+32] + qh[qh_off..qh_off+32]
+    //         → two int8x16_t (q_lo, q_hi) with values in -32..31
+    //       - sdot q_lo·x_lo → dot_lo; sdot q_hi·x_hi → dot_hi
+    //       - acc[r] += d · x_scale · (sc_lo · dot_lo + sc_hi · dot_hi)
+    code.push_str(
+        r#"
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn dot4_q6_k_q8_0(
+    w0: &[u8],
+    w1: &[u8],
+    w2: &[u8],
+    w3: &[u8],
+    input_q8: &[u8],
+    k: usize,
+) -> (f32, f32, f32, f32) {
+    use std::arch::aarch64::*;
+    const Q6K_BLOCK: usize = 256;
+    const Q6K_BYTES: usize = 210;
+    const Q8_BYTES: usize = 34;
+    let num_sb = k / Q6K_BLOCK;
+    let mut acc0 = 0.0f32;
+    let mut acc1 = 0.0f32;
+    let mut acc2 = 0.0f32;
+    let mut acc3 = 0.0f32;
+    let weights = [w0, w1, w2, w3];
+
+    // (ql_off, qh_off, nibble_shift, qh_shift, sc_idx) per Q8_0 block.
+    const BLOCKS: [(usize, usize, i8, i8, usize); 8] = [
+        (0, 0, 0, 0, 0),
+        (32, 0, 0, 2, 2),
+        (0, 0, 4, 4, 4),
+        (32, 0, 4, 6, 6),
+        (64, 32, 0, 0, 8),
+        (96, 32, 0, 2, 10),
+        (64, 32, 4, 4, 12),
+        (96, 32, 4, 6, 14),
+    ];
+
+    unsafe {
+        let mask_0f = vdupq_n_u8(0x0F);
+        let mask_03 = vdupq_n_u8(0x03);
+        let bias = vdupq_n_s8(32);
+
+        for sb in 0..num_sb {
+            let wb = sb * Q6K_BYTES;
+            // Decode per-row scalars once per superblock.
+            let mut d_arr = [0.0f32; 4];
+            for r in 0..4 {
+                let w = weights[r];
+                let d_bits = u16::from_le_bytes([w[wb + 208], w[wb + 209]]);
+                d_arr[r] = f16_bits_to_f32(d_bits);
+            }
+            let x_block_base = sb * 8 * Q8_BYTES;
+
+            for &(ql_off, qh_off, nibble_shift, qh_shift, sc_idx) in BLOCKS.iter() {
+                // Shared Q8_0 input block loaded once across all 4 weight rows.
+                let x_off = x_block_base + (sc_idx / 2) * Q8_BYTES;
+                let x_scale = f16_bits_to_f32(u16::from_le_bytes([
+                    input_q8[x_off],
+                    input_q8[x_off + 1],
+                ]));
+                let x_ptr = input_q8[x_off + 2..].as_ptr() as *const i8;
+                let x_lo: int8x16_t = vld1q_s8(x_ptr);
+                let x_hi: int8x16_t = vld1q_s8(x_ptr.add(16));
+
+                // Runtime shifts via vshlq_u8: negative count = right shift.
+                let ns_vec = vdupq_n_s8(-nibble_shift);
+                let qs_vec = vdupq_n_s8(-qh_shift);
+
+                let acc_arr = [&mut acc0, &mut acc1, &mut acc2, &mut acc3];
+                for (r, acc_ref) in acc_arr.into_iter().enumerate() {
+                    let weight_r = weights[r];
+                    let ql_ptr = weight_r[wb + ql_off..].as_ptr();
+                    let qh_ptr = weight_r[wb + 128 + qh_off..].as_ptr();
+                    let scales = &weight_r[wb + 192..wb + 208];
+
+                    let ql_lo_v: uint8x16_t = vld1q_u8(ql_ptr);
+                    let ql_hi_v: uint8x16_t = vld1q_u8(ql_ptr.add(16));
+                    let qh_lo_v: uint8x16_t = vld1q_u8(qh_ptr);
+                    let qh_hi_v: uint8x16_t = vld1q_u8(qh_ptr.add(16));
+
+                    // ql nibble: (v >> nibble_shift) & 0x0F  (4-bit low half of q6)
+                    let ql_lo_n = vandq_u8(vshlq_u8(ql_lo_v, ns_vec), mask_0f);
+                    let ql_hi_n = vandq_u8(vshlq_u8(ql_hi_v, ns_vec), mask_0f);
+                    // qh 2-bits: ((v >> qh_shift) & 0x03) << 4  (top 2 bits of q6)
+                    let qh_lo_2 = vandq_u8(vshlq_u8(qh_lo_v, qs_vec), mask_03);
+                    let qh_hi_2 = vandq_u8(vshlq_u8(qh_hi_v, qs_vec), mask_03);
+                    let qh_lo_n = vshlq_n_u8::<4>(qh_lo_2);
+                    let qh_hi_n = vshlq_n_u8::<4>(qh_hi_2);
+                    // q6_unsigned = ql_nibble | (qh_2bits << 4)
+                    let q6u_lo = vorrq_u8(ql_lo_n, qh_lo_n);
+                    let q6u_hi = vorrq_u8(ql_hi_n, qh_hi_n);
+                    // signed q6 = q6_unsigned - 32  (Q6_K bias)
+                    let q6_lo = vsubq_s8(vreinterpretq_s8_u8(q6u_lo), bias);
+                    let q6_hi = vsubq_s8(vreinterpretq_s8_u8(q6u_hi), bias);
+
+                    let mut dot_lo_v = vdupq_n_s32(0);
+                    let mut dot_hi_v = vdupq_n_s32(0);
+                    core::arch::asm!(
+                        "sdot {a1:v}.4s, {wlo:v}.16b, {xlo:v}.16b",
+                        "sdot {a2:v}.4s, {whi:v}.16b, {xhi:v}.16b",
+                        a1 = inout(vreg) dot_lo_v,
+                        a2 = inout(vreg) dot_hi_v,
+                        wlo = in(vreg) q6_lo,
+                        whi = in(vreg) q6_hi,
+                        xlo = in(vreg) x_lo,
+                        xhi = in(vreg) x_hi,
+                        options(nostack),
+                    );
+                    let dot_lo = vaddvq_s32(dot_lo_v) as i32;
+                    let dot_hi = vaddvq_s32(dot_hi_v) as i32;
+
+                    let sc_lo = scales[sc_idx] as i8 as i32;
+                    let sc_hi = scales[sc_idx + 1] as i8 as i32;
+                    let d = d_arr[r];
+                    *acc_ref +=
+                        d * x_scale * (sc_lo as f32 * dot_lo as f32 + sc_hi as f32 * dot_hi as f32);
+                }
+            }
+        }
+    }
+    (acc0, acc1, acc2, acc3)
+}
+"#,
+    );
     Ok(())
 }
 
@@ -3814,16 +3951,53 @@ fn emit_specialized_q6_k_matmul_functions(
         writeln!(code, "    let mut input_q8 = vec![0u8; {q8_bytes}];")?;
         writeln!(code, "    quantize_to_q8_0_blocks_into(&input[..], &mut input_q8);")?;
         if n * row_bytes >= par_byte_threshold {
+            // AArch64: 4-row dot4 cascade via dot4_q6_k_q8_0, scalar tail.
+            // Other targets: scalar dot_q6_k_q8_0 per row.
             writeln!(code, "    output.par_chunks_mut(64).enumerate().for_each(|(chunk_idx, out)| {{")?;
             writeln!(code, "        let base = chunk_idx * 64;")?;
-            writeln!(code, "        for r in 0..out.len() {{")?;
-            writeln!(code, "            let j = base + r;")?;
-            writeln!(code, "            out[r] = dot_q6_k_q8_0(&weight[j*{row_bytes}..(j+1)*{row_bytes}], &input_q8, {k});")?;
+            writeln!(code, "        let len = out.len();")?;
+            writeln!(code, "        #[cfg(target_arch = \"aarch64\")] {{")?;
+            writeln!(code, "            let chunks4 = len / 4;")?;
+            writeln!(code, "            for c in 0..chunks4 {{")?;
+            writeln!(code, "                let r = base + c * 4;")?;
+            writeln!(code, "                let (d0, d1, d2, d3) = dot4_q6_k_q8_0(&weight[r*{row_bytes}..(r+1)*{row_bytes}], &weight[(r+1)*{row_bytes}..(r+2)*{row_bytes}], &weight[(r+2)*{row_bytes}..(r+3)*{row_bytes}], &weight[(r+3)*{row_bytes}..(r+4)*{row_bytes}], &input_q8, {k});")?;
+            writeln!(code, "                out[c*4] = d0; out[c*4+1] = d1; out[c*4+2] = d2; out[c*4+3] = d3;")?;
+            writeln!(code, "            }}")?;
+            writeln!(code, "            for i in (chunks4 * 4)..len {{")?;
+            writeln!(code, "                let j = base + i;")?;
+            writeln!(code, "                out[i] = dot_q6_k_q8_0(&weight[j*{row_bytes}..(j+1)*{row_bytes}], &input_q8, {k});")?;
+            writeln!(code, "            }}")?;
+            writeln!(code, "        }}")?;
+            writeln!(code, "        #[cfg(not(target_arch = \"aarch64\"))] {{")?;
+            writeln!(code, "            for r in 0..len {{")?;
+            writeln!(code, "                let j = base + r;")?;
+            writeln!(code, "                out[r] = dot_q6_k_q8_0(&weight[j*{row_bytes}..(j+1)*{row_bytes}], &input_q8, {k});")?;
+            writeln!(code, "            }}")?;
             writeln!(code, "        }}")?;
             writeln!(code, "    }});")?;
         } else {
-            writeln!(code, "    for j in 0..{n} {{")?;
-            writeln!(code, "        output[j] = dot_q6_k_q8_0(&weight[j*{row_bytes}..(j+1)*{row_bytes}], &input_q8, {k});")?;
+            // Below parallel threshold — 4-wide cascade inline on aarch64.
+            writeln!(code, "    #[cfg(target_arch = \"aarch64\")] {{")?;
+            let n4 = n / 4;
+            let n_rem = n % 4;
+            if n4 > 0 {
+                writeln!(code, "        for c in 0..{n4} {{")?;
+                writeln!(code, "            let r = c * 4;")?;
+                writeln!(code, "            let (d0, d1, d2, d3) = dot4_q6_k_q8_0(&weight[r*{row_bytes}..(r+1)*{row_bytes}], &weight[(r+1)*{row_bytes}..(r+2)*{row_bytes}], &weight[(r+2)*{row_bytes}..(r+3)*{row_bytes}], &weight[(r+3)*{row_bytes}..(r+4)*{row_bytes}], &input_q8, {k});")?;
+                writeln!(code, "            output[c*4] = d0; output[c*4+1] = d1; output[c*4+2] = d2; output[c*4+3] = d3;")?;
+                writeln!(code, "        }}")?;
+            }
+            if n_rem > 0 {
+                let base = n4 * 4;
+                writeln!(code, "        for j in {base}..{n} {{")?;
+                writeln!(code, "            output[j] = dot_q6_k_q8_0(&weight[j*{row_bytes}..(j+1)*{row_bytes}], &input_q8, {k});")?;
+                writeln!(code, "        }}")?;
+            }
+            writeln!(code, "    }}")?;
+            writeln!(code, "    #[cfg(not(target_arch = \"aarch64\"))] {{")?;
+            writeln!(code, "        for j in 0..{n} {{")?;
+            writeln!(code, "            output[j] = dot_q6_k_q8_0(&weight[j*{row_bytes}..(j+1)*{row_bytes}], &input_q8, {k});")?;
+            writeln!(code, "        }}")?;
             writeln!(code, "    }}")?;
         }
         writeln!(code, "}}")?;
@@ -3861,6 +4035,9 @@ fn emit_specialized_q6_k_matmul_batched_functions(
             code,
             "/// Q6_K batched matmul: [m, {k}] x [{n}, {k}]^T -> [m, {n}] (row-major; weight raw Q6_K bytes)"
         )?;
+        // AArch64 path uses dot4_q6_k_q8_0 (4-row sdot cascade); other targets
+        // fall back to scalar dot_q6_k_q8_0.
+        writeln!(code, "#[cfg(target_arch = \"aarch64\")]")?;
         writeln!(
             code,
             "fn matmul_mat_q6_k_{k}x{n}(output: &mut [f32], m: usize, input: &[f32], weight: &[u8]) {{"
@@ -3873,14 +4050,94 @@ fn emit_specialized_q6_k_matmul_batched_functions(
         )?;
         writeln!(code, "    }}")?;
 
+        let n_chunks4 = n / 4;
+        let n_rem4 = n % 4;
         writeln!(code, "    let out_addr = output.as_mut_ptr() as usize;")?;
         writeln!(code, "    let input_q8_ref: &[u8] = &input_q8;")?;
-        // Parallelize over output columns.  Each worker owns one column j;
-        // the inner per-token loop reuses the single weight row across all m.
+        if n_chunks4 > 0 {
+            // Parallelize over output column chunks of 4; each worker loads 4
+            // weight rows once and dots against M tokens — same cache
+            // amortization pattern as matmul_mat_q4_k.
+            writeln!(
+                code,
+                "    (0..{n_chunks4}).into_par_iter().for_each(|n_block| {{"
+            )?;
+            writeln!(code, "        let j0 = n_block * 4;")?;
+            writeln!(
+                code,
+                "        let w0 = &weight[(j0+0)*{row_bytes}..(j0+1)*{row_bytes}];"
+            )?;
+            writeln!(
+                code,
+                "        let w1 = &weight[(j0+1)*{row_bytes}..(j0+2)*{row_bytes}];"
+            )?;
+            writeln!(
+                code,
+                "        let w2 = &weight[(j0+2)*{row_bytes}..(j0+3)*{row_bytes}];"
+            )?;
+            writeln!(
+                code,
+                "        let w3 = &weight[(j0+3)*{row_bytes}..(j0+4)*{row_bytes}];"
+            )?;
+            writeln!(code, "        for r in 0..m {{")?;
+            writeln!(
+                code,
+                "            let input_q = &input_q8_ref[r*{q8_bytes}..(r+1)*{q8_bytes}];"
+            )?;
+            writeln!(
+                code,
+                "            let (d0, d1, d2, d3) = dot4_q6_k_q8_0(w0, w1, w2, w3, input_q, {k});"
+            )?;
+            writeln!(code, "            unsafe {{")?;
+            writeln!(code, "                let base = r * {n} + j0;")?;
+            writeln!(
+                code,
+                "                let p = (out_addr as *mut f32).add(base);"
+            )?;
+            writeln!(code, "                *p.add(0) = d0;")?;
+            writeln!(code, "                *p.add(1) = d1;")?;
+            writeln!(code, "                *p.add(2) = d2;")?;
+            writeln!(code, "                *p.add(3) = d3;")?;
+            writeln!(code, "            }}")?;
+            writeln!(code, "        }}")?;
+            writeln!(code, "    }});")?;
+        }
+        if n_rem4 > 0 {
+            let tail_base = n_chunks4 * 4;
+            writeln!(code, "    // Scalar tail (N % 4 remainder)")?;
+            writeln!(code, "    for r in 0..m {{")?;
+            writeln!(
+                code,
+                "        let input_q = &input_q8[r*{q8_bytes}..(r+1)*{q8_bytes}];"
+            )?;
+            for j in 0..n_rem4 {
+                let col = tail_base + j;
+                writeln!(
+                    code,
+                    "        output[r*{n} + {col}] = dot_q6_k_q8_0(&weight[{col}*{row_bytes}..({col}+1)*{row_bytes}], input_q, {k});"
+                )?;
+            }
+            writeln!(code, "    }}")?;
+        }
+        writeln!(code, "}}")?;
+        writeln!(code)?;
+
+        // Non-AArch64 fallback: per-row scalar dot.
+        writeln!(code, "#[cfg(not(target_arch = \"aarch64\"))]")?;
         writeln!(
             code,
-            "    (0..{n}).into_par_iter().for_each(|j| {{"
+            "fn matmul_mat_q6_k_{k}x{n}(output: &mut [f32], m: usize, input: &[f32], weight: &[u8]) {{"
         )?;
+        writeln!(code, "    let mut input_q8 = vec![0u8; m * {q8_bytes}];")?;
+        writeln!(code, "    for r in 0..m {{")?;
+        writeln!(
+            code,
+            "        quantize_to_q8_0_blocks_into(&input[r*{k}..(r+1)*{k}], &mut input_q8[r*{q8_bytes}..(r+1)*{q8_bytes}]);"
+        )?;
+        writeln!(code, "    }}")?;
+        writeln!(code, "    let out_addr = output.as_mut_ptr() as usize;")?;
+        writeln!(code, "    let input_q8_ref: &[u8] = &input_q8;")?;
+        writeln!(code, "    (0..{n}).into_par_iter().for_each(|j| {{")?;
         writeln!(
             code,
             "        let w = &weight[j*{row_bytes}..(j+1)*{row_bytes}];"
@@ -3890,10 +4147,7 @@ fn emit_specialized_q6_k_matmul_batched_functions(
             code,
             "            let input_q = &input_q8_ref[r*{q8_bytes}..(r+1)*{q8_bytes}];"
         )?;
-        writeln!(
-            code,
-            "            let d = dot_q6_k_q8_0(w, input_q, {k});"
-        )?;
+        writeln!(code, "            let d = dot_q6_k_q8_0(w, input_q, {k});")?;
         writeln!(code, "            unsafe {{")?;
         writeln!(
             code,

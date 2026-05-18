@@ -2,6 +2,81 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.9.16] — 2026-05-18 — dot4_q6_k_q8_0 NEON cascade closes the #218 perf gap
+
+Q6_K's dot product was scalar in v0.9.15 — fine for correctness but the
+obvious next-step ILP optimization, and the bottleneck for real
+Q4_K_M GGUFs (which keep their highest-precision tensors —
+`v_proj` / `down_proj` / `output` — as Q6_K).
+
+v0.9.15's 2K-token prefill on real Q4_K_M was 73.8 tok/s, missing
+issue #218's ≥100 tok/s acceptance target.  v0.9.16's
+`dot4_q6_k_q8_0` adds a 4-row NEON sdot cascade — same pattern as
+`dot4_q4_k_q8_0` — lifting the same prefill to **186.1 tok/s** and
+also speeding up decode (Q6_K vec matmul now uses dot4 too).
+
+### Added
+
+- **`dot4_q6_k_q8_0`** in `emit_q6_k_kernel` — 4-row sdot cascade for
+  AArch64.  Shared Q8_0 input load (`x_lo`, `x_hi`, `x_scale`) is
+  hoisted across all 4 weight rows.  Per row, decodes 32 Q6_K quants
+  into `int8x16_t × 2` via:
+    `q6_unsigned = (ql >> nibble_shift) & 0x0F | ((qh >> qh_shift) & 0x03) << 4`,
+  signed via `vsubq_s8(.., vdupq_n_s8(32))`.  The variable shifts
+  (`nibble_shift` ∈ {0,4}, `qh_shift` ∈ {0,2,4,6}) use
+  `vshlq_u8(value, vdupq_n_s8(-count))` (NEON's runtime-shift form,
+  same latency as compile-time `vshrq_n_u8`).  Two `sdot` instructions
+  per row × 4 rows per cascade — full NEON dot-product throughput.
+
+### Changed
+
+- **`emit_specialized_q6_k_matmul_functions`** (vec path / decode):
+  AArch64 path now dispatches in 4-row chunks via `dot4_q6_k_q8_0`,
+  scalar tail for `N % 4`.  Mirrors the Q4_K vec emitter.  Speeds up
+  decode on any Q6_K projection (v/down/lm_head in Q4_K_M; everything
+  in --force-q6k).
+- **`emit_specialized_q6_k_matmul_batched_functions`** (batched path /
+  prefill): replaces the one-column-per-task parallelization with
+  4-column chunks, each running `dot4_q6_k_q8_0` × M tokens inner.
+  Closes the Q4_K_M prefill gap.
+
+### Validation
+
+Real Bartowski Llama-3.2-1B Q4_K_M (mixed Q4_K + Q6_K), M-series CPU:
+
+| Prompt | v0.9.15 batched | v0.9.16 batched | Speedup |
+|---|---|---|---|
+| 34 tok | 76.1 t/s | **190.9 t/s** | 2.5× |
+| 496 tok | 87.5 t/s | **241.3 t/s** | 2.8× |
+| 1981 tok | 73.8 t/s | **186.1 t/s** | 2.5× |
+
+Decode at 2K context: 10.1 → 12.7 tok/s (1.3× from vec path also
+using dot4).
+
+Uniform Q6_K (`--force-q6k`): decode 14.3 → 30.3 tok/s (2.1×).
+Prompt-prefill not re-measured but the same kernel powers it.
+
+Output **bit-identical** between batched and per-token paths at every
+prompt length tested.  Generated tokens at 2K prompt match v0.9.15
+exactly.
+
+### Acceptance vs issue #218
+
+- ✅ Llama-3.2-1B Q4_K prefill ≥ 100 tok/s (was 208 t/s in v0.9.15).
+- ✅ Llama-3.2-1B Q4_K_M (mixed) ≥ 100 tok/s on 2K prompt
+  (**186.1 t/s** — closes the v0.9.15 gap).
+- ✅ Decode unchanged or improved (1.3–2.1× faster on Q6_K paths).
+- ✅ Output bit-identical to per-token path.
+- ✅ All 63 codegen-cpu tests + full workspace test suite green.
+
+### Deferred / next
+
+- `dot8_q6_k_q8_0` (8-row ILP) — incremental gain, deferred.
+- `dot4_q4_k_q8_0` cache-tiling for very long prompts — Q4_K
+  prefill at 2K (~120 t/s) is workable but has headroom too.
+- The pre-existing `--embed-weights` `fn sample` arity bug still
+  open.
+
 ## [0.9.15] — 2026-05-13 — batched prefill for K-quants (Q4_K / Q6_K)
 
 Closes the biggest perceived-perf gap in the AOT-K-quant story: prompt
