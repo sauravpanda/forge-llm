@@ -762,6 +762,19 @@ fn main() {{
     let t0 = std::time::Instant::now();
     let mut rng_state: u64 = seed;
     let mut logits = model::forward_prefill(&prompt_tokens, &weights, &mut cache);
+    // Reference-diff hook: when FORGE_DUMP_LOGITS=<path> is set, write the
+    // last-prefill-step logits to a binary file (vocab × f32, little-endian).
+    // Used by `forge diff` to compare against the interpreter's f32 reference
+    // path on the same prompt.  Off by default (no overhead in normal runs).
+    if let Ok(dump_path) = std::env::var("FORGE_DUMP_LOGITS") {{
+        use std::io::Write as _;
+        let mut bytes = Vec::with_capacity(logits.len() * 4);
+        for v in logits.iter() {{ bytes.extend_from_slice(&v.to_le_bytes()); }}
+        match std::fs::File::create(&dump_path).and_then(|mut f| f.write_all(&bytes)) {{
+            Ok(()) => eprintln!("FORGE_DUMP_LOGITS: wrote {{}} f32 logits to {{}}", logits.len(), dump_path),
+            Err(e) => eprintln!("FORGE_DUMP_LOGITS: failed to write {{}}: {{}}", dump_path, e),
+        }}
+    }}
     let mut next = sample(&mut logits, temperature, top_k, top_p, &mut rng_state);
     eprintln!("Prefill: {{:.1}} tok/s", prompt_tokens.len() as f64 / t0.elapsed().as_secs_f64());
 
@@ -776,6 +789,10 @@ fn main() {{
         tokenizer.token_to_id("<|eot_id|>"),
     ].iter().filter_map(|t| *t).collect();
     let mut recent_tokens: Vec<u32> = prompt_tokens.clone();
+    // Reference-diff hook: when FORGE_DUMP_GENERATED=<path> is set, collect
+    // every generated token ID and write them (LE u32) at end-of-generation.
+    let dump_gen_path = std::env::var("FORGE_DUMP_GENERATED").ok();
+    let mut dump_gen_ids: Vec<u32> = Vec::new();
     let mut gen_count = 0usize;
     for _ in 0..max_tokens {{
         if eos_tokens.contains(&next) {{ break; }}
@@ -784,11 +801,21 @@ fn main() {{
             print!("{{}}", text);
             std::io::stdout().flush().ok();
         }}
+        if dump_gen_path.is_some() {{ dump_gen_ids.push(next); }}
         recent_tokens.push(next);
         let mut l = model::forward(next, &weights, &mut cache);
         apply_repeat_penalty(&mut l, &recent_tokens, repeat_penalty);
         next = sample(&mut l, temperature, top_k, top_p, &mut rng_state);
         gen_count += 1;
+    }}
+    if let Some(path) = &dump_gen_path {{
+        use std::io::Write as _;
+        let mut bytes = Vec::with_capacity(dump_gen_ids.len() * 4);
+        for id in dump_gen_ids.iter() {{ bytes.extend_from_slice(&id.to_le_bytes()); }}
+        match std::fs::File::create(path).and_then(|mut f| f.write_all(&bytes)) {{
+            Ok(()) => eprintln!("FORGE_DUMP_GENERATED: wrote {{}} token IDs to {{}}", dump_gen_ids.len(), path),
+            Err(e) => eprintln!("FORGE_DUMP_GENERATED: failed to write {{}}: {{}}", path, e),
+        }}
     }}
     if !quiet {{ println!(); }}
     eprintln!("Generate: {{}} tokens in {{:.2}}s ({{:.1}} tok/s)", gen_count, t1.elapsed().as_secs_f64(), gen_count as f64 / t1.elapsed().as_secs_f64());
@@ -1250,6 +1277,19 @@ fn main() {{
     let t0 = std::time::Instant::now();
     let mut rng_state: u64 = seed;
     let mut logits = model::forward_prefill(&prompt_tokens, &weights, &mut cache);
+    // Reference-diff hook: when FORGE_DUMP_LOGITS=<path> is set, write the
+    // last-prefill-step logits to a binary file (vocab × f32, little-endian).
+    // Used by `forge diff` to compare against the interpreter's f32 reference
+    // path on the same prompt.  Off by default (no overhead in normal runs).
+    if let Ok(dump_path) = std::env::var("FORGE_DUMP_LOGITS") {{
+        use std::io::Write as _;
+        let mut bytes = Vec::with_capacity(logits.len() * 4);
+        for v in logits.iter() {{ bytes.extend_from_slice(&v.to_le_bytes()); }}
+        match std::fs::File::create(&dump_path).and_then(|mut f| f.write_all(&bytes)) {{
+            Ok(()) => eprintln!("FORGE_DUMP_LOGITS: wrote {{}} f32 logits to {{}}", logits.len(), dump_path),
+            Err(e) => eprintln!("FORGE_DUMP_LOGITS: failed to write {{}}: {{}}", dump_path, e),
+        }}
+    }}
     let mut next = sample(&mut logits, temperature, top_k, top_p, &mut rng_state);
     eprintln!("Prefill: {{:.1}} tok/s", prompt_tokens.len() as f64 / t0.elapsed().as_secs_f64());
 
@@ -1264,6 +1304,10 @@ fn main() {{
         tokenizer.token_to_id("<|eot_id|>"),
     ].iter().filter_map(|t| *t).collect();
     let mut recent_tokens: Vec<u32> = prompt_tokens.clone();
+    // Reference-diff hook: when FORGE_DUMP_GENERATED=<path> is set, collect
+    // every generated token ID and write them (LE u32) at end-of-generation.
+    let dump_gen_path = std::env::var("FORGE_DUMP_GENERATED").ok();
+    let mut dump_gen_ids: Vec<u32> = Vec::new();
     let mut gen_count = 0usize;
     for _ in 0..max_tokens {{
         if eos_tokens.contains(&next) {{ break; }}
@@ -1272,11 +1316,21 @@ fn main() {{
             print!("{{}}", text);
             std::io::stdout().flush().ok();
         }}
+        if dump_gen_path.is_some() {{ dump_gen_ids.push(next); }}
         recent_tokens.push(next);
         let mut l = model::forward(next, &weights, &mut cache);
         apply_repeat_penalty(&mut l, &recent_tokens, repeat_penalty);
         next = sample(&mut l, temperature, top_k, top_p, &mut rng_state);
         gen_count += 1;
+    }}
+    if let Some(path) = &dump_gen_path {{
+        use std::io::Write as _;
+        let mut bytes = Vec::with_capacity(dump_gen_ids.len() * 4);
+        for id in dump_gen_ids.iter() {{ bytes.extend_from_slice(&id.to_le_bytes()); }}
+        match std::fs::File::create(path).and_then(|mut f| f.write_all(&bytes)) {{
+            Ok(()) => eprintln!("FORGE_DUMP_GENERATED: wrote {{}} token IDs to {{}}", dump_gen_ids.len(), path),
+            Err(e) => eprintln!("FORGE_DUMP_GENERATED: failed to write {{}}: {{}}", path, e),
+        }}
     }}
     if !quiet {{ println!(); }}
     eprintln!("Generate: {{}} tokens in {{:.2}}s ({{:.1}} tok/s)", gen_count, t1.elapsed().as_secs_f64(), gen_count as f64 / t1.elapsed().as_secs_f64());

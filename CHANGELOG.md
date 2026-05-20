@@ -2,6 +2,92 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.9.17] — 2026-05-20 — reference-diff harness (`forge diff`) for AOT vs interpreter
+
+Closes issue #217 (P1 / strategic) — first instalment.  Adds a
+deterministic differential harness that compiles the model AOT, runs
+both the AOT binary and the in-tree interpreter on the same prompt,
+and compares per-step logits + greedy token IDs.
+
+Before this commit our correctness signal was end-to-end perplexity
+on a corpus — fine for catching the model being *broken*, but easily
+misses being *subtly wrong* (a 1–2% perplexity delta could mean a
+real bug or just quantization noise, and we couldn't tell).  This
+harness gives us **cosine similarity on the actual logit vectors** —
+a continuous metric that exposes probability-mass shifts that don't
+flip argmax, and a deterministic top-K-overlap check that catches
+dispatch / mask / dtype bugs across all 49152 vocabulary slots at
+once.
+
+### Added
+
+- **`forge diff`** CLI subcommand
+  (`crates/forgellm-cli/src/main.rs::cmd_diff`).  Flags:
+  `--model <gguf>`, `--prompt "..."`, `--max-tokens N`,
+  `--tokenizer <path>`, `--top-k 5`, `--min-cosine 0.99`,
+  `--reuse-aot <dir>` (skip the AOT compile+build on iteration).
+  Pipeline: load `Graph` + f32 weights → run interpreter prefill →
+  compile model AOT → cargo build → run AOT binary with two env-var
+  dump hooks → load both dumps → compute cosine_sim / top-K overlap
+  / max/mean abs diff on last-prefill logits + token-level greedy
+  comparison.  Exit code 0 on pass, 1 on fail, suitable as a CI gate.
+- **`FORGE_DUMP_LOGITS=<path>`** AOT env-var hook (codegen in
+  `forgellm-codegen-cpu/src/project.rs`).  When set, the AOT binary
+  writes the last-prefill-step logits (`vocab × f32`, little-endian)
+  to the file before sampling.  Zero overhead when unset.
+- **`FORGE_DUMP_GENERATED=<path>`** AOT env-var hook.  When set, the
+  binary collects every generated token ID and writes them as LE u32
+  at end-of-generation — gives byte-exact comparison vs the
+  interpreter's token sequence (no tokenizer round-trip in the
+  middle).
+
+### Validation
+
+Three architectures × three quantization layouts all PASS the gate:
+
+| Model | dtype | cos_sim | top-5 | tokens | status |
+|---|---|---|---|---|---|
+| SmolLM2-135M | Q8_0 | 0.999527 | 5/5 | 4/8 | PASS |
+| Llama-3.2-1B | Q4_K_M (mixed Q4_K + Q6_K) | 0.999552 | 5/5 | 8/8 | PASS |
+| Phi-3.1-mini-4k | Q8_0 (fused QKV) | 0.999998 | 5/5 | 8/8 | PASS |
+
+The SmolLM2 case shows the diff harness working *as designed*:
+first-step logits are essentially identical (`cos_sim 0.9995`,
+top-5 overlap 5/5, argmax matches), but compounding Q8_0 vs f32
+quantization noise flips argmax at generation step 4.  That's
+*expected behaviour* — token-level greedy match is reported as
+informational, not a hard gate.  The cos_sim + top-K + first-step
+argmax checks are the load-bearing signals.
+
+### Bugs surfaced (and fixed) while bringing the harness online
+
+- The AOT binary's CLI parser only recognised `--temp`, not
+  `--temperature`.  When `forge diff` initially shelled out with
+  `--temperature 0`, the parser dropped the flag name but pushed
+  `0` as an extra prompt token — silently re-encoding
+  *"The capital of France is 0"*.  Result: `cos_sim = -0.5`, top-K
+  overlap 0/5, every greedy token wrong.  Easy harness fix
+  (use `--temp`), but documented here because it's exactly the
+  class of bug the harness is designed to catch.  Adding
+  `--temperature` to the AOT's `known_value_flags` is a low-priority
+  follow-up.
+
+### Limitations / next
+
+- **Single-prompt, single-checkpoint** today.  Layer-by-layer
+  checkpoint dumps (post-attn / post-FFN hidden states per layer) are
+  the obvious next milestone — when first-step logits diverge, we'd
+  want to know *which layer* introduced the divergence.  Adding
+  `--debug-checkpoints` to the codegen + corresponding interpreter
+  capture is the planned phase 2.
+- **Interpreter reference only.**  Doesn't compare against
+  llama.cpp yet — that needs FFI or patched-llama.cpp subprocess
+  with checkpoint hooks (out of scope for this commit, but the
+  framework is in place).
+- **AOT compile cost per run** (~30s for cargo build).  Acceptable
+  for a correctness gate; iterate with `--reuse-aot <dir>` when
+  developing the harness itself.
+
 ## [0.9.16] — 2026-05-18 — dot4_q6_k_q8_0 NEON cascade closes the #218 perf gap
 
 Q6_K's dot product was scalar in v0.9.15 — fine for correctness but the

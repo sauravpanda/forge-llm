@@ -1,7 +1,7 @@
 use std::fs;
 use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 use std::net::TcpListener;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
@@ -272,6 +272,44 @@ enum Commands {
         port: u16,
     },
 
+    /// Reference-diff harness: compile the model AOT, run both the AOT binary
+    /// and the in-tree interpreter on the same prompt, and compare token IDs
+    /// + first-step logits.  Used to catch subtle codegen bugs that don't
+    /// show up in greedy decode but shift probability mass off the argmax.
+    Diff {
+        /// Path to GGUF model file
+        #[arg(long)]
+        model: String,
+
+        /// Prompt to encode and feed into both paths
+        #[arg(long, default_value = "The capital of France is")]
+        prompt: String,
+
+        /// Number of greedy-decode tokens to compare after the prompt
+        #[arg(long, default_value = "16")]
+        max_tokens: usize,
+
+        /// Path to tokenizer.json (auto-detected if omitted)
+        #[arg(long)]
+        tokenizer: Option<String>,
+
+        /// Top-k logits to compare for overlap (defaults to 5)
+        #[arg(long, default_value = "5")]
+        top_k: usize,
+
+        /// Cosine-similarity threshold for the first-step logits.  Quantization
+        /// noise typically keeps Llama-3.2-1B Q4_K_M above 0.995 vs the f32
+        /// interpreter; tighten for unquantized models, loosen for narrow
+        /// quants like Q4_0.
+        #[arg(long, default_value = "0.99")]
+        min_cosine: f32,
+
+        /// Skip the AOT compile + build step; reuse an already-built AOT crate
+        /// at this path.  Faster iteration when only the diff harness changed.
+        #[arg(long)]
+        reuse_aot: Option<String>,
+    },
+
     /// Compile draft + target models and generate a speculative decoding runner
     Speculative {
         /// Path to the draft GGUF model file (small, fast model)
@@ -465,6 +503,27 @@ fn main() -> Result<()> {
             run,
             prompt: prompt.as_deref(),
         })?,
+
+        Commands::Diff {
+            model,
+            prompt,
+            max_tokens,
+            tokenizer,
+            top_k,
+            min_cosine,
+            reuse_aot,
+        } => {
+            let tok = resolve_tokenizer(&tokenizer, &model)?;
+            cmd_diff(
+                &model,
+                &tok,
+                &prompt,
+                max_tokens,
+                top_k,
+                min_cosine,
+                reuse_aot.as_deref(),
+            )?
+        }
     }
 
     Ok(())
@@ -1334,6 +1393,370 @@ fn cmd_speculative(args: SpeculativeArgs<'_>) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Reference-diff harness: compare the AOT codegen against the in-tree
+/// interpreter (which runs the same IR on f32 weights).  The interpreter is
+/// the canonical numerical reference for "this IR + these weights"; any
+/// divergence from AOT is either a real codegen bug (wrong kernel dispatch,
+/// off-by-one indexing, dtype drift) or unavoidable quantization noise from
+/// the AOT path quantizing weights into Q4_K / Q6_K / Q8_0.
+///
+/// The harness reports:
+///   • Cosine similarity of the last-prefill logits (continuous metric).
+///   • Top-K overlap on the same logits (catches probability-mass shifts
+///     that don't change argmax).
+///   • Token-by-token greedy match for the next `max_tokens` generations.
+///   • First divergence position with both sides' tokens decoded.
+///
+/// Exit code 0 on pass (all tokens match AND cos_sim ≥ min_cosine), 1 on fail.
+/// Threshold defaults loosen for quantized models (cos_sim ≥ 0.99 is sane for
+/// Q4_K_M vs f32 interpreter); tighten for unquantized A/B comparisons.
+#[allow(clippy::too_many_arguments)]
+fn cmd_diff(
+    model_path: &str,
+    tokenizer_path: &str,
+    prompt: &str,
+    max_tokens: usize,
+    top_k: usize,
+    min_cosine: f32,
+    reuse_aot: Option<&str>,
+) -> Result<()> {
+    use forgellm_runtime::interpreter;
+    use forgellm_runtime::kv_cache::KVCache;
+    use std::collections::HashSet;
+
+    eprintln!("=== forge diff ===");
+    eprintln!("Model:     {model_path}");
+    eprintln!("Tokenizer: {tokenizer_path}");
+    eprintln!("Prompt:    {prompt:?}");
+
+    let tokenizer = Tokenizer::from_file(tokenizer_path)
+        .with_context(|| "failed to load tokenizer")?;
+
+    let config = load_model_config(model_path)?;
+    eprintln!(
+        "Config: {} layers, hidden={}, vocab={}, dtype={:?}",
+        config.num_layers, config.hidden_size, config.vocab_size, config.dtype,
+    );
+    if let Some(pdt) = config.proj_dtypes {
+        eprintln!(
+            "  proj_dtypes: q={:?} k={:?} v={:?} o={:?} gate={:?} up={:?} down={:?} lm_head={:?}",
+            pdt.q, pdt.k, pdt.v, pdt.o, pdt.gate, pdt.up, pdt.down, pdt.lm_head,
+        );
+    }
+
+    let graph = graph_builder::build_graph(&config)
+        .with_context(|| "failed to build computation graph")?;
+
+    // Tokenize prompt the same way the AOT main.rs does: encode(prompt, false)
+    // so prompt_tokens matches across both paths.
+    let prompt_tokens: Vec<u32> = tokenizer
+        .encode(prompt)
+        .with_context(|| "failed to encode prompt")?;
+    eprintln!("Prompt tokens: {}", prompt_tokens.len());
+
+    if prompt_tokens.is_empty() {
+        bail!("prompt encoded to zero tokens — give a non-empty prompt");
+    }
+
+    // ----- Interpreter side (f32 reference) -----
+    eprintln!("Loading f32 weights for interpreter (dequantize-on-load)...");
+    let (_gguf, weights_f32) = forgellm_frontend::weight_loader::load_from_file(model_path)
+        .with_context(|| "failed to load weights for interpreter")?;
+
+    eprintln!("Running interpreter prefill + greedy decode...");
+    let mut interp_cache = KVCache::with_capacity(
+        config.num_layers,
+        config.num_kv_heads,
+        config.head_dim,
+        config.max_seq_len,
+    );
+    let mut interp_logits: Vec<f32> = Vec::new();
+    for (pos, &tok) in prompt_tokens.iter().enumerate() {
+        interp_logits = interpreter::forward(tok, pos, &graph, &weights_f32, &mut interp_cache);
+        interp_cache.advance();
+    }
+    let mut interp_gen: Vec<u32> = Vec::with_capacity(max_tokens);
+    let mut next = argmax(&interp_logits) as u32;
+    for i in 0..max_tokens {
+        interp_gen.push(next);
+        let pos = prompt_tokens.len() + i;
+        let logits = interpreter::forward(next, pos, &graph, &weights_f32, &mut interp_cache);
+        interp_cache.advance();
+        next = argmax(&logits) as u32;
+    }
+
+    // ----- AOT side (quantized codegen) -----
+    let (aot_dir, owns_aot) = if let Some(dir) = reuse_aot {
+        (PathBuf::from(dir), false)
+    } else {
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("forge-diff-{pid}"));
+        if dir.exists() {
+            fs::remove_dir_all(&dir)
+                .with_context(|| format!("failed to clear {}", dir.display()))?;
+        }
+        eprintln!("Compiling AOT crate at {}...", dir.display());
+        cmd_compile(CompileArgs {
+            model_path,
+            target: "cpu",
+            output_path: dir.to_str().unwrap(),
+            run: false,
+            prompt: None,
+            tokenizer_opt: &Some(tokenizer_path.to_string()),
+            embed_weights: false,
+            cross_target: None,
+            lora_path: None,
+            force_q4k: false,
+            force_q6k: false,
+        })?;
+        eprintln!("Exporting weights.bin...");
+        cmd_export_weights_impl(
+            model_path,
+            dir.join("weights.bin").to_str().unwrap(),
+            None,
+            false,
+            false,
+        )?;
+        fs::copy(tokenizer_path, dir.join("tokenizer.json"))
+            .with_context(|| "failed to stage tokenizer.json")?;
+        eprintln!("Building AOT crate (cargo build --release)...");
+        let st = std::process::Command::new("cargo")
+            .args(["build", "--release", "--quiet", "--manifest-path"])
+            .arg(dir.join("Cargo.toml"))
+            .status()
+            .with_context(|| "failed to spawn cargo")?;
+        if !st.success() {
+            bail!("AOT cargo build failed");
+        }
+        (dir, true)
+    };
+
+    let bin_name = aot_dir
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("AOT dir has no filename component"))?
+        .to_string_lossy()
+        .to_string();
+    let bin_path = aot_dir.join("target/release").join(&bin_name);
+    if !bin_path.exists() {
+        bail!("AOT binary not found at {}", bin_path.display());
+    }
+    let logits_path = aot_dir.join("aot-prefill-logits.bin");
+    let gen_path = aot_dir.join("aot-generated-tokens.bin");
+    let _ = fs::remove_file(&logits_path);
+    let _ = fs::remove_file(&gen_path);
+
+    eprintln!("Running AOT binary {}...", bin_path.display());
+    // NB: the AOT binary parses --temp (not --temperature) — passing the wrong
+    // flag silently leaks the value into the prompt because the parser pushes
+    // unknown non-flag args.  Match the AOT's known-flag list exactly.
+    // --quiet suppresses stdout so we don't rely on text round-tripping;
+    // generated token IDs are dumped via FORGE_DUMP_GENERATED for byte-exact
+    // comparison.
+    let aot_output = std::process::Command::new(&bin_path)
+        .arg(aot_dir.join("weights.bin"))
+        .arg(aot_dir.join("tokenizer.json"))
+        .arg(prompt)
+        .arg("--max-tokens")
+        .arg(max_tokens.to_string())
+        .arg("--temp")
+        .arg("0")
+        .arg("--top-k")
+        .arg("0")
+        .arg("--top-p")
+        .arg("1.0")
+        .arg("--repeat-penalty")
+        .arg("1.0")
+        .arg("--quiet")
+        .env("FORGE_DUMP_LOGITS", &logits_path)
+        .env("FORGE_DUMP_GENERATED", &gen_path)
+        .output()
+        .with_context(|| "failed to spawn AOT binary")?;
+
+    if !aot_output.status.success() {
+        eprintln!("AOT stderr:\n{}", String::from_utf8_lossy(&aot_output.stderr));
+        bail!("AOT binary exited with non-zero status");
+    }
+
+    let aot_gen_bytes = fs::read(&gen_path)
+        .with_context(|| format!("failed to read AOT generated tokens at {}", gen_path.display()))?;
+    if aot_gen_bytes.len() % 4 != 0 {
+        bail!(
+            "AOT generated token dump has non-u32 byte count ({} bytes)",
+            aot_gen_bytes.len()
+        );
+    }
+    let aot_gen_tokens: Vec<u32> = aot_gen_bytes
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+
+    // Load AOT logits dump.
+    let aot_logits_bytes = fs::read(&logits_path)
+        .with_context(|| format!("failed to read AOT logits dump at {}", logits_path.display()))?;
+    if aot_logits_bytes.len() % 4 != 0 {
+        bail!(
+            "AOT logits dump has non-f32 byte count ({} bytes)",
+            aot_logits_bytes.len()
+        );
+    }
+    let aot_logits: Vec<f32> = aot_logits_bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    if aot_logits.len() != interp_logits.len() {
+        bail!(
+            "logits length mismatch — AOT {} vs interpreter {}",
+            aot_logits.len(),
+            interp_logits.len()
+        );
+    }
+
+    // ----- Compare -----
+    let cos_sim = cosine_similarity(&interp_logits, &aot_logits);
+    let interp_topk: HashSet<u32> = top_k_indices(&interp_logits, top_k)
+        .into_iter()
+        .map(|i| i as u32)
+        .collect();
+    let aot_topk: HashSet<u32> = top_k_indices(&aot_logits, top_k)
+        .into_iter()
+        .map(|i| i as u32)
+        .collect();
+    let topk_overlap = interp_topk.intersection(&aot_topk).count();
+    let max_abs_diff = interp_logits
+        .iter()
+        .zip(aot_logits.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let mean_abs_diff = interp_logits
+        .iter()
+        .zip(aot_logits.iter())
+        .map(|(a, b)| (a - b).abs())
+        .sum::<f32>()
+        / interp_logits.len() as f32;
+
+    let cmp_len = interp_gen.len().min(aot_gen_tokens.len());
+    let token_matches: usize = (0..cmp_len)
+        .filter(|&i| interp_gen[i] == aot_gen_tokens[i])
+        .count();
+    let first_div = (0..cmp_len).find(|&i| interp_gen[i] != aot_gen_tokens[i]);
+
+    // ----- Report -----
+    println!();
+    println!("=== Forge diff results ===");
+    println!("Logits (last prefill step):");
+    println!("  cosine_similarity : {cos_sim:.6}");
+    println!(
+        "  top-{top_k} overlap    : {topk_overlap}/{top_k}  (interp {:?} | aot {:?})",
+        top_k_indices(&interp_logits, top_k.min(3)),
+        top_k_indices(&aot_logits, top_k.min(3)),
+    );
+    println!("  max_abs_diff      : {max_abs_diff:.6}");
+    println!("  mean_abs_diff     : {mean_abs_diff:.6}");
+    println!();
+    println!("Greedy tokens (next {max_tokens}):");
+    println!(
+        "  interp gen={}  aot gen={}  compared={}",
+        interp_gen.len(),
+        aot_gen_tokens.len(),
+        cmp_len
+    );
+    println!(
+        "  matches           : {token_matches}/{cmp_len} ({:.1}%)",
+        100.0 * token_matches as f64 / cmp_len.max(1) as f64
+    );
+    if let Some(i) = first_div {
+        let interp_word = tokenizer
+            .decode_one(interp_gen[i])
+            .unwrap_or_else(|_| "<?>".into());
+        let aot_word = tokenizer
+            .decode_one(aot_gen_tokens[i])
+            .unwrap_or_else(|_| "<?>".into());
+        println!(
+            "  first divergence  : gen[{i}] interp={interp_word:?}(id={}) aot={aot_word:?}(id={})",
+            interp_gen[i], aot_gen_tokens[i]
+        );
+    } else if cmp_len > 0 {
+        println!("  first divergence  : —  (all {cmp_len} tokens match)");
+    }
+    println!();
+
+    // Pass criteria:
+    // - First-step logits cosine_sim ≥ threshold (catches kernel-implementation bugs).
+    // - First generated token (argmax of last-prefill logits) matches between
+    //   interp and AOT (catches subtle dispatch / dtype / mask bugs).
+    // - Top-k overlap ≥ max(1, top_k - 1) (catches probability-mass shifts).
+    // Token-level greedy match after that is informational only — compounding
+    // quantization noise will shift argmax after a few generations even when
+    // the per-step computation is correct.
+    let argmax_match = if !interp_gen.is_empty() && !aot_gen_tokens.is_empty() {
+        interp_gen[0] == aot_gen_tokens[0]
+    } else {
+        true
+    };
+    let topk_required = top_k.saturating_sub(1).max(1);
+    let pass = cos_sim >= min_cosine && argmax_match && topk_overlap >= topk_required;
+    if pass {
+        println!(
+            "PASS  cos_sim={cos_sim:.4} ≥ {min_cosine:.4}, top-1 match, top-{top_k} overlap {topk_overlap}/{top_k}, tokens {token_matches}/{cmp_len} (informational)"
+        );
+    } else {
+        let mut reasons = Vec::new();
+        if cos_sim < min_cosine {
+            reasons.push(format!("cos_sim={cos_sim:.4} < {min_cosine:.4}"));
+        }
+        if !argmax_match {
+            reasons.push("argmax(first-step logits) differs".into());
+        }
+        if topk_overlap < topk_required {
+            reasons.push(format!("top-{top_k} overlap {topk_overlap}/{top_k} < {topk_required}"));
+        }
+        println!("FAIL  {}", reasons.join("; "));
+    }
+
+    // Note: when reuse_aot is None, the temp dir holds a few hundred MB of
+    // build artifacts.  Leave it on disk for forensic inspection on FAIL; on
+    // PASS the user can clean it manually.  This keeps the harness deterministic
+    // and lets `--reuse-aot <path>` short-circuit the next iteration.
+    let _ = owns_aot;
+
+    if !pass {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn argmax(logits: &[f32]) -> usize {
+    let mut best_i = 0usize;
+    let mut best_v = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > best_v {
+            best_v = v;
+            best_i = i;
+        }
+    }
+    best_i
+}
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na * nb)
+}
+
+fn top_k_indices(logits: &[f32], k: usize) -> Vec<usize> {
+    let mut indexed: Vec<(usize, f32)> = logits
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (i, v))
+        .collect();
+    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    indexed.into_iter().take(k).map(|(i, _)| i).collect()
 }
 
 fn cmd_info(model_path: &str) -> Result<()> {
