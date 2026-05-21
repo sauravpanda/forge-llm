@@ -1465,7 +1465,7 @@ fn cmd_diff(
     let (_gguf, weights_f32) = forgellm_frontend::weight_loader::load_from_file(model_path)
         .with_context(|| "failed to load weights for interpreter")?;
 
-    eprintln!("Running interpreter prefill + greedy decode...");
+    eprintln!("Running interpreter prefill + greedy decode (with per-layer checkpoints)...");
     let mut interp_cache = KVCache::with_capacity(
         config.num_layers,
         config.num_kv_heads,
@@ -1473,8 +1473,26 @@ fn cmd_diff(
         config.max_seq_len,
     );
     let mut interp_logits: Vec<f32> = Vec::new();
+    let mut interp_checkpoints: Vec<f32> = Vec::with_capacity(
+        config.num_layers * 2 * config.hidden_size,
+    );
+    let last_prompt_idx = prompt_tokens.len() - 1;
     for (pos, &tok) in prompt_tokens.iter().enumerate() {
-        interp_logits = interpreter::forward(tok, pos, &graph, &weights_f32, &mut interp_cache);
+        if pos == last_prompt_idx {
+            // Only capture checkpoints for the last prompt token — that's the
+            // point at which the AOT also dumps and the logits we compare.
+            interp_checkpoints.clear();
+            interp_logits = interpreter::forward_with_checkpoints(
+                tok,
+                pos,
+                &graph,
+                &weights_f32,
+                &mut interp_cache,
+                &mut interp_checkpoints,
+            );
+        } else {
+            interp_logits = interpreter::forward(tok, pos, &graph, &weights_f32, &mut interp_cache);
+        }
         interp_cache.advance();
     }
     let mut interp_gen: Vec<u32> = Vec::with_capacity(max_tokens);
@@ -1544,8 +1562,10 @@ fn cmd_diff(
     }
     let logits_path = aot_dir.join("aot-prefill-logits.bin");
     let gen_path = aot_dir.join("aot-generated-tokens.bin");
+    let cp_path = aot_dir.join("aot-checkpoints.bin");
     let _ = fs::remove_file(&logits_path);
     let _ = fs::remove_file(&gen_path);
+    let _ = fs::remove_file(&cp_path);
 
     eprintln!("Running AOT binary {}...", bin_path.display());
     // NB: the AOT binary parses --temp (not --temperature) — passing the wrong
@@ -1554,6 +1574,10 @@ fn cmd_diff(
     // --quiet suppresses stdout so we don't rely on text round-tripping;
     // generated token IDs are dumped via FORGE_DUMP_GENERATED for byte-exact
     // comparison.
+    // FORGE_BATCHED_PREFILL=0 forces the per-token prefill path which is where
+    // the layer-checkpoint hooks live.  The batched path is still validated
+    // end-to-end via the last-prefill logits cosine_sim comparison; layer
+    // attribution just isn't available for batched prompts in this phase.
     let aot_output = std::process::Command::new(&bin_path)
         .arg(aot_dir.join("weights.bin"))
         .arg(aot_dir.join("tokenizer.json"))
@@ -1571,6 +1595,8 @@ fn cmd_diff(
         .arg("--quiet")
         .env("FORGE_DUMP_LOGITS", &logits_path)
         .env("FORGE_DUMP_GENERATED", &gen_path)
+        .env("FORGE_DUMP_CHECKPOINTS", &cp_path)
+        .env("FORGE_BATCHED_PREFILL", "0")
         .output()
         .with_context(|| "failed to spawn AOT binary")?;
 
@@ -1610,6 +1636,35 @@ fn cmd_diff(
             "logits length mismatch — AOT {} vs interpreter {}",
             aot_logits.len(),
             interp_logits.len()
+        );
+    }
+
+    // Load AOT layer checkpoints (phase 2).  Two stages per layer
+    // (post-attn, post-ffn), each `hidden` f32 values.  Empty / absent file
+    // means the AOT path didn't capture (e.g., embedded variant) — skip the
+    // per-layer report rather than failing.
+    let aot_checkpoints: Vec<f32> = match fs::read(&cp_path) {
+        Ok(bytes) if !bytes.is_empty() => {
+            if bytes.len() % 4 != 0 {
+                bail!(
+                    "AOT checkpoint dump has non-f32 byte count ({} bytes)",
+                    bytes.len()
+                );
+            }
+            bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+    let have_checkpoints =
+        !aot_checkpoints.is_empty() && aot_checkpoints.len() == interp_checkpoints.len();
+    if !aot_checkpoints.is_empty() && aot_checkpoints.len() != interp_checkpoints.len() {
+        eprintln!(
+            "warning: checkpoint length mismatch — AOT {} vs interpreter {}; skipping per-layer report",
+            aot_checkpoints.len(),
+            interp_checkpoints.len(),
         );
     }
 
@@ -1682,11 +1737,101 @@ fn cmd_diff(
     }
     println!();
 
+    // Per-layer checkpoint analysis (phase 2).  Each layer contributes two
+    // hidden-state captures: post-attn (stage 0) and post-ffn (stage 1).
+    // The first layer whose cos_sim falls below `min_cosine` is the attribution
+    // candidate — that's where the AOT path diverges from the interpreter.
+    let mut first_layer_diverge: Option<(usize, &'static str, f32)> = None;
+    let mut layer_rows: Vec<(usize, f32, f32, f32, f32)> = Vec::new();
+    if have_checkpoints {
+        let h = config.hidden_size;
+        for layer_idx in 0..config.num_layers {
+            let attn_start = layer_idx * 2 * h;
+            let attn_end = attn_start + h;
+            let ffn_end = attn_end + h;
+            let attn_cs =
+                cosine_similarity(&interp_checkpoints[attn_start..attn_end], &aot_checkpoints[attn_start..attn_end]);
+            let ffn_cs =
+                cosine_similarity(&interp_checkpoints[attn_end..ffn_end], &aot_checkpoints[attn_end..ffn_end]);
+            let attn_max = interp_checkpoints[attn_start..attn_end]
+                .iter()
+                .zip(aot_checkpoints[attn_start..attn_end].iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            let ffn_max = interp_checkpoints[attn_end..ffn_end]
+                .iter()
+                .zip(aot_checkpoints[attn_end..ffn_end].iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            layer_rows.push((layer_idx, attn_cs, ffn_cs, attn_max, ffn_max));
+            if first_layer_diverge.is_none() && attn_cs < min_cosine {
+                first_layer_diverge = Some((layer_idx, "post_attn", attn_cs));
+            }
+            if first_layer_diverge.is_none() && ffn_cs < min_cosine {
+                first_layer_diverge = Some((layer_idx, "post_ffn", ffn_cs));
+            }
+        }
+
+        println!();
+        println!("Per-layer hidden-state cosine_sim (last prompt token):");
+        println!(
+            "  {:>5}  {:>10}  {:>10}  {:>10}  {:>10}",
+            "layer", "post_attn", "post_ffn", "max_attn", "max_ffn"
+        );
+        // Print compact: layers 0..3, last few, and any divergent rows.
+        let n = layer_rows.len();
+        let mut printed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut emit_row = |row: &(usize, f32, f32, f32, f32),
+                            printed: &mut std::collections::HashSet<usize>| {
+            if printed.insert(row.0) {
+                println!(
+                    "  {:>5}  {:>10.6}  {:>10.6}  {:>10.6}  {:>10.6}",
+                    row.0, row.1, row.2, row.3, row.4
+                );
+            }
+        };
+        for row in layer_rows.iter().take(3) {
+            emit_row(row, &mut printed);
+        }
+        if n > 6 {
+            println!("  {:>5}  {:>10}  {:>10}  {:>10}  {:>10}", "…", "…", "…", "…", "…");
+        }
+        for row in layer_rows.iter().rev().take(3).collect::<Vec<_>>().iter().rev() {
+            emit_row(row, &mut printed);
+        }
+        // Always include the worst-cos_sim row even if not in head/tail.
+        if let Some(worst) = layer_rows
+            .iter()
+            .min_by(|a, b| a.1.min(a.2).partial_cmp(&b.1.min(b.2)).unwrap_or(std::cmp::Ordering::Equal))
+        {
+            if !printed.contains(&worst.0) {
+                println!("  {:>5}  {:>10}  {:>10}  {:>10}  {:>10}", "↓", "worst", "", "", "");
+                println!(
+                    "  {:>5}  {:>10.6}  {:>10.6}  {:>10.6}  {:>10.6}",
+                    worst.0, worst.1, worst.2, worst.3, worst.4
+                );
+            }
+        }
+        if let Some((layer, stage, cs)) = first_layer_diverge {
+            println!(
+                "  first divergence  : layer {layer} ({stage}) cos_sim={cs:.6} < {min_cosine:.6}"
+            );
+        } else {
+            println!("  first divergence  : —  (all layers ≥ {min_cosine:.4})");
+        }
+    } else {
+        println!();
+        println!("Per-layer hidden-state cosine_sim: <not captured>");
+    }
+
     // Pass criteria:
     // - First-step logits cosine_sim ≥ threshold (catches kernel-implementation bugs).
     // - First generated token (argmax of last-prefill logits) matches between
     //   interp and AOT (catches subtle dispatch / dtype / mask bugs).
     // - Top-k overlap ≥ max(1, top_k - 1) (catches probability-mass shifts).
+    // - When per-layer checkpoints are available, no layer's post-attn or
+    //   post-ffn cos_sim falls below `min_cosine` (catches per-layer kernel
+    //   bugs that the final-logit aggregation might smooth over).
     // Token-level greedy match after that is informational only — compounding
     // quantization noise will shift argmax after a few generations even when
     // the per-step computation is correct.
@@ -1696,7 +1841,8 @@ fn cmd_diff(
         true
     };
     let topk_required = top_k.saturating_sub(1).max(1);
-    let pass = cos_sim >= min_cosine && argmax_match && topk_overlap >= topk_required;
+    let layers_pass = first_layer_diverge.is_none();
+    let pass = cos_sim >= min_cosine && argmax_match && topk_overlap >= topk_required && layers_pass;
     if pass {
         println!(
             "PASS  cos_sim={cos_sim:.4} ≥ {min_cosine:.4}, top-1 match, top-{top_k} overlap {topk_overlap}/{top_k}, tokens {token_matches}/{cmp_len} (informational)"
@@ -1711,6 +1857,9 @@ fn cmd_diff(
         }
         if topk_overlap < topk_required {
             reasons.push(format!("top-{top_k} overlap {topk_overlap}/{top_k} < {topk_required}"));
+        }
+        if let Some((layer, stage, cs)) = first_layer_diverge {
+            reasons.push(format!("layer {layer} ({stage}) cos_sim={cs:.4} < {min_cosine:.4}"));
         }
         println!("FAIL  {}", reasons.join("; "));
     }

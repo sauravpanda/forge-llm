@@ -2,6 +2,69 @@
 
 All notable changes to ForgeLLM are documented here.
 
+## [0.9.18] — 2026-05-20 — `forge diff` phase 2: per-layer checkpoint attribution
+
+Builds on v0.9.17's reference-diff harness.  When end-to-end logits
+diverge between AOT and interpreter, the v0.9.17 harness told you
+*that* something was wrong but not *where*.  Phase 2 adds per-layer
+post-attention and post-FFN hidden-state captures on both sides so a
+divergence at e.g. layer 12 attention can be attributed directly.
+
+### Added
+
+- **`FORGE_DUMP_CHECKPOINTS=<path>`** AOT env-var hook (codegen in
+  `forgellm-codegen-cpu/src/emit.rs::emit_prefill_function`).  When
+  set, the generated `forward_prefill` writes the last-prompt-token's
+  per-layer hidden state at two stages — after the attention residual
+  add and after the FFN residual add — to `<path>` as raw f32 LE,
+  `[num_layers × 2 × hidden_size]`.  Zero allocation when unset.
+- **`interpreter::forward_with_checkpoints`** in
+  `forgellm-runtime/src/interpreter.rs` — mirrors `forward` but
+  appends the same two hidden-state captures per layer into a caller-
+  provided `&mut Vec<f32>`.  Identical execution otherwise.
+- **`forge diff`** now sets `FORGE_DUMP_CHECKPOINTS` and
+  `FORGE_BATCHED_PREFILL=0` on the AOT subprocess.  The latter forces
+  the per-token prefill path since that's where the checkpoint hooks
+  live; the batched path is still validated end-to-end via the
+  last-prefill logits cos_sim from phase 1.
+- **Per-layer cosine_sim + max_abs_diff table** in the diff report.
+  Shows the first 3 layers, the last 3 layers, and the worst-cos_sim
+  layer (if not already in head/tail).  Identifies the first layer
+  whose cos_sim drops below the threshold — the attribution
+  candidate.
+- **Pass criterion tightened**: pass now also requires every layer's
+  post-attn and post-ffn cos_sim ≥ `min_cosine`.
+
+### Validation
+
+Same three models as v0.9.17, now with layer-level resolution:
+
+| Model | dtype | logit cos_sim | worst layer | worst cos_sim | status |
+|---|---|---|---|---|---|
+| SmolLM2-135M (30 layers) | Q8_0 | 0.999527 | 29 (post_ffn) | 0.999445 | PASS |
+| Llama-3.2-1B (16 layers) | Q4_K_M mixed | 0.999552 | 5 (post_attn) | 0.998447 | PASS |
+| Phi-3.1-mini (32 layers, fused QKV) | Q8_0 | 0.999998 | 6 (post_ffn) | 0.999242 | PASS |
+
+A non-trivial finding: the **worst-cos_sim layer isn't always the
+last one**.  Llama Q4_K_M's worst-divergence layer is 5 (out of 16),
+Phi-3's is 6 (out of 32).  Quantization noise compounds layer-to-
+layer but also gets dampened by the FFN+residual structure, so the
+divergence curve isn't monotonic.  Without per-layer attribution
+we'd have missed this observation entirely.
+
+### Limitations / next
+
+- **Per-token prefill only.**  Batched prefill checkpoints would
+  require duplicating the dump logic in `emit_prefill_batched_function`.
+  Phase 3 if needed, but for the common short-prompt case the
+  per-token gate suffices.
+- **No fine-grained tensor attribution inside a layer.**  Currently
+  we capture post-attn + post-ffn, not (q_proj, k_proj, v_proj,
+  attn_out, o_proj) individually.  If we ever see a layer flagged
+  but neither stage helps narrow the cause further, that's the next
+  resolution level.
+- **No llama.cpp parity yet.**  Still interpreter-only reference.
+
 ## [0.9.17] — 2026-05-20 — reference-diff harness (`forge diff`) for AOT vs interpreter
 
 Closes issue #217 (P1 / strategic) — first instalment.  Adds a

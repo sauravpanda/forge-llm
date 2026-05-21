@@ -5135,6 +5135,21 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "    let mut ffn_out = [0.0f32; {hidden}];")?;
     writeln!(code, "    let mut last_logits = vec![0.0f32; VOCAB_SIZE];")?;
     writeln!(code)?;
+    // Reference-diff hook: when FORGE_DUMP_CHECKPOINTS=<path> is set, capture
+    // per-layer post-attn and post-ffn hidden states for the LAST prompt token
+    // and write them as raw f32 LE to <path> before returning.  Used by
+    // `forge diff` (phase 2) to attribute logit divergence to a specific
+    // layer.  Zero allocation / overhead when unset.
+    writeln!(
+        code,
+        "    let cp_dump_path: Option<String> = std::env::var(\"FORGE_DUMP_CHECKPOINTS\").ok();"
+    )?;
+    writeln!(
+        code,
+        "    let cp_capacity: usize = if cp_dump_path.is_some() {{ NUM_LAYERS * 2 * HIDDEN_SIZE }} else {{ 0 }};"
+    )?;
+    writeln!(code, "    let mut cp_buf: Vec<f32> = Vec::with_capacity(cp_capacity);")?;
+    writeln!(code)?;
     writeln!(
         code,
         "    for (tok_pos, &token_id) in tokens.iter().enumerate() {{"
@@ -5267,6 +5282,11 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
         code,
         "            residual_add(&mut hidden_state, &attn_proj);"
     )?;
+    // Checkpoint dump: post-attn hidden state, last token only.
+    writeln!(
+        code,
+        "            if cp_dump_path.is_some() && tok_pos == seq_len - 1 {{ cp_buf.extend_from_slice(&hidden_state); }}"
+    )?;
     writeln!(code)?;
     writeln!(code, "            // FFN norm")?;
     writeln!(
@@ -5318,6 +5338,11 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(
         code,
         "            residual_add(&mut hidden_state, &ffn_out);"
+    )?;
+    // Checkpoint dump: post-ffn hidden state, last token only.
+    writeln!(
+        code,
+        "            if cp_dump_path.is_some() && tok_pos == seq_len - 1 {{ cp_buf.extend_from_slice(&hidden_state); }}"
     )?;
     writeln!(code, "        }}")?;
     writeln!(code)?;
@@ -5558,6 +5583,16 @@ fn emit_prefill_function(code: &mut String, config: &ModelConfig) -> Result<(), 
     writeln!(code, "    }}")?;
     writeln!(code)?;
     writeln!(code, "    cache.len += seq_len;")?;
+    // Write checkpoint dump (if requested) before returning logits.
+    writeln!(code, "    if let Some(path) = cp_dump_path {{")?;
+    writeln!(code, "        use std::io::Write as _;")?;
+    writeln!(code, "        let mut bytes = Vec::with_capacity(cp_buf.len() * 4);")?;
+    writeln!(code, "        for v in cp_buf.iter() {{ bytes.extend_from_slice(&v.to_le_bytes()); }}")?;
+    writeln!(code, "        match std::fs::File::create(&path).and_then(|mut f| f.write_all(&bytes)) {{")?;
+    writeln!(code, "            Ok(()) => eprintln!(\"FORGE_DUMP_CHECKPOINTS: wrote {{}} f32 values ({{}} layers × 2 stages × {{}} hidden) to {{}}\", cp_buf.len(), NUM_LAYERS, HIDDEN_SIZE, path),")?;
+    writeln!(code, "            Err(e) => eprintln!(\"FORGE_DUMP_CHECKPOINTS: failed to write {{}}: {{}}\", path, e),")?;
+    writeln!(code, "        }}")?;
+    writeln!(code, "    }}")?;
     writeln!(code, "    last_logits")?;
     writeln!(code, "}}")?;
 

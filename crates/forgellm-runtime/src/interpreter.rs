@@ -166,6 +166,158 @@ pub fn forward(
     logits
 }
 
+/// Variant of `forward` that captures per-layer post-attn and post-ffn hidden
+/// states into `checkpoints` (appended in layer order, two entries per layer).
+///
+/// Used by `forge diff` (phase 2) to attribute logit divergence between the
+/// interpreter (f32 reference) and the AOT (quantized codegen) to a specific
+/// layer.  Otherwise identical to `forward` — same kernels, same execution
+/// order, just adds two `extend_from_slice` calls per layer.
+///
+/// `checkpoints` is expected to be empty on entry; the caller can preallocate
+/// `num_layers * 2 * hidden_size` capacity to avoid reallocation.
+pub fn forward_with_checkpoints(
+    token_id: u32,
+    pos: usize,
+    graph: &Graph,
+    weights: &ModelWeights,
+    cache: &mut KVCache,
+    checkpoints: &mut Vec<f32>,
+) -> Vec<f32> {
+    let config = graph.config.as_ref().expect("graph must have config");
+
+    let hidden = config.hidden_size;
+    let intermediate = config.intermediate_size;
+    let num_heads = config.num_attention_heads;
+    let num_kv_heads = config.num_kv_heads;
+    let head_dim = config.head_dim;
+    let vocab = config.vocab_size;
+
+    let embed_w = weights.tensor("model.embed_tokens.weight");
+    let mut hidden_state = vec![0.0f32; hidden];
+    let offset = token_id as usize * hidden;
+    hidden_state.copy_from_slice(&embed_w[offset..offset + hidden]);
+
+    if matches!(
+        config.architecture,
+        forgellm_frontend::ir::Architecture::Gemma
+    ) {
+        let scale = (hidden as f32).sqrt();
+        for v in hidden_state.iter_mut() {
+            *v *= scale;
+        }
+    }
+
+    let mut normed = vec![0.0f32; hidden];
+    let mut q = vec![0.0f32; num_heads * head_dim];
+    let mut k = vec![0.0f32; num_kv_heads * head_dim];
+    let mut v = vec![0.0f32; num_kv_heads * head_dim];
+    let mut attn_out = vec![0.0f32; num_heads * head_dim];
+    let mut attn_proj = vec![0.0f32; hidden];
+    let mut residual = vec![0.0f32; hidden];
+    let mut gate = vec![0.0f32; intermediate];
+    let mut gate_act = vec![0.0f32; intermediate];
+    let mut up = vec![0.0f32; intermediate];
+    let mut ffn_hidden = vec![0.0f32; intermediate];
+    let mut ffn_out = vec![0.0f32; hidden];
+
+    for layer_idx in 0..config.num_layers {
+        let prefix = format!("model.layers.{layer_idx}");
+
+        let norm_w = weights.tensor(&format!("{prefix}.input_layernorm.weight"));
+        rms_norm(&mut normed, &hidden_state, norm_w, config.rms_norm_eps);
+
+        let q_w = weights.tensor(&format!("{prefix}.self_attn.q_proj.weight"));
+        let k_w = weights.tensor(&format!("{prefix}.self_attn.k_proj.weight"));
+        let v_w = weights.tensor(&format!("{prefix}.self_attn.v_proj.weight"));
+        matmul(&mut q, &normed, q_w, 1, hidden, num_heads * head_dim);
+        matmul(&mut k, &normed, k_w, 1, hidden, num_kv_heads * head_dim);
+        matmul(&mut v, &normed, v_w, 1, hidden, num_kv_heads * head_dim);
+
+        if let Some(q_bias) = weights.get(&format!("{prefix}.self_attn.q_proj.bias")) {
+            elementwise_add_inplace(&mut q, q_bias);
+        }
+        if let Some(k_bias) = weights.get(&format!("{prefix}.self_attn.k_proj.bias")) {
+            elementwise_add_inplace(&mut k, k_bias);
+        }
+        if let Some(v_bias) = weights.get(&format!("{prefix}.self_attn.v_proj.bias")) {
+            elementwise_add_inplace(&mut v, v_bias);
+        }
+
+        rope(&mut q, pos, head_dim, num_heads, config.rope_theta);
+        rope(&mut k, pos, head_dim, num_kv_heads, config.rope_theta);
+
+        cache.append(layer_idx, &k, &v);
+
+        attention(
+            &mut attn_out,
+            &q,
+            cache.k(layer_idx),
+            cache.v(layer_idx),
+            &AttentionParams {
+                seq_len: pos + 1,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+            },
+        );
+
+        let o_w = weights.tensor(&format!("{prefix}.self_attn.o_proj.weight"));
+        matmul(
+            &mut attn_proj,
+            &attn_out,
+            o_w,
+            1,
+            num_heads * head_dim,
+            hidden,
+        );
+
+        elementwise_add(&mut residual, &hidden_state, &attn_proj);
+        // Post-attention checkpoint (hidden_state + attn_proj residual).
+        // Matches the AOT's `residual_add(&mut hidden_state, &attn_proj)` site.
+        checkpoints.extend_from_slice(&residual);
+
+        let ffn_norm_w = weights.tensor(&format!("{prefix}.post_attention_layernorm.weight"));
+        rms_norm(&mut normed, &residual, ffn_norm_w, config.rms_norm_eps);
+
+        let gate_w = weights.tensor(&format!("{prefix}.mlp.gate_proj.weight"));
+        let up_w = weights.tensor(&format!("{prefix}.mlp.up_proj.weight"));
+        let down_w = weights.tensor(&format!("{prefix}.mlp.down_proj.weight"));
+
+        matmul(&mut gate, &normed, gate_w, 1, hidden, intermediate);
+        match config.hidden_activation {
+            forgellm_frontend::ir::HiddenActivation::SiLU => silu(&mut gate_act, &gate),
+            forgellm_frontend::ir::HiddenActivation::GeluApprox => {
+                kernels::gelu(&mut gate_act, &gate)
+            }
+        }
+        matmul(&mut up, &normed, up_w, 1, hidden, intermediate);
+        elementwise_mul(&mut ffn_hidden, &gate_act, &up);
+        matmul(&mut ffn_out, &ffn_hidden, down_w, 1, intermediate, hidden);
+
+        elementwise_add(&mut hidden_state, &residual, &ffn_out);
+        // Post-FFN checkpoint.  Matches the AOT's
+        // `residual_add(&mut hidden_state, &ffn_out)` site.
+        checkpoints.extend_from_slice(&hidden_state);
+    }
+
+    let final_norm_w = weights.tensor("model.norm.weight");
+    rms_norm(
+        &mut normed,
+        &hidden_state,
+        final_norm_w,
+        config.rms_norm_eps,
+    );
+
+    let lm_head_w = weights
+        .get("lm_head.weight")
+        .unwrap_or_else(|| weights.tensor("model.embed_tokens.weight"));
+    let mut logits = vec![0.0f32; vocab];
+    matmul(&mut logits, &normed, lm_head_w, 1, hidden, vocab);
+
+    logits
+}
+
 // --- Kernel wrappers (delegate to optimized kernels module) ---
 
 fn rms_norm(output: &mut [f32], input: &[f32], weight: &[f32], eps: f32) {
